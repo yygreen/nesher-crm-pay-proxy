@@ -1,0 +1,520 @@
+/**
+ * Flexible invoice draft builder.
+ * - Pack every CRM detail we can find into memo + line items.
+ * - Never hard-block: missing fields are listed so staff can fill them in.
+ */
+
+import { resolveCustomerEmail, formatStay, toIsoDate } from "./quote.js";
+import {
+  hotelInvoiceNumber,
+  reservationInvoiceNumber,
+  toUsdAmount,
+  defaultIlsSpot,
+} from "./mercury.js";
+
+export function missingField(field, label, reason, required = true) {
+  return { field, label, reason, required };
+}
+
+function parseOverrides(raw = {}) {
+  const o = raw && typeof raw === "object" ? raw : {};
+  const amountUsd =
+    o.amountUsd != null && o.amountUsd !== ""
+      ? Number(o.amountUsd)
+      : o.amount_usd != null && o.amount_usd !== ""
+        ? Number(o.amount_usd)
+        : undefined;
+  return {
+    customerEmail:
+      o.customerEmail != null
+        ? String(o.customerEmail).trim()
+        : o.customer_email != null
+          ? String(o.customer_email).trim()
+          : undefined,
+    customerName:
+      o.customerName != null
+        ? String(o.customerName).trim()
+        : o.customer_name != null
+          ? String(o.customer_name).trim()
+          : undefined,
+    amountUsd:
+      amountUsd !== undefined && Number.isFinite(amountUsd) ? amountUsd : undefined,
+    lineItemName:
+      o.lineItemName != null
+        ? String(o.lineItemName)
+        : o.line_item_name != null
+          ? String(o.line_item_name)
+          : undefined,
+    payerMemo: o.payerMemo != null ? String(o.payerMemo) : o.payer_memo != null ? String(o.payer_memo) : undefined,
+    invoiceNumber:
+      o.invoiceNumber != null
+        ? String(o.invoiceNumber).trim()
+        : o.invoice_number != null
+          ? String(o.invoice_number).trim()
+          : undefined,
+    offerId:
+      o.offerId != null
+        ? o.offerId
+        : o.offer_id != null
+          ? o.offer_id
+          : undefined,
+  };
+}
+
+/**
+ * Build a full editable draft for a reservation (soft — no throw on zero price).
+ */
+export function buildReservationDraft(ctx, overridesIn = {}) {
+  const overrides = parseOverrides(overridesIn);
+  const { reservation, quote, warnings = [] } = ctx;
+  const code = reservation.reservation_code || `ID${reservation.id}`;
+  const ref = String(code).replace(/[^A-Za-z0-9_-]/g, "") || `id${reservation.id}`;
+
+  const realEmail =
+    overrides.customerEmail !== undefined
+      ? overrides.customerEmail
+      : reservation.customer_email;
+  const resolved = resolveCustomerEmail(realEmail, `res${ref}`);
+  const name =
+    String(
+      overrides.customerName !== undefined
+        ? overrides.customerName
+        : reservation.customer_name || ""
+    ).trim() || "Customer";
+
+  let amountUsd =
+    overrides.amountUsd !== undefined ? Number(overrides.amountUsd) : NaN;
+  if (!Number.isFinite(amountUsd) || amountUsd <= 0) {
+    amountUsd = Number(quote.balance) > 0 ? Number(quote.balance) : 0;
+  }
+
+  const journeys = quote.journeyLines || [];
+  const travelers = quote.travelers || [];
+  const flights = quote.flights || [];
+  const pricedJourneys = journeys.filter((j) => Number(j.customer_price) > 0);
+
+  // Rich line items: one per journey with price, unless staff overrode total
+  let lineItems = [];
+  if (overrides.amountUsd !== undefined && Number(overrides.amountUsd) > 0) {
+    lineItems = [
+      {
+        name: String(
+          overrides.lineItemName || `Reservation ${code} — payment`
+        ).slice(0, 180),
+        unitPrice: amountUsd,
+        quantity: 1,
+      },
+    ];
+  } else if (pricedJourneys.length) {
+    lineItems = pricedJourneys.map((j) => ({
+      name: String(j.label || j.line_type || "Service").slice(0, 180),
+      unitPrice: Number(j.customer_price),
+      quantity: 1,
+    }));
+    // If balance differs from sum (partial payment), scale or single line
+    const lineSum = lineItems.reduce((s, li) => s + li.unitPrice, 0);
+    if (amountUsd > 0 && Math.abs(lineSum - amountUsd) > 0.02) {
+      lineItems = [
+        {
+          name: String(
+            overrides.lineItemName ||
+              `Reservation ${code} balance due (quote $${Number(quote.customer_price || 0).toFixed(2)}, paid $${Number(quote.amount_paid || 0).toFixed(2)})`
+          ).slice(0, 180),
+          unitPrice: amountUsd,
+          quantity: 1,
+        },
+      ];
+    }
+  } else if (amountUsd > 0) {
+    lineItems = [
+      {
+        name: String(
+          overrides.lineItemName || `Reservation ${code} balance due`
+        ).slice(0, 180),
+        unitPrice: amountUsd,
+        quantity: 1,
+      },
+    ];
+  }
+
+  const memoLines = [
+    `Nesher / FlyNesher payment request`,
+    `Booking / PNR: ${code}`,
+    `CRM reservation id: ${reservation.id}`,
+    name ? `Customer: ${name}` : null,
+    resolved.email ? `Email: ${resolved.email}` : null,
+    reservation.phone ? `Phone: ${reservation.phone}` : null,
+    reservation.booking_method
+      ? `Booking method: ${reservation.booking_method}`
+      : null,
+    quote.priceSource ? `Price source: ${quote.priceSource}` : null,
+    `Quoted: $${Number(quote.customer_price || amountUsd || 0).toFixed(2)}`,
+    `Already paid: $${Number(quote.amount_paid || 0).toFixed(2)}`,
+    `Amount due: $${Number(amountUsd || 0).toFixed(2)} USD`,
+  ].filter(Boolean);
+
+  if (travelers.length) {
+    memoLines.push(
+      `Travelers (${travelers.length}): ${travelers
+        .map((t) => t.full_name || "Traveler")
+        .join(", ")}`
+    );
+  }
+  if (flights.length) {
+    memoLines.push("Flights:");
+    for (const f of flights.slice(0, 12)) {
+      memoLines.push(
+        `  ${f.airline || ""} ${f.flight_number || ""} ${f.from_location || "?"}→${f.to_location || "?"} ${f.departure_date || ""} ${f.departure_time || ""}`.trim()
+      );
+    }
+  }
+  if (journeys.length) {
+    memoLines.push("Services / tickets:");
+    for (const j of journeys.slice(0, 20)) {
+      const priceBit =
+        Number(j.customer_price) > 0
+          ? ` $${Number(j.customer_price).toFixed(2)}`
+          : "";
+      const conf = j.confirmation_number
+        ? ` (conf ${j.confirmation_number})`
+        : "";
+      memoLines.push(`  - ${j.label || j.line_type || "line"}${priceBit}${conf}`);
+    }
+  }
+  if (overrides.payerMemo) {
+    memoLines.push(`Staff note: ${overrides.payerMemo}`);
+  }
+
+  const missing = [];
+  if (!(amountUsd > 0)) {
+    missing.push(
+      missingField(
+        "amountUsd",
+        "Amount due (USD)",
+        "No customer price on the reservation or ticket lines — enter the amount to charge."
+      )
+    );
+  }
+  if (resolved.placeholder) {
+    missing.push(
+      missingField(
+        "customerEmail",
+        "Customer email",
+        "CRM has no email — a placeholder will be used unless you enter a real one. Prefer a real customer email.",
+        false
+      )
+    );
+  }
+  if (
+    !String(reservation.customer_name || "").trim() &&
+    overrides.customerName === undefined
+  ) {
+    missing.push(
+      missingField(
+        "customerName",
+        "Customer name",
+        "No name on the customer record — optional but clearer on the invoice.",
+        false
+      )
+    );
+  }
+  if (!pricedJourneys.length && !(Number(quote.customer_price) > 0)) {
+    missing.push(
+      missingField(
+        "crmPrice",
+        "CRM price on reservation/journeys",
+        "Optional: set Customer Price in CRM for next time. You can still charge by entering Amount due now.",
+        false
+      )
+    );
+  }
+
+  const invoiceNumber =
+    overrides.invoiceNumber ||
+    reservationInvoiceNumber(code) ||
+    `RES-ID${reservation.id}`;
+
+  const summary = [
+    `RES ${code}`,
+    amountUsd > 0 ? `due $${amountUsd.toFixed(2)}` : "amount TBD",
+    name,
+    resolved.email,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+
+  const advice = [];
+  if (missing.some((m) => m.required)) {
+    advice.push(
+      "Fill the required fields below, then create the payment link."
+    );
+  } else if (missing.length) {
+    advice.push(
+      "You can create the link now. Optional fields below improve the invoice for the customer."
+    );
+  } else {
+    advice.push(
+      "All key details found. Review the invoice preview, then create the payment link."
+    );
+  }
+  for (const w of warnings) advice.push(w);
+
+  return {
+    kind: "reservation",
+    canCreate: amountUsd > 0 && Boolean(resolved.email),
+    needsInput: missing.some((m) => m.required),
+    missing,
+    advice,
+    draft: {
+      customerName: name,
+      customerEmail: resolved.email,
+      emailPlaceholder: resolved.placeholder,
+      amountUsd,
+      currency: "USD",
+      invoiceNumber,
+      lineItems,
+      payerMemo: memoLines.join("\n").slice(0, 1800),
+      lineItemName: lineItems[0]?.name || `Reservation ${code}`,
+      summary,
+      details: {
+        reservationId: Number(reservation.id),
+        reservationCode: code,
+        bookingMethod: reservation.booking_method || null,
+        phone: reservation.phone || null,
+        customerPrice: Number(quote.customer_price) || 0,
+        amountPaid: Number(quote.amount_paid) || 0,
+        balance: amountUsd,
+        priceSource: quote.priceSource || null,
+        travelers,
+        flights,
+        journeyLines: journeys,
+      },
+    },
+  };
+}
+
+export async function buildHotelDraft(ctx, overridesIn = {}) {
+  const overrides = parseOverrides(overridesIn);
+  const { request, offer, resolution, allOffers = [], ambiguous } = ctx;
+  const stay = formatStay(request.check_in, request.check_out);
+  const resolved = resolveCustomerEmail(
+    overrides.customerEmail !== undefined
+      ? overrides.customerEmail
+      : request.email,
+    `jrm${request.id}o${offer?.id || "x"}`
+  );
+  const name =
+    String(
+      overrides.customerName !== undefined
+        ? overrides.customerName
+        : request.customer_name || ""
+    ).trim() || "Customer";
+
+  let amountUsd =
+    overrides.amountUsd !== undefined ? Number(overrides.amountUsd) : NaN;
+  let currency = offer?.currency || "USD";
+  let customerPrice = Number(offer?.customer_price) || 0;
+
+  if (!Number.isFinite(amountUsd) || amountUsd <= 0) {
+    if (customerPrice > 0) {
+      try {
+        amountUsd = await toUsdAmount(
+          customerPrice,
+          currency,
+          defaultIlsSpot
+        );
+      } catch {
+        amountUsd = 0;
+      }
+    } else {
+      amountUsd = 0;
+    }
+  }
+
+  const missing = [];
+  if (!(amountUsd > 0)) {
+    missing.push(
+      missingField(
+        "amountUsd",
+        "Amount due (USD)",
+        "No customer price on this offer — enter the USD amount to charge."
+      )
+    );
+  }
+  if (resolved.placeholder) {
+    missing.push(
+      missingField(
+        "customerEmail",
+        "Customer email",
+        "No email on the hotel request — placeholder used unless you enter one.",
+        false
+      )
+    );
+  }
+  if (!offer || !offer.id) {
+    missing.push(
+      missingField(
+        "offerId",
+        "Hotel offer",
+        "No offer selected. Enter amount manually, or open the specific offer and click Pay on that quote.",
+        false
+      )
+    );
+  }
+  if (ambiguous && allOffers.length > 1) {
+    missing.push(
+      missingField(
+        "offerId",
+        "Confirm which offer",
+        `Multiple offers on this request — invoice uses offer #${offer?.id || "?"}. Prefer Pay on the exact quote row.`,
+        false
+      )
+    );
+  }
+
+  const invoiceNumber =
+    overrides.invoiceNumber ||
+    (offer?.id
+      ? hotelInvoiceNumber(request.id, offer.id)
+      : `JRM-1${request.id}`);
+
+  const guests = [
+    request.adults != null ? `${request.adults} adults` : null,
+    request.children != null ? `${request.children} children` : null,
+    request.rooms != null ? `${request.rooms} rooms` : null,
+  ]
+    .filter(Boolean)
+    .join(", ");
+
+  const lineName = String(
+    overrides.lineItemName ||
+      [
+        offer?.hotel_name || "Hotel booking",
+        stay ? `(${stay})` : null,
+        request.city ? `— ${request.city}` : null,
+        name ? `— ${name}` : null,
+      ]
+        .filter(Boolean)
+        .join(" ")
+  ).slice(0, 180);
+
+  const memoLines = [
+    `Nesher / JRM Hotels payment request`,
+    `CRM hotel request #${request.id}`,
+    offer?.id ? `Offer #${offer.id}` : null,
+    `Invoice: ${invoiceNumber}`,
+    name ? `Customer: ${name}` : null,
+    resolved.email ? `Email: ${resolved.email}` : null,
+    request.phone ? `Phone: ${request.phone}` : null,
+    offer?.hotel_name ? `Hotel: ${offer.hotel_name}` : null,
+    offer?.room_type ? `Room: ${offer.room_type}` : null,
+    request.city ? `City: ${request.city}` : null,
+    stay ? `Stay: ${stay}` : null,
+    toIsoDate(request.check_in)
+      ? `Check-in: ${toIsoDate(request.check_in)}`
+      : null,
+    toIsoDate(request.check_out)
+      ? `Check-out: ${toIsoDate(request.check_out)}`
+      : null,
+    guests ? `Guests: ${guests}` : null,
+    customerPrice > 0
+      ? `Quoted: ${customerPrice} ${currency || ""}`.trim()
+      : null,
+    offer?.vat_status ? `VAT: ${offer.vat_status}` : null,
+    offer?.customer_answer_status
+      ? `Customer answer: ${offer.customer_answer_status}`
+      : null,
+    `Amount due: $${Number(amountUsd || 0).toFixed(2)} USD`,
+    resolution ? `Resolved via: ${resolution}` : null,
+    overrides.payerMemo ? `Staff note: ${overrides.payerMemo}` : null,
+  ].filter(Boolean);
+
+  const summary = [
+    offer?.hotel_name || `Request #${request.id}`,
+    stay,
+    amountUsd > 0 ? `$${amountUsd.toFixed(2)}` : "amount TBD",
+    name,
+    resolved.email,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+
+  const advice = [];
+  if (missing.some((m) => m.required)) {
+    advice.push(
+      "Fill the required fields below, then create the payment link."
+    );
+  } else if (missing.length) {
+    advice.push(
+      "You can create the link now. Optional fields below improve the invoice."
+    );
+  } else {
+    advice.push(
+      "All key details found. Review the invoice preview, then create the payment link."
+    );
+  }
+
+  return {
+    kind: "hotel",
+    canCreate: amountUsd > 0 && Boolean(resolved.email),
+    needsInput: missing.some((m) => m.required),
+    missing,
+    advice,
+    draft: {
+      customerName: name,
+      customerEmail: resolved.email,
+      emailPlaceholder: resolved.placeholder,
+      amountUsd,
+      currency: "USD",
+      sourceCurrency: currency,
+      sourceAmount: customerPrice,
+      invoiceNumber,
+      lineItems:
+        amountUsd > 0
+          ? [{ name: lineName, unitPrice: amountUsd, quantity: 1 }]
+          : [],
+      payerMemo: memoLines.join("\n").slice(0, 1800),
+      lineItemName: lineName,
+      summary,
+      details: {
+        requestId: request.id,
+        offerId: offer?.id || null,
+        hotelName: offer?.hotel_name || null,
+        roomType: offer?.room_type || null,
+        city: request.city || null,
+        phone: request.phone || null,
+        stay,
+        checkIn: toIsoDate(request.check_in),
+        checkOut: toIsoDate(request.check_out),
+        adults: request.adults ?? null,
+        children: request.children ?? null,
+        rooms: request.rooms ?? null,
+        vatStatus: offer?.vat_status || null,
+        resolution: resolution || null,
+        allOffers: (allOffers || []).map((o) => ({
+          id: o.id,
+          hotel_name: o.hotel_name,
+          customer_price: o.customer_price,
+          currency: o.currency,
+        })),
+      },
+    },
+  };
+}
+
+/**
+ * Build Mercury create opts from a finished draft payload.
+ */
+export function mercuryOptsFromDraft(token, draftPayload) {
+  const d = draftPayload.draft || draftPayload;
+  return {
+    token,
+    customerName: d.customerName,
+    customerEmail: d.customerEmail,
+    invoiceNumber: d.invoiceNumber,
+    amountUsd: d.amountUsd,
+    lineItemName: d.lineItemName,
+    lineItems: d.lineItems,
+    payerMemo: d.payerMemo,
+  };
+}

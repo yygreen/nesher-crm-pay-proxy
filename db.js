@@ -19,7 +19,7 @@ function mapOffer(row) {
   return {
     id: Number(row.id),
     hotel_name: row.hotel_name,
-    customer_price: row.customer_price,
+    customer_price: row.customer_price != null ? Number(row.customer_price) : null,
     currency: row.currency,
     vat_status: row.vat_status,
     room_type: row.room_type,
@@ -41,11 +41,25 @@ function mapRequest(row) {
     check_in: row.check_in,
     check_out: row.check_out,
     internal_notes: row.internal_notes,
+    adults: row.adults ?? null,
+    children: row.children ?? null,
+    rooms: row.rooms ?? null,
   };
 }
 
+/** Soft query — returns [] on any failure (missing table/column). */
+async function softQuery(sql, params = []) {
+  try {
+    const r = await getPool().query(sql, params);
+    return r.rows || [];
+  } catch (e) {
+    console.warn("softQuery failed:", e.message);
+    return [];
+  }
+}
+
 /**
- * Load exact offer + parent request. Fails if offer has no customer_price.
+ * Load offer + parent request. Soft: zero price is allowed (draft will ask for amount).
  */
 export async function loadHotelOfferPayContext(offerId) {
   const p = getPool();
@@ -64,12 +78,6 @@ export async function loadHotelOfferPayContext(offerId) {
   );
   if (!r.rows.length) throw new Error(`Hotel offer ${id} not found`);
   const row = r.rows[0];
-  const price = Number(row.customer_price);
-  if (!Number.isFinite(price) || price <= 0) {
-    throw new Error(
-      `Offer #${id} has no customer price (quote not set) — set Customer Price first`
-    );
-  }
   const request = mapRequest({
     id: row.req_id,
     customer_name: row.customer_name,
@@ -82,13 +90,12 @@ export async function loadHotelOfferPayContext(offerId) {
     internal_notes: row.internal_notes,
   });
   const offer = mapOffer(row);
-  return { request, offer };
+  return { request, offer, soft: true };
 }
 
 /**
- * Resolve the exact quote for a hotel request.
- * @param {number|string} requestId
- * @param {number|string|null} offerId  when set, that offer is required
+ * Resolve hotel request → offer. Soft when unpriced/ambiguous:
+ * returns request + best-effort offer (may be null) + allOffers for the UI.
  */
 export async function loadHotelPayContext(requestId, offerId = null) {
   const p = getPool();
@@ -102,7 +109,7 @@ export async function loadHotelPayContext(requestId, offerId = null) {
         `Offer #${offerId} does not belong to hotel request #${id}`
       );
     }
-    return { ...ctx, resolution: "explicit_offer" };
+    return { ...ctx, resolution: "explicit_offer", soft: true };
   }
 
   const req = await p.query(
@@ -117,22 +124,21 @@ export async function loadHotelPayContext(requestId, offerId = null) {
     `SELECT id, hotel_name, customer_price, currency, vat_status, room_type,
             sent_to_customer, sent_to_customer_at, customer_answer_status, request_id
      FROM core_jrmhoteloffer
-     WHERE request_id = $1 AND customer_price IS NOT NULL AND customer_price::numeric > 0
+     WHERE request_id = $1
      ORDER BY
+       CASE WHEN customer_price IS NOT NULL AND customer_price::numeric > 0 THEN 0 ELSE 1 END,
        CASE WHEN customer_answer_status ILIKE 'accepted%' OR customer_answer_status ILIKE 'book%' THEN 0 ELSE 1 END,
        CASE WHEN sent_to_customer IS TRUE THEN 0 ELSE 1 END,
        sent_to_customer_at DESC NULLS LAST,
        id DESC`,
     [id]
   );
-  const priced = offersRes.rows.map(mapOffer);
-  if (!priced.length) {
-    throw new Error(
-      "No priced offer on this hotel request (set Customer Price on an offer)"
-    );
-  }
+  const allOffers = offersRes.rows.map(mapOffer);
+  const priced = allOffers.filter(
+    (o) => Number.isFinite(Number(o.customer_price)) && Number(o.customer_price) > 0
+  );
 
-  // Prefer accepted/booked, then sent-to-customer, else only if single priced offer
+  // Prefer accepted/booked, then sent-to-customer, else single priced, else latest any
   const accepted = priced.filter(
     (o) =>
       o.customer_answer_status &&
@@ -140,8 +146,10 @@ export async function loadHotelPayContext(requestId, offerId = null) {
   );
   const sent = priced.filter((o) => o.sent_to_customer);
 
-  let offer;
-  let resolution;
+  let offer = null;
+  let resolution = "no_offer";
+  let ambiguous = false;
+
   if (accepted.length === 1) {
     offer = accepted[0];
     resolution = "accepted_offer";
@@ -152,32 +160,108 @@ export async function loadHotelPayContext(requestId, offerId = null) {
     offer = priced[0];
     resolution = "single_priced_offer";
   } else if (sent.length > 1) {
-    // latest sent
     offer = sent[0];
     resolution = "latest_sent_offer";
-  } else {
-    // ambiguous: multiple priced, none clearly the customer quote
-    const summary = priced
-      .map(
-        (o) =>
-          `#${o.id} ${o.hotel_name || "?"} ${o.customer_price} ${o.currency || ""}`
-      )
-      .join("; ");
-    const err = new Error(
-      `Multiple priced offers on request #${id} — open the request and click Pay on the exact quote. Offers: ${summary}`
-    );
-    err.code = "AMBIGUOUS_OFFERS";
-    err.offers = priced;
-    throw err;
+    ambiguous = true;
+  } else if (priced.length > 1) {
+    offer = priced[0];
+    resolution = "multiple_priced_pick_latest";
+    ambiguous = true;
+  } else if (allOffers.length === 1) {
+    offer = allOffers[0];
+    resolution = "single_unpriced_offer";
+  } else if (allOffers.length > 1) {
+    offer = allOffers[0];
+    resolution = "latest_unpriced_offer";
+    ambiguous = true;
   }
 
-  return { request, offer, resolution, allPricedOffers: priced };
+  return {
+    request,
+    offer,
+    resolution,
+    soft: true,
+    ambiguous,
+    allOffers,
+    allPricedOffers: priced,
+  };
+}
+
+async function loadReservationEnrichment(reservationId) {
+  const id = Number(reservationId);
+  const travelers = (
+    await softQuery(
+      `SELECT id, full_name, date_of_birth, passport_number, type
+       FROM core_traveler
+       WHERE reservation_id = $1
+       ORDER BY id`,
+      [id]
+    )
+  ).map((t) => ({
+    id: t.id,
+    full_name: t.full_name,
+    date_of_birth: t.date_of_birth,
+    passport_number: t.passport_number,
+    type: t.type,
+  }));
+
+  // Flights may hang off journey segments
+  let flights = (
+    await softQuery(
+      `SELECT fs.id, fs.airline, fs.flight_number, fs.from_location, fs.to_location,
+              fs.departure_date, fs.departure_time, fs.arrival_date, fs.arrival_time,
+              j.id AS journey_id, j.label AS journey_label
+       FROM core_flightsegment fs
+       JOIN core_journey j ON j.id = fs.journey_id
+       WHERE j.reservation_id = $1
+       ORDER BY fs.departure_date NULLS LAST, fs.id`,
+      [id]
+    )
+  ).map((f) => ({
+    id: f.id,
+    airline: f.airline,
+    flight_number: f.flight_number,
+    from_location: f.from_location,
+    to_location: f.to_location,
+    departure_date: f.departure_date,
+    departure_time: f.departure_time,
+    arrival_date: f.arrival_date,
+    arrival_time: f.arrival_time,
+    journey_id: f.journey_id,
+    journey_label: f.journey_label,
+  }));
+
+  // Alternate schema: segments linked differently or named columns vary
+  if (!flights.length) {
+    flights = (
+      await softQuery(
+        `SELECT id, airline, flight_number, origin AS from_location, destination AS to_location,
+                departure_date, departure_time, arrival_date, arrival_time
+         FROM core_flightsegment
+         WHERE reservation_id = $1
+         ORDER BY departure_date NULLS LAST, id`,
+        [id]
+      )
+    ).map((f) => ({
+      id: f.id,
+      airline: f.airline,
+      flight_number: f.flight_number,
+      from_location: f.from_location,
+      to_location: f.to_location,
+      departure_date: f.departure_date,
+      departure_time: f.departure_time,
+      arrival_date: f.arrival_date,
+      arrival_time: f.arrival_time,
+    }));
+  }
+
+  return { travelers, flights };
 }
 
 /**
- * Resolve payable quote for a reservation.
- * Many SVC/service rows keep customer_price=0 on the reservation header while
- * the real quote lives on journey lines (core_journey.customer_price).
+ * Resolve payable quote for a reservation — SOFT.
+ * Never throws for zero price / zero balance. Still throws if reservation missing.
+ * Packs journey lines, travelers, flights when available.
  */
 export async function loadReservationPayContext(reservationId) {
   const p = getPool();
@@ -201,16 +285,24 @@ export async function loadReservationPayContext(reservationId) {
   let priceSource = "reservation.customer_price";
   let journeyLines = [];
 
+  // Always load journey lines for invoice detail (even when header has a price)
+  const j = await softQuery(
+    `SELECT id, label, customer_price, supplier_cost, line_type, confirmation_number, "order"
+     FROM core_journey
+     WHERE reservation_id = $1
+     ORDER BY "order" NULLS LAST, id`,
+    [id]
+  );
+  journeyLines = j.map((l) => ({
+    id: l.id,
+    label: l.label,
+    customer_price: Number(l.customer_price) || 0,
+    supplier_cost: Number(l.supplier_cost) || 0,
+    line_type: l.line_type,
+    confirmation_number: l.confirmation_number,
+  }));
+
   if (!Number.isFinite(price) || price <= 0) {
-    // Sum journey-level customer prices (service tickets etc.)
-    const j = await p.query(
-      `SELECT id, label, customer_price, supplier_cost, line_type, confirmation_number
-       FROM core_journey
-       WHERE reservation_id = $1
-       ORDER BY "order" NULLS LAST, id`,
-      [id]
-    );
-    journeyLines = j.rows || [];
     const journeySum = journeyLines.reduce(
       (s, line) => s + (Number(line.customer_price) || 0),
       0
@@ -222,48 +314,46 @@ export async function loadReservationPayContext(reservationId) {
   }
 
   if (!Number.isFinite(price) || price <= 0) {
-    // Traveler-level pricing fallback
-    const t = await p.query(
+    const t = await softQuery(
       `SELECT COALESCE(SUM(jtp.customer_price), 0) AS total
        FROM core_journeytravelerpricing jtp
        JOIN core_journey j ON j.id = jtp.journey_id
        WHERE j.reservation_id = $1`,
       [id]
     );
-    const tSum = Number(t.rows[0]?.total || 0);
+    const tSum = Number(t[0]?.total || 0);
     if (tSum > 0) {
       price = Math.round(tSum * 100) / 100;
       priceSource = "sum(journeytravelerpricing.customer_price)";
     }
   }
 
-  if (!Number.isFinite(price) || price <= 0) {
-    const code = row.reservation_code || id;
-    throw new Error(
-      `Reservation ${code} has no payable quote yet (customer_price is 0 and no journey prices). Open the reservation and set Customer Price (or price on the journey/ticket lines), then try Pay again.`
-    );
-  }
+  if (!Number.isFinite(price) || price < 0) price = 0;
 
   const balance = Math.round((price - paid) * 100) / 100;
-  if (!(balance > 0)) {
-    throw new Error(
-      `Reservation has no payable balance (quote $${price.toFixed(2)} − paid $${paid.toFixed(2)} ≤ 0)`
-    );
-  }
+  const { travelers, flights } = await loadReservationEnrichment(id);
+
   return {
     reservation: row,
-    balance,
+    balance: balance > 0 ? balance : 0,
+    soft: true,
+    warnings: [
+      !(price > 0)
+        ? "No customer price on reservation or journey lines — enter amount to charge."
+        : null,
+      price > 0 && !(balance > 0)
+        ? `Quote $${price.toFixed(2)} is fully paid ($${paid.toFixed(2)}). Enter a new amount if charging more.`
+        : null,
+    ].filter(Boolean),
     quote: {
       customer_price: price,
       amount_paid: paid,
-      balance,
+      balance: balance > 0 ? balance : 0,
       currency: "USD",
-      priceSource,
-      journeyLines: journeyLines.map((l) => ({
-        id: l.id,
-        label: l.label,
-        customer_price: Number(l.customer_price) || 0,
-      })),
+      priceSource: price > 0 ? priceSource : null,
+      journeyLines,
+      travelers,
+      flights,
     },
   };
 }

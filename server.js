@@ -1,13 +1,7 @@
 import http from "node:http";
 import { URL } from "node:url";
 import httpProxy from "http-proxy";
-import {
-  createOrReusePaymentRequest,
-  hotelInvoiceNumber,
-  reservationInvoiceNumber,
-  toUsdAmount,
-  defaultIlsSpot,
-} from "./mercury.js";
+import { createOrReusePaymentRequest } from "./mercury.js";
 import { injectPayButtons } from "./inject.js";
 import { injectWhatsAppUi } from "./whatsapp-ui.js";
 import {
@@ -19,10 +13,10 @@ import {
 } from "./db.js";
 import { validateStaffSession } from "./auth.js";
 import {
-  buildHotelQuoteSnapshot,
-  buildReservationQuoteSnapshot,
-  resolveCustomerEmail,
-} from "./quote.js";
+  buildReservationDraft,
+  buildHotelDraft,
+  mercuryOptsFromDraft,
+} from "./draft.js";
 import {
   waConfig,
   downloadWhatsAppMedia,
@@ -140,56 +134,12 @@ async function requireStaff(req, res) {
   return true;
 }
 
-async function createHotelPayment(token, ctx) {
-  const { request, offer } = ctx;
-  const resolved = resolveCustomerEmail(
-    request.email,
-    `jrm${request.id}o${offer.id}`
-  );
-  // Use resolved email in snapshot path
-  const requestForQuote = { ...request, email: resolved.email };
-  const amountUsd = await toUsdAmount(
-    offer.customer_price,
-    offer.currency,
-    defaultIlsSpot
-  );
-  const quote = buildHotelQuoteSnapshot(
-    { ...ctx, request: requestForQuote },
-    amountUsd
-  );
-  quote.emailPlaceholder = resolved.placeholder;
-  const invoiceNumber = hotelInvoiceNumber(request.id, offer.id);
-  const result = await createOrReusePaymentRequest({
-    token,
-    customerName: quote.customerName || resolved.email,
-    customerEmail: resolved.email,
-    invoiceNumber,
-    amountUsd,
-    lineItemName: quote.lineItem,
-    payerMemo: `Exact CRM quote: req #${request.id} offer #${offer.id} | ${quote.summary}`,
-  });
-  try {
-    const ph = resolved.placeholder ? " (placeholder email)" : "";
-    await appendHotelNote(
-      request.id,
-      `[Automated Mercury] ${result.reused ? "Reused" : "Created"} pay link ${result.payUrl} | ${quote.summary} | invoice ${invoiceNumber}${ph}`
-    );
-  } catch (e) {
-    console.warn("note append failed", e.message);
-  }
-  return {
-    ok: true,
-    reused: result.reused,
-    payUrl: result.payUrl,
-    invoiceNumber,
-    amountUsd,
-    slug: result.invoice.slug,
-    invoiceId: result.invoice.id,
-    quote,
-    emailPlaceholder: resolved.placeholder,
-  };
-}
-
+/**
+ * Flexible pay API:
+ * - GET → always returns a draft (rich details + missing fields list). Never hard-fails on missing price/email.
+ * - POST without enough data → same draft + needsInput (200), so UI can fill gaps.
+ * - POST with amount (+ email always resolved) → create Mercury invoice with full memo.
+ */
 async function handlePayApi(req, res, kind, id, query) {
   if (req.method !== "POST" && req.method !== "GET") {
     sendJson(res, 405, { error: "GET (preview) or POST (create) only" });
@@ -199,11 +149,7 @@ async function handlePayApi(req, res, kind, id, query) {
 
   try {
     const token = process.env.MERCURY_TOKEN_NESHER || process.env.MERCURY_TOKEN;
-    if (!token && req.method === "POST") {
-      throw new Error("MERCURY_TOKEN_NESHER not configured on Railway");
-    }
 
-    // Body may include offerId for hotel request-level calls
     let body = {};
     if (req.method === "POST") {
       try {
@@ -212,136 +158,150 @@ async function handlePayApi(req, res, kind, id, query) {
         body = {};
       }
     }
+    // Also accept query overrides on GET for previews
+    const overrides = {
+      ...body,
+      offerId:
+        body.offerId ||
+        body.offer_id ||
+        query.get("offerId") ||
+        query.get("offer_id") ||
+        undefined,
+      amountUsd:
+        body.amountUsd ?? body.amount_usd ?? query.get("amountUsd") ?? undefined,
+      customerEmail:
+        body.customerEmail ??
+        body.customer_email ??
+        query.get("customerEmail") ??
+        undefined,
+      customerName:
+        body.customerName ??
+        body.customer_name ??
+        query.get("customerName") ??
+        undefined,
+      lineItemName: body.lineItemName ?? body.line_item_name,
+      payerMemo: body.payerMemo ?? body.payer_memo,
+      invoiceNumber: body.invoiceNumber ?? body.invoice_number,
+      create: body.create === true || body.create === "1" || query.get("create") === "1",
+    };
+
+    let draftBundle;
+    let ctx;
 
     if (kind === "hotel-offer") {
-      const ctx = await loadHotelOfferPayContext(id);
+      ctx = await loadHotelOfferPayContext(id);
       ctx.resolution = "explicit_offer";
-      if (req.method === "GET") {
-        const amountUsd = await toUsdAmount(
-          ctx.offer.customer_price,
-          ctx.offer.currency,
-          defaultIlsSpot
-        );
-        sendJson(res, 200, {
-          ok: true,
-          preview: true,
-          quote: buildHotelQuoteSnapshot(ctx, amountUsd),
-          invoiceNumber: hotelInvoiceNumber(ctx.request.id, ctx.offer.id),
-        });
-        return;
-      }
-      const out = await createHotelPayment(token, ctx);
-      sendJson(res, 200, out);
+      draftBundle = await buildHotelDraft(ctx, overrides);
+    } else if (kind === "hotel") {
+      ctx = await loadHotelPayContext(id, overrides.offerId || null);
+      draftBundle = await buildHotelDraft(ctx, overrides);
+    } else if (kind === "reservation") {
+      ctx = await loadReservationPayContext(id);
+      draftBundle = buildReservationDraft(ctx, overrides);
+    } else {
+      sendJson(res, 404, { error: "Unknown kind" });
       return;
     }
 
-    if (kind === "hotel") {
-      const offerId =
-        body.offerId || body.offer_id || query.get("offerId") || query.get("offer_id");
-      let ctx;
-      try {
-        ctx = await loadHotelPayContext(id, offerId || null);
-      } catch (e) {
-        if (e.code === "AMBIGUOUS_OFFERS") {
-          sendJson(res, 409, {
-            error: e.message,
-            code: "AMBIGUOUS_OFFERS",
-            offers: e.offers,
-          });
-          return;
-        }
-        throw e;
-      }
-      if (req.method === "GET") {
-        const amountUsd = await toUsdAmount(
-          ctx.offer.customer_price,
-          ctx.offer.currency,
-          defaultIlsSpot
-        );
-        sendJson(res, 200, {
-          ok: true,
-          preview: true,
-          quote: buildHotelQuoteSnapshot(ctx, amountUsd),
-          invoiceNumber: hotelInvoiceNumber(ctx.request.id, ctx.offer.id),
-          resolution: ctx.resolution,
-        });
-        return;
-      }
-      const out = await createHotelPayment(token, ctx);
-      sendJson(res, 200, out);
-      return;
-    }
+    // GET always previews. POST with create:false previews. Otherwise try create (soft if incomplete).
+    const wantsCreate =
+      req.method === "POST" && body.create !== false && query.get("create") !== "0";
 
-    if (kind === "reservation") {
-      const ctx = await loadReservationPayContext(id);
-      const ref =
-        ctx.reservation.reservation_code || `resid${ctx.reservation.id}`;
-      const resolved = resolveCustomerEmail(
-        ctx.reservation.customer_email,
-        `res${ref}`
-      );
-      // Inject resolved email so quote/summary include it
-      const reservationForQuote = {
-        ...ctx.reservation,
-        customer_email: resolved.email,
-      };
-      const amountUsd = await toUsdAmount(ctx.balance, "USD", defaultIlsSpot);
-      const quote = buildReservationQuoteSnapshot(
-        { ...ctx, reservation: reservationForQuote },
-        amountUsd
-      );
-      quote.emailPlaceholder = resolved.placeholder;
-      const invoiceNumber =
-        reservationInvoiceNumber(ctx.reservation.reservation_code) ||
-        `RES-ID${ctx.reservation.id}`;
-      if (req.method === "GET") {
-        sendJson(res, 200, {
-          ok: true,
-          preview: true,
-          quote,
-          invoiceNumber,
-          emailPlaceholder: resolved.placeholder,
-        });
-        return;
-      }
-      const result = await createOrReusePaymentRequest({
-        token,
-        customerName: quote.customerName || resolved.email,
-        customerEmail: resolved.email,
-        invoiceNumber,
-        amountUsd,
-        lineItemName: quote.lineItem,
-        payerMemo: `Exact CRM reservation quote: id ${ctx.reservation.id} | ${quote.summary}`,
-      });
-      try {
-        const ph = resolved.placeholder
-          ? ` | email placeholder ${resolved.email}`
-          : "";
-        await appendReservationNote(
-          ctx.reservation.id,
-          `${result.reused ? "Reused" : "Created"} ${result.payUrl} | ${quote.summary} | ${invoiceNumber}${ph}`
-        );
-      } catch (e) {
-        console.warn("res note failed", e.message);
-      }
+    if (req.method === "GET" || !wantsCreate) {
       sendJson(res, 200, {
         ok: true,
-        reused: result.reused,
-        payUrl: result.payUrl,
-        invoiceNumber,
-        amountUsd,
-        slug: result.invoice.slug,
-        invoiceId: result.invoice.id,
-        quote,
-        emailPlaceholder: resolved.placeholder,
+        preview: true,
+        ...draftBundle,
+        quote: {
+          summary: draftBundle.draft.summary,
+          amountUsd: draftBundle.draft.amountUsd,
+          customerName: draftBundle.draft.customerName,
+          customerEmail: draftBundle.draft.customerEmail,
+          emailPlaceholder: draftBundle.draft.emailPlaceholder,
+          invoiceNumber: draftBundle.draft.invoiceNumber,
+          lineItem: draftBundle.draft.lineItemName,
+          details: draftBundle.draft.details,
+        },
+        invoiceNumber: draftBundle.draft.invoiceNumber,
       });
       return;
     }
 
-    sendJson(res, 404, { error: "Unknown kind" });
+    if (!token) {
+      sendJson(res, 200, {
+        ok: false,
+        needsInput: true,
+        error: "MERCURY_TOKEN_NESHER not configured on Railway",
+        ...draftBundle,
+      });
+      return;
+    }
+
+    // Soft: if cannot create yet, return draft + exact missing fields (HTTP 200, not 400)
+    if (!draftBundle.canCreate) {
+      sendJson(res, 200, {
+        ok: false,
+        needsInput: true,
+        message:
+          "Cannot create yet — fill the required fields below, then try again.",
+        ...draftBundle,
+      });
+      return;
+    }
+
+    const result = await createOrReusePaymentRequest(
+      mercuryOptsFromDraft(token, draftBundle)
+    );
+
+    // CRM note
+    try {
+      const d = draftBundle.draft;
+      const ph = d.emailPlaceholder ? " (placeholder email)" : "";
+      const note = `[Automated Mercury] ${result.reused ? "Reused" : "Created"} pay link ${result.payUrl} | ${d.summary} | invoice ${d.invoiceNumber}${ph}`;
+      if (kind === "reservation") {
+        await appendReservationNote(ctx.reservation.id, note);
+      } else if (ctx.request?.id) {
+        await appendHotelNote(ctx.request.id, note);
+      }
+    } catch (e) {
+      console.warn("note append failed", e.message);
+    }
+
+    sendJson(res, 200, {
+      ok: true,
+      reused: result.reused,
+      payUrl: result.payUrl,
+      invoiceNumber: draftBundle.draft.invoiceNumber,
+      amountUsd: draftBundle.draft.amountUsd,
+      slug: result.invoice.slug,
+      invoiceId: result.invoice.id,
+      emailPlaceholder: draftBundle.draft.emailPlaceholder,
+      missing: draftBundle.missing,
+      advice: draftBundle.advice,
+      draft: draftBundle.draft,
+      quote: {
+        summary: draftBundle.draft.summary,
+        amountUsd: draftBundle.draft.amountUsd,
+        customerName: draftBundle.draft.customerName,
+        customerEmail: draftBundle.draft.customerEmail,
+        emailPlaceholder: draftBundle.draft.emailPlaceholder,
+        invoiceNumber: draftBundle.draft.invoiceNumber,
+        lineItem: draftBundle.draft.lineItemName,
+        details: draftBundle.draft.details,
+      },
+    });
   } catch (e) {
     console.error("pay api error", e);
-    sendJson(res, 400, { error: e.message || String(e) });
+    // Even on unexpected errors, try not to hard-block the UI — structured message
+    sendJson(res, 200, {
+      ok: false,
+      error: e.message || String(e),
+      needsInput: true,
+      advice: [
+        "Something failed loading CRM or talking to Mercury. Check the message, fix any missing fields, and try again.",
+      ],
+      missing: [],
+    });
   }
 }
 

@@ -23,7 +23,7 @@ export function resolveCustomerEmail(realEmail, refForPlaceholder) {
   };
 }
 
-function toIsoDate(v) {
+export function toIsoDate(v) {
   if (v == null || v === "") return null;
   if (v instanceof Date && !Number.isNaN(v.getTime())) {
     return v.toISOString().slice(0, 10);

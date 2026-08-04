@@ -98,14 +98,44 @@ export async function defaultIlsSpot() {
 }
 
 /**
+ * Normalize line items for Mercury AR.
+ * Accepts opts.lineItems[] or falls back to single lineItemName + amountUsd.
+ */
+export function buildLineItems(opts) {
+  const amountUsd = Number(opts.amountUsd);
+  if (Array.isArray(opts.lineItems) && opts.lineItems.length) {
+    const items = opts.lineItems
+      .map((li) => ({
+        name: String(li.name || opts.lineItemName || opts.invoiceNumber || "Payment")
+          .slice(0, 180),
+        unitPrice: Number(li.unitPrice ?? li.unit_price ?? li.amount),
+        quantity: Number(li.quantity) > 0 ? Number(li.quantity) : 1,
+      }))
+      .filter((li) => Number.isFinite(li.unitPrice) && li.unitPrice > 0);
+    if (items.length) return items;
+  }
+  if (!Number.isFinite(amountUsd) || amountUsd <= 0) {
+    throw new Error("amountUsd must be positive (or provide priced lineItems)");
+  }
+  return [
+    {
+      name: String(opts.lineItemName || opts.invoiceNumber || "Payment").slice(0, 180),
+      unitPrice: amountUsd,
+      quantity: 1,
+    },
+  ];
+}
+
+/**
  * Create or reuse an unpaid Mercury AR invoice.
  * @param {object} opts
  * @param {string} opts.token
  * @param {string} opts.customerName
  * @param {string} opts.customerEmail
  * @param {string} opts.invoiceNumber
- * @param {number} opts.amountUsd
- * @param {string} opts.lineItemName
+ * @param {number} [opts.amountUsd]
+ * @param {string} [opts.lineItemName]
+ * @param {Array<{name:string,unitPrice:number,quantity?:number}>} [opts.lineItems]
  * @param {string} [opts.payerMemo]
  * @param {string} [opts.destinationAccountId]
  * @param {typeof fetch} [opts.fetchImpl]
@@ -122,7 +152,13 @@ export async function createOrReusePaymentRequest(opts) {
   if (!email) throw new Error("Customer email is required for Mercury AR invoices");
   const invoiceNumber = String(opts.invoiceNumber || "").trim();
   if (!invoiceNumber) throw new Error("invoiceNumber required");
-  const amountUsd = Number(opts.amountUsd);
+  const lineItems = buildLineItems(opts);
+  const amountUsd =
+    Number(opts.amountUsd) > 0
+      ? Number(opts.amountUsd)
+      : Math.round(
+          lineItems.reduce((s, li) => s + li.unitPrice * li.quantity, 0) * 100
+        ) / 100;
   if (!Number.isFinite(amountUsd) || amountUsd <= 0) {
     throw new Error("amountUsd must be positive");
   }
@@ -184,10 +220,14 @@ export async function createOrReusePaymentRequest(opts) {
     customer = await createCust.json();
   }
 
-  // 3) Create invoice
+  // 3) Create invoice — pack every detail into payerMemo + multi line items
   const today = new Date();
   const due = new Date(today.getTime() + 24 * 60 * 60 * 1000);
   const iso = (d) => d.toISOString().slice(0, 10);
+  const memo = String(
+    opts.payerMemo ||
+      `Nesher CRM pay link for ${invoiceNumber}. Do not reply to this memo.`
+  ).slice(0, 2000);
   const body = {
     customerId: customer.id,
     destinationAccountId: dest,
@@ -199,16 +239,8 @@ export async function createOrReusePaymentRequest(opts) {
     achDebitEnabled: true,
     useRealAccountNumber: false,
     sendEmailOption: "DontSend",
-    payerMemo:
-      opts.payerMemo ||
-      `Nesher CRM pay link for ${invoiceNumber}. Do not reply to this memo.`,
-    lineItems: [
-      {
-        name: opts.lineItemName || invoiceNumber,
-        unitPrice: amountUsd,
-        quantity: 1,
-      },
-    ],
+    payerMemo: memo,
+    lineItems,
   };
 
   const invRes = await fetchImpl(`${MERCURY_API}/ar/invoices`, {
