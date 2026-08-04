@@ -186,6 +186,62 @@ export async function getContact(contactId) {
 }
 
 /**
+ * One-query inbox: every contact with its last message + linked customer name.
+ */
+export async function listInboxSummaries() {
+  const p = getPool();
+  const r = await p.query(
+    `SELECT c.id, c.phone_number, c.display_name, c.unread_count,
+            c.is_archived, c.customer_id, cust.full_name AS customer_name,
+            m.direction AS lm_direction, m.status AS lm_status,
+            m.message_type AS lm_type, m.body AS lm_body,
+            m.message_at AS lm_at, m.raw_payload AS lm_raw
+     FROM core_whatsappcontact c
+     LEFT JOIN core_customer cust ON cust.id = c.customer_id
+     LEFT JOIN LATERAL (
+       SELECT direction, status, message_type, body, message_at, raw_payload
+       FROM core_whatsappmessage
+       WHERE contact_id = c.id
+       ORDER BY message_at DESC, id DESC
+       LIMIT 1
+     ) m ON TRUE
+     ORDER BY COALESCE(m.message_at, c.last_message_at, c.created_at) DESC NULLS LAST`
+  );
+  return r.rows.map((row) => ({
+    id: Number(row.id),
+    phone: row.phone_number,
+    name: row.display_name,
+    unread: Number(row.unread_count) || 0,
+    archived: Boolean(row.is_archived),
+    customerId: row.customer_id ? Number(row.customer_id) : null,
+    customerName: row.customer_name || null,
+    lastMessage: row.lm_at
+      ? {
+          direction: row.lm_direction,
+          status: row.lm_status,
+          messageType: row.lm_type,
+          body: row.lm_body,
+          messageAt: row.lm_at,
+          voice: Boolean(row.lm_raw?.audio?.voice),
+        }
+      : null,
+  }));
+}
+
+/**
+ * Zero the unread counter (the operator is looking at the open chat).
+ */
+export async function markContactRead(contactId) {
+  const p = getPool();
+  const id = Number(contactId);
+  if (!Number.isFinite(id)) return;
+  await p.query(
+    `UPDATE core_whatsappcontact SET unread_count = 0 WHERE id = $1 AND unread_count <> 0`,
+    [id]
+  );
+}
+
+/**
  * List messages for a contact (newest last for chat UI).
  */
 export async function listContactMessages(contactId, limit = 100) {

@@ -19,6 +19,15 @@ const STAFF_MARKERS = [
   /Reservations/i,
 ];
 
+// Positive-result session cache: chat polling calls the API every few seconds
+// and each validation costs a full upstream page render without it.
+const AUTH_CACHE_TTL_MS = Number(process.env.AUTH_CACHE_TTL_MS || 60_000);
+const authCache = new Map(); // sessionId -> expiry epoch ms
+
+export function clearAuthCache() {
+  authCache.clear();
+}
+
 /**
  * @param {string} cookieHeader
  * @returns {string|null} sessionid value or null
@@ -74,6 +83,11 @@ export async function validateStaffSession(opts) {
     return { ok: false, reason: "missing_or_invalid_sessionid" };
   }
 
+  const cachedUntil = authCache.get(sessionId);
+  if (cachedUntil && cachedUntil > Date.now()) {
+    return { ok: true, cached: true };
+  }
+
   const upstream = (opts.upstream || "").replace(/\/$/, "");
   const publicHost = opts.publicHost || "crm.flynesher.com";
   const fetchImpl = opts.fetchImpl || fetch;
@@ -110,6 +124,8 @@ export async function validateStaffSession(opts) {
   }
 
   if (isAuthenticatedCrmResponse(res.status, body, location)) {
+    if (authCache.size > 200) authCache.clear();
+    authCache.set(sessionId, Date.now() + AUTH_CACHE_TTL_MS);
     return { ok: true };
   }
   return {
