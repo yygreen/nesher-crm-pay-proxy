@@ -15,6 +15,7 @@ import {
   appendHotelNote,
   appendReservationNote,
 } from "./db.js";
+import { validateStaffSession } from "./auth.js";
 
 const PORT = Number(process.env.PORT || 8080);
 const UPSTREAM =
@@ -79,19 +80,22 @@ function sendJson(res, status, obj) {
   res.end(body);
 }
 
-/** Session cookie present ≈ staff browser session from CRM login. */
-function hasSession(req) {
-  const c = req.headers.cookie || "";
-  return /sessionid=/.test(c);
-}
-
 async function handlePayApi(req, res, kind, id) {
   if (req.method !== "POST") {
     sendJson(res, 405, { error: "POST only" });
     return;
   }
-  if (!hasSession(req)) {
-    sendJson(res, 401, { error: "Login required" });
+  // Validate real Django session against CRM (forged sessionid must fail)
+  const auth = await validateStaffSession({
+    cookieHeader: req.headers.cookie || "",
+    upstream: UPSTREAM,
+    publicHost: PUBLIC_HOST,
+  });
+  if (!auth.ok) {
+    sendJson(res, 401, {
+      error: "Login required",
+      reason: auth.reason || "unauthorized",
+    });
     return;
   }
   try {
