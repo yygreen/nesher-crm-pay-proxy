@@ -1,0 +1,17 @@
+{
+  "name": "nesher-crm-pay-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "http-proxy": "^1.18.1",
+    "pg": "^8.16.0"
+  }
+}

@@ -1,0 +1,205 @@
+/**
+ * Mercury AR create-or-reuse payment request helpers.
+ * HTTP boundary is injectable for unit tests.
+ */
+
+const MERCURY_API = "https://api.mercury.com/api/v1";
+const DEFAULT_DEST = "841f6d7c-53b8-11f1-a581-8f1a5e965da2";
+
+export function payUrlFromSlug(slug) {
+  if (!slug) return null;
+  return `https://app.mercury.com/pay/${slug}`;
+}
+
+export function normalizeToken(token) {
+  if (!token) return "";
+  const t = String(token).trim();
+  if (t.startsWith("secret-token:")) return t;
+  if (t.startsWith("mercury_")) return `secret-token:${t}`;
+  return t;
+}
+
+/** Stable invoice numbers matching Nesher autopilot conventions. */
+export function hotelInvoiceNumber(requestId, offerId) {
+  const base = `JRM-1${requestId}`;
+  return offerId ? `${base}-O${offerId}` : base;
+}
+
+export function reservationInvoiceNumber(code) {
+  const clean = String(code || "")
+    .trim()
+    .replace(/[^A-Za-z0-9_-]/g, "")
+    .toUpperCase();
+  return clean ? `RES-${clean}` : null;
+}
+
+/**
+ * Convert amount to USD if needed (ILS → USD at spot * 1.03).
+ * @param {number} amount
+ * @param {string} currency
+ * @param {() => Promise<number>} getIlsSpot  returns ILS per 1 USD
+ */
+export async function toUsdAmount(amount, currency, getIlsSpot) {
+  const n = Number(amount);
+  if (!Number.isFinite(n) || n <= 0) {
+    throw new Error("Amount must be a positive number");
+  }
+  const cur = String(currency || "USD").trim().toUpperCase();
+  if (cur === "USD" || cur === "US$" || cur === "$") {
+    return Math.round(n * 100) / 100;
+  }
+  if (cur === "ILS" || cur === "NIS" || cur === "₪") {
+    const spot = await getIlsSpot();
+    if (!spot || spot <= 0) throw new Error("Could not fetch ILS/USD spot rate");
+    // usd = ils / spot * 1.03  (locked Nesher pricing rule)
+    return Math.round((n / spot) * 1.03 * 100) / 100;
+  }
+  // assume already USD-ish
+  return Math.round(n * 100) / 100;
+}
+
+export async function defaultIlsSpot() {
+  try {
+    const r = await fetch("https://open.er-api.com/v6/latest/USD");
+    if (r.ok) {
+      const j = await r.json();
+      if (j?.rates?.ILS) return Number(j.rates.ILS);
+    }
+  } catch {
+    /* fall through */
+  }
+  const r2 = await fetch("https://api.frankfurter.app/latest?from=USD&to=ILS");
+  if (!r2.ok) throw new Error("FX rate fetch failed");
+  const j2 = await r2.json();
+  return Number(j2.rates.ILS);
+}
+
+/**
+ * Create or reuse an unpaid Mercury AR invoice.
+ * @param {object} opts
+ * @param {string} opts.token
+ * @param {string} opts.customerName
+ * @param {string} opts.customerEmail
+ * @param {string} opts.invoiceNumber
+ * @param {number} opts.amountUsd
+ * @param {string} opts.lineItemName
+ * @param {string} [opts.payerMemo]
+ * @param {string} [opts.destinationAccountId]
+ * @param {typeof fetch} [opts.fetchImpl]
+ * @returns {Promise<{ reused: boolean, invoice: object, payUrl: string }>}
+ */
+export async function createOrReusePaymentRequest(opts) {
+  const fetchImpl = opts.fetchImpl || fetch;
+  const token = normalizeToken(opts.token);
+  if (!token) throw new Error("MERCURY_TOKEN missing");
+  const email = String(opts.customerEmail || "").trim().toLowerCase();
+  const name = String(opts.customerName || "").trim() || email || "Customer";
+  if (!email) throw new Error("Customer email is required for Mercury AR invoices");
+  const invoiceNumber = String(opts.invoiceNumber || "").trim();
+  if (!invoiceNumber) throw new Error("invoiceNumber required");
+  const amountUsd = Number(opts.amountUsd);
+  if (!Number.isFinite(amountUsd) || amountUsd <= 0) {
+    throw new Error("amountUsd must be positive");
+  }
+  const dest =
+    opts.destinationAccountId ||
+    process.env.MERCURY_DESTINATION_ACCOUNT_ID ||
+    DEFAULT_DEST;
+
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    Accept: "application/json",
+    "Content-Type": "application/json",
+  };
+
+  // 1) Reuse unpaid invoice with same number
+  const listRes = await fetchImpl(`${MERCURY_API}/ar/invoices`, { headers });
+  if (!listRes.ok) {
+    const t = await listRes.text();
+    throw new Error(`Mercury list invoices failed: ${listRes.status} ${t}`);
+  }
+  const listJson = await listRes.json();
+  const invoices = listJson.invoices || listJson || [];
+  const existing = invoices.find(
+    (inv) =>
+      inv.invoiceNumber === invoiceNumber &&
+      String(inv.status || "").toLowerCase() === "unpaid"
+  );
+  if (existing?.slug) {
+    return {
+      reused: true,
+      invoice: existing,
+      payUrl: payUrlFromSlug(existing.slug),
+    };
+  }
+
+  // 2) Find or create customer by email
+  const custRes = await fetchImpl(`${MERCURY_API}/ar/customers`, { headers });
+  if (!custRes.ok) {
+    const t = await custRes.text();
+    throw new Error(`Mercury list customers failed: ${custRes.status} ${t}`);
+  }
+  const custJson = await custRes.json();
+  const customers = custJson.customers || [];
+  let customer = customers.find(
+    (c) => String(c.email || "").trim().toLowerCase() === email
+  );
+  if (!customer) {
+    const createCust = await fetchImpl(`${MERCURY_API}/ar/customers`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ name, email }),
+    });
+    if (!createCust.ok) {
+      const t = await createCust.text();
+      throw new Error(`Mercury create customer failed: ${createCust.status} ${t}`);
+    }
+    customer = await createCust.json();
+  }
+
+  // 3) Create invoice
+  const today = new Date();
+  const due = new Date(today.getTime() + 24 * 60 * 60 * 1000);
+  const iso = (d) => d.toISOString().slice(0, 10);
+  const body = {
+    customerId: customer.id,
+    destinationAccountId: dest,
+    invoiceDate: iso(today),
+    dueDate: iso(due),
+    invoiceNumber,
+    ccEmails: [],
+    creditCardEnabled: true,
+    achDebitEnabled: true,
+    useRealAccountNumber: false,
+    sendEmailOption: "DontSend",
+    payerMemo:
+      opts.payerMemo ||
+      `Nesher CRM pay link for ${invoiceNumber}. Do not reply to this memo.`,
+    lineItems: [
+      {
+        name: opts.lineItemName || invoiceNumber,
+        unitPrice: amountUsd,
+        quantity: 1,
+      },
+    ],
+  };
+
+  const invRes = await fetchImpl(`${MERCURY_API}/ar/invoices`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+  });
+  if (!invRes.ok) {
+    const t = await invRes.text();
+    throw new Error(`Mercury create invoice failed: ${invRes.status} ${t}`);
+  }
+  const invoice = await invRes.json();
+  if (!invoice.slug) throw new Error("Mercury invoice missing slug");
+  return {
+    reused: false,
+    invoice,
+    payUrl: payUrlFromSlug(invoice.slug),
+  };
+}
+
+export { MERCURY_API, DEFAULT_DEST };
