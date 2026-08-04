@@ -4,8 +4,27 @@ import {
   buildHotelQuoteSnapshot,
   buildReservationQuoteSnapshot,
   formatStay,
+  resolveCustomerEmail,
 } from "../quote.js";
 import { injectPayButtons, BUTTON_MARKER } from "../inject.js";
+
+describe("resolveCustomerEmail", () => {
+  it("keeps a real email", () => {
+    const r = resolveCustomerEmail("  Person@Example.com ", "9FSGMN");
+    assert.equal(r.email, "person@example.com");
+    assert.equal(r.placeholder, false);
+  });
+  it("builds booking+ placeholder for missing email", () => {
+    const r = resolveCustomerEmail("", "RES-9FSGMN");
+    assert.equal(r.email, "booking+res9fsgmn@jrmhotels.com");
+    assert.equal(r.placeholder, true);
+  });
+  it("builds placeholder when email blank", () => {
+    const r = resolveCustomerEmail(null, "abc-12");
+    assert.equal(r.placeholder, true);
+    assert.match(r.email, /^booking\+abc12@jrmhotels\.com$/);
+  });
+});
 
 describe("quote snapshots", () => {
   it("formats stay range", () => {

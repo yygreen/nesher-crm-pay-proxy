@@ -2,6 +2,27 @@
  * Build a clear quote snapshot for UI + invoice memo (exact CRM quote → Mercury).
  */
 
+/**
+ * Mercury AR requires an email. Nesher convention (pricing skill):
+ * booking+<ref>@jrmhotels.com when CRM has no email.
+ */
+export function resolveCustomerEmail(realEmail, refForPlaceholder) {
+  const email = String(realEmail || "").trim().toLowerCase();
+  if (email && email.includes("@")) {
+    return { email, placeholder: false };
+  }
+  const ref =
+    String(refForPlaceholder || "unknown")
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "")
+      .slice(0, 40) || "unknown";
+  return {
+    email: `booking+${ref}@jrmhotels.com`,
+    placeholder: true,
+  };
+}
+
 function toIsoDate(v) {
   if (v == null || v === "") return null;
   if (v instanceof Date && !Number.isNaN(v.getTime())) {

@@ -21,6 +21,7 @@ import { validateStaffSession } from "./auth.js";
 import {
   buildHotelQuoteSnapshot,
   buildReservationQuoteSnapshot,
+  resolveCustomerEmail,
 } from "./quote.js";
 
 const PORT = Number(process.env.PORT || 8080);
@@ -104,28 +105,37 @@ async function requireStaff(req, res) {
 
 async function createHotelPayment(token, ctx) {
   const { request, offer } = ctx;
-  const email = String(request.email || "").trim();
-  if (!email) throw new Error("Hotel request has no customer email");
+  const resolved = resolveCustomerEmail(
+    request.email,
+    `jrm${request.id}o${offer.id}`
+  );
+  // Use resolved email in snapshot path
+  const requestForQuote = { ...request, email: resolved.email };
   const amountUsd = await toUsdAmount(
     offer.customer_price,
     offer.currency,
     defaultIlsSpot
   );
-  const quote = buildHotelQuoteSnapshot(ctx, amountUsd);
+  const quote = buildHotelQuoteSnapshot(
+    { ...ctx, request: requestForQuote },
+    amountUsd
+  );
+  quote.emailPlaceholder = resolved.placeholder;
   const invoiceNumber = hotelInvoiceNumber(request.id, offer.id);
   const result = await createOrReusePaymentRequest({
     token,
-    customerName: quote.customerName || email,
-    customerEmail: email,
+    customerName: quote.customerName || resolved.email,
+    customerEmail: resolved.email,
     invoiceNumber,
     amountUsd,
     lineItemName: quote.lineItem,
     payerMemo: `Exact CRM quote: req #${request.id} offer #${offer.id} | ${quote.summary}`,
   });
   try {
+    const ph = resolved.placeholder ? " (placeholder email)" : "";
     await appendHotelNote(
       request.id,
-      `[Automated Mercury] ${result.reused ? "Reused" : "Created"} pay link ${result.payUrl} | ${quote.summary} | invoice ${invoiceNumber}`
+      `[Automated Mercury] ${result.reused ? "Reused" : "Created"} pay link ${result.payUrl} | ${quote.summary} | invoice ${invoiceNumber}${ph}`
     );
   } catch (e) {
     console.warn("note append failed", e.message);
@@ -139,6 +149,7 @@ async function createHotelPayment(token, ctx) {
     slug: result.invoice.slug,
     invoiceId: result.invoice.id,
     quote,
+    emailPlaceholder: resolved.placeholder,
   };
 }
 
@@ -226,14 +237,23 @@ async function handlePayApi(req, res, kind, id, query) {
 
     if (kind === "reservation") {
       const ctx = await loadReservationPayContext(id);
-      const email = String(ctx.reservation.customer_email || "").trim();
-      if (!email) {
-        throw new Error(
-          "Reservation customer has no email — set email on the customer record first"
-        );
-      }
+      const ref =
+        ctx.reservation.reservation_code || `resid${ctx.reservation.id}`;
+      const resolved = resolveCustomerEmail(
+        ctx.reservation.customer_email,
+        `res${ref}`
+      );
+      // Inject resolved email so quote/summary include it
+      const reservationForQuote = {
+        ...ctx.reservation,
+        customer_email: resolved.email,
+      };
       const amountUsd = await toUsdAmount(ctx.balance, "USD", defaultIlsSpot);
-      const quote = buildReservationQuoteSnapshot(ctx, amountUsd);
+      const quote = buildReservationQuoteSnapshot(
+        { ...ctx, reservation: reservationForQuote },
+        amountUsd
+      );
+      quote.emailPlaceholder = resolved.placeholder;
       const invoiceNumber =
         reservationInvoiceNumber(ctx.reservation.reservation_code) ||
         `RES-ID${ctx.reservation.id}`;
@@ -243,22 +263,26 @@ async function handlePayApi(req, res, kind, id, query) {
           preview: true,
           quote,
           invoiceNumber,
+          emailPlaceholder: resolved.placeholder,
         });
         return;
       }
       const result = await createOrReusePaymentRequest({
         token,
-        customerName: quote.customerName || email,
-        customerEmail: email,
+        customerName: quote.customerName || resolved.email,
+        customerEmail: resolved.email,
         invoiceNumber,
         amountUsd,
         lineItemName: quote.lineItem,
         payerMemo: `Exact CRM reservation quote: id ${ctx.reservation.id} | ${quote.summary}`,
       });
       try {
+        const ph = resolved.placeholder
+          ? ` | email placeholder ${resolved.email}`
+          : "";
         await appendReservationNote(
           ctx.reservation.id,
-          `${result.reused ? "Reused" : "Created"} ${result.payUrl} | ${quote.summary} | ${invoiceNumber}`
+          `${result.reused ? "Reused" : "Created"} ${result.payUrl} | ${quote.summary} | ${invoiceNumber}${ph}`
         );
       } catch (e) {
         console.warn("res note failed", e.message);
@@ -272,6 +296,7 @@ async function handlePayApi(req, res, kind, id, query) {
         slug: result.invoice.slug,
         invoiceId: result.invoice.id,
         quote,
+        emailPlaceholder: resolved.placeholder,
       });
       return;
     }
