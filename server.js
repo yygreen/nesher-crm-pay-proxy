@@ -28,6 +28,8 @@ import {
   downloadWhatsAppMedia,
   getContact,
   listContactMessages,
+  listInboxSummaries,
+  markContactRead,
   sendContactAudio,
 } from "./whatsapp-media.js";
 
@@ -73,6 +75,23 @@ proxy.on("proxyReq", (proxyReq, req) => {
   proxyReq.setHeader("host", host);
   proxyReq.setHeader("x-forwarded-host", host);
   proxyReq.setHeader("x-forwarded-proto", "https");
+  // Avoid header overflow / hop-by-hop junk on long sessions
+  for (const h of [
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+  ]) {
+    try {
+      proxyReq.removeHeader(h);
+    } catch {
+      /* ignore */
+    }
+  }
 });
 
 function isHtml(headers) {
@@ -364,7 +383,26 @@ async function handleWaMedia(req, res, mediaId) {
   }
 }
 
-async function handleWaMessages(req, res, contactId) {
+async function handleWaInbox(req, res) {
+  if (req.method !== "GET") {
+    sendJson(res, 405, { error: "GET only" });
+    return;
+  }
+  if (!(await requireStaff(req, res))) return;
+  try {
+    const chats = await listInboxSummaries();
+    sendJson(res, 200, {
+      ok: true,
+      chats,
+      whatsappConfigured: waConfig().configured,
+    });
+  } catch (e) {
+    console.error("wa inbox", e.message);
+    sendJson(res, 400, { error: e.message || String(e) });
+  }
+}
+
+async function handleWaMessages(req, res, contactId, query) {
   if (req.method !== "GET") {
     sendJson(res, 405, { error: "GET only" });
     return;
@@ -373,6 +411,11 @@ async function handleWaMessages(req, res, contactId) {
   try {
     const contact = await getContact(contactId);
     const messages = await listContactMessages(contactId);
+    if (query && query.get("read") === "1") {
+      markContactRead(contactId).catch((e) =>
+        console.warn("mark read failed", e.message)
+      );
+    }
     sendJson(res, 200, {
       ok: true,
       contact: {
@@ -533,11 +576,15 @@ const server = http.createServer(async (req, res) => {
     await handleWaMedia(req, res, waMediaMatch[1]);
     return;
   }
+  if (/^\/__nesher_wa\/inbox\/?$/.test(url.pathname)) {
+    await handleWaInbox(req, res);
+    return;
+  }
   const waMsgsMatch = url.pathname.match(
     /^\/__nesher_wa\/contact\/(\d+)\/messages\/?$/
   );
   if (waMsgsMatch) {
-    await handleWaMessages(req, res, waMsgsMatch[1]);
+    await handleWaMessages(req, res, waMsgsMatch[1], url.searchParams);
     return;
   }
   const waSendAudioMatch = url.pathname.match(
