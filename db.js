@@ -174,6 +174,11 @@ export async function loadHotelPayContext(requestId, offerId = null) {
   return { request, offer, resolution, allPricedOffers: priced };
 }
 
+/**
+ * Resolve payable quote for a reservation.
+ * Many SVC/service rows keep customer_price=0 on the reservation header while
+ * the real quote lives on journey lines (core_journey.customer_price).
+ */
 export async function loadReservationPayContext(reservationId) {
   const p = getPool();
   const id = Number(reservationId);
@@ -181,7 +186,7 @@ export async function loadReservationPayContext(reservationId) {
 
   const r = await p.query(
     `SELECT res.id, res.reservation_code, res.customer_price, res.amount_paid, res.is_closed, res.notes,
-            res.booking_method, res.supplier_cost,
+            res.booking_method, res.supplier_cost, res.tax_amount,
             cust.full_name AS customer_name, cust.email AS customer_email, cust.phone
      FROM core_reservation res
      LEFT JOIN core_customer cust ON cust.id = res.customer_id
@@ -190,15 +195,59 @@ export async function loadReservationPayContext(reservationId) {
   );
   if (!r.rows.length) throw new Error(`Reservation ${id} not found`);
   const row = r.rows[0];
-  const price = Number(row.customer_price || 0);
   const paid = Number(row.amount_paid || 0);
+
+  let price = Number(row.customer_price || 0);
+  let priceSource = "reservation.customer_price";
+  let journeyLines = [];
+
   if (!Number.isFinite(price) || price <= 0) {
-    throw new Error("Reservation has no customer_price quote");
+    // Sum journey-level customer prices (service tickets etc.)
+    const j = await p.query(
+      `SELECT id, label, customer_price, supplier_cost, line_type, confirmation_number
+       FROM core_journey
+       WHERE reservation_id = $1
+       ORDER BY "order" NULLS LAST, id`,
+      [id]
+    );
+    journeyLines = j.rows || [];
+    const journeySum = journeyLines.reduce(
+      (s, line) => s + (Number(line.customer_price) || 0),
+      0
+    );
+    if (journeySum > 0) {
+      price = Math.round(journeySum * 100) / 100;
+      priceSource = "sum(journey.customer_price)";
+    }
   }
+
+  if (!Number.isFinite(price) || price <= 0) {
+    // Traveler-level pricing fallback
+    const t = await p.query(
+      `SELECT COALESCE(SUM(jtp.customer_price), 0) AS total
+       FROM core_journeytravelerpricing jtp
+       JOIN core_journey j ON j.id = jtp.journey_id
+       WHERE j.reservation_id = $1`,
+      [id]
+    );
+    const tSum = Number(t.rows[0]?.total || 0);
+    if (tSum > 0) {
+      price = Math.round(tSum * 100) / 100;
+      priceSource = "sum(journeytravelerpricing.customer_price)";
+    }
+  }
+
+  if (!Number.isFinite(price) || price <= 0) {
+    const code = row.reservation_code || id;
+    throw new Error(
+      `Reservation ${code} has no payable quote yet (customer_price is 0 and no journey prices). Open the reservation and set Customer Price (or price on the journey/ticket lines), then try Pay again.`
+    );
+  }
+
   const balance = Math.round((price - paid) * 100) / 100;
   if (!(balance > 0)) {
     throw new Error(
-      "Reservation has no payable balance (customer_price - amount_paid <= 0)"
+      `Reservation has no payable balance (quote $${price.toFixed(2)} − paid $${paid.toFixed(2)} ≤ 0)`
     );
   }
   return {
@@ -209,6 +258,12 @@ export async function loadReservationPayContext(reservationId) {
       amount_paid: paid,
       balance,
       currency: "USD",
+      priceSource,
+      journeyLines: journeyLines.map((l) => ({
+        id: l.id,
+        label: l.label,
+        customer_price: Number(l.customer_price) || 0,
+      })),
     },
   };
 }

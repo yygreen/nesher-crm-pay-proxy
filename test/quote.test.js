@@ -86,6 +86,30 @@ describe("quote snapshots", () => {
     assert.equal(snap.customerEmail, "info@flynesher.com");
     assert.match(snap.summary, /due \$1507\.03/);
   });
+
+  it("includes journey line prices in summary when priceSource is journeys", () => {
+    const snap = buildReservationQuoteSnapshot(
+      {
+        reservation: {
+          id: 346,
+          reservation_code: "SVC-194-x",
+          customer_name: "Test",
+          customer_email: "booking+x@jrmhotels.com",
+        },
+        balance: 1500,
+        quote: {
+          customer_price: 1500,
+          amount_paid: 0,
+          balance: 1500,
+          priceSource: "sum(journey.customer_price)",
+          journeyLines: [{ id: 1, label: "Ticket feb 5", customer_price: 1500 }],
+        },
+      },
+      1500
+    );
+    assert.match(snap.summary, /Ticket feb 5/);
+    assert.match(snap.summary, /sum\(journey/);
+  });
 });
 
 describe("inject per-offer buttons", () => {

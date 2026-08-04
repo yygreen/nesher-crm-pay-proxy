@@ -92,6 +92,10 @@ export function buildHotelQuoteSnapshot(ctx, amountUsd) {
 export function buildReservationQuoteSnapshot(ctx, amountUsd) {
   const { reservation, balance, quote } = ctx;
   const email = String(reservation.customer_email || "").trim();
+  const lines = (quote.journeyLines || [])
+    .filter((l) => l.customer_price > 0)
+    .map((l) => `${l.label || "line"} $${Number(l.customer_price).toFixed(2)}`)
+    .slice(0, 4);
   return {
     kind: "reservation_balance",
     reservationId: Number(reservation.id),
@@ -104,10 +108,16 @@ export function buildReservationQuoteSnapshot(ctx, amountUsd) {
     balance: Number(balance),
     currency: "USD",
     amountUsd: Number(amountUsd),
+    priceSource: quote.priceSource || "reservation.customer_price",
+    journeyLines: quote.journeyLines || [],
     lineItem: `Reservation ${reservation.reservation_code || reservation.id} balance due`,
     summary: [
       `RES ${reservation.reservation_code || reservation.id}`,
       `quote $${Number(quote.customer_price).toFixed(2)}`,
+      quote.priceSource && quote.priceSource !== "reservation.customer_price"
+        ? `(${quote.priceSource})`
+        : null,
+      lines.length ? lines.join(" + ") : null,
       `paid $${Number(quote.amount_paid).toFixed(2)}`,
       `due $${Number(balance).toFixed(2)}`,
       email || null,
