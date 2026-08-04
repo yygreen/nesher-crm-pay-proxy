@@ -11,11 +11,16 @@ import {
 import { injectPayButtons } from "./inject.js";
 import {
   loadHotelPayContext,
+  loadHotelOfferPayContext,
   loadReservationPayContext,
   appendHotelNote,
   appendReservationNote,
 } from "./db.js";
 import { validateStaffSession } from "./auth.js";
+import {
+  buildHotelQuoteSnapshot,
+  buildReservationQuoteSnapshot,
+} from "./quote.js";
 
 const PORT = Number(process.env.PORT || 8080);
 const UPSTREAM =
@@ -80,12 +85,7 @@ function sendJson(res, status, obj) {
   res.end(body);
 }
 
-async function handlePayApi(req, res, kind, id) {
-  if (req.method !== "POST") {
-    sendJson(res, 405, { error: "POST only" });
-    return;
-  }
-  // Validate real Django session against CRM (forged sessionid must fail)
+async function requireStaff(req, res) {
   const auth = await validateStaffSession({
     cookieHeader: req.headers.cookie || "",
     upstream: UPSTREAM,
@@ -96,78 +96,168 @@ async function handlePayApi(req, res, kind, id) {
       error: "Login required",
       reason: auth.reason || "unauthorized",
     });
+    return false;
+  }
+  return true;
+}
+
+async function createHotelPayment(token, ctx) {
+  const { request, offer } = ctx;
+  const email = String(request.email || "").trim();
+  if (!email) throw new Error("Hotel request has no customer email");
+  const amountUsd = await toUsdAmount(
+    offer.customer_price,
+    offer.currency,
+    defaultIlsSpot
+  );
+  const quote = buildHotelQuoteSnapshot(ctx, amountUsd);
+  const invoiceNumber = hotelInvoiceNumber(request.id, offer.id);
+  const result = await createOrReusePaymentRequest({
+    token,
+    customerName: quote.customerName || email,
+    customerEmail: email,
+    invoiceNumber,
+    amountUsd,
+    lineItemName: quote.lineItem,
+    payerMemo: `Exact CRM quote: req #${request.id} offer #${offer.id} | ${quote.summary}`,
+  });
+  try {
+    await appendHotelNote(
+      request.id,
+      `[Automated Mercury] ${result.reused ? "Reused" : "Created"} pay link ${result.payUrl} | ${quote.summary} | invoice ${invoiceNumber}`
+    );
+  } catch (e) {
+    console.warn("note append failed", e.message);
+  }
+  return {
+    ok: true,
+    reused: result.reused,
+    payUrl: result.payUrl,
+    invoiceNumber,
+    amountUsd,
+    slug: result.invoice.slug,
+    invoiceId: result.invoice.id,
+    quote,
+  };
+}
+
+async function handlePayApi(req, res, kind, id, query) {
+  if (req.method !== "POST" && req.method !== "GET") {
+    sendJson(res, 405, { error: "GET (preview) or POST (create) only" });
     return;
   }
+  if (!(await requireStaff(req, res))) return;
+
   try {
     const token = process.env.MERCURY_TOKEN_NESHER || process.env.MERCURY_TOKEN;
-    if (!token) throw new Error("MERCURY_TOKEN_NESHER not configured on Railway");
+    if (!token && req.method === "POST") {
+      throw new Error("MERCURY_TOKEN_NESHER not configured on Railway");
+    }
+
+    // Body may include offerId for hotel request-level calls
+    let body = {};
+    if (req.method === "POST") {
+      try {
+        body = await readJson(req);
+      } catch {
+        body = {};
+      }
+    }
+
+    if (kind === "hotel-offer") {
+      const ctx = await loadHotelOfferPayContext(id);
+      ctx.resolution = "explicit_offer";
+      if (req.method === "GET") {
+        const amountUsd = await toUsdAmount(
+          ctx.offer.customer_price,
+          ctx.offer.currency,
+          defaultIlsSpot
+        );
+        sendJson(res, 200, {
+          ok: true,
+          preview: true,
+          quote: buildHotelQuoteSnapshot(ctx, amountUsd),
+          invoiceNumber: hotelInvoiceNumber(ctx.request.id, ctx.offer.id),
+        });
+        return;
+      }
+      const out = await createHotelPayment(token, ctx);
+      sendJson(res, 200, out);
+      return;
+    }
 
     if (kind === "hotel") {
-      const { request, offer } = await loadHotelPayContext(id);
-      const email = String(request.email || "").trim();
-      if (!email) throw new Error("Hotel request has no customer email");
-      const amountUsd = await toUsdAmount(
-        offer.customer_price,
-        offer.currency,
-        defaultIlsSpot
-      );
-      const invoiceNumber = hotelInvoiceNumber(request.id, offer.id);
-      const line = `${offer.hotel_name || "Hotel"} — ${request.customer_name || ""}`.trim();
-      const result = await createOrReusePaymentRequest({
-        token,
-        customerName: request.customer_name || email,
-        customerEmail: email,
-        invoiceNumber,
-        amountUsd,
-        lineItemName: line.slice(0, 200),
-        payerMemo: `JRM hotel request #${request.id} offer #${offer.id}`,
-      });
+      const offerId =
+        body.offerId || body.offer_id || query.get("offerId") || query.get("offer_id");
+      let ctx;
       try {
-        await appendHotelNote(
-          request.id,
-          `[Automated Mercury] ${result.reused ? "Reused" : "Created"} pay link ${result.payUrl} invoice ${invoiceNumber} amount $${amountUsd} (offer #${offer.id})`
-        );
+        ctx = await loadHotelPayContext(id, offerId || null);
       } catch (e) {
-        console.warn("note append failed", e.message);
+        if (e.code === "AMBIGUOUS_OFFERS") {
+          sendJson(res, 409, {
+            error: e.message,
+            code: "AMBIGUOUS_OFFERS",
+            offers: e.offers,
+          });
+          return;
+        }
+        throw e;
       }
-      sendJson(res, 200, {
-        ok: true,
-        reused: result.reused,
-        payUrl: result.payUrl,
-        invoiceNumber,
-        amountUsd,
-        slug: result.invoice.slug,
-        invoiceId: result.invoice.id,
-      });
+      if (req.method === "GET") {
+        const amountUsd = await toUsdAmount(
+          ctx.offer.customer_price,
+          ctx.offer.currency,
+          defaultIlsSpot
+        );
+        sendJson(res, 200, {
+          ok: true,
+          preview: true,
+          quote: buildHotelQuoteSnapshot(ctx, amountUsd),
+          invoiceNumber: hotelInvoiceNumber(ctx.request.id, ctx.offer.id),
+          resolution: ctx.resolution,
+        });
+        return;
+      }
+      const out = await createHotelPayment(token, ctx);
+      sendJson(res, 200, out);
       return;
     }
 
     if (kind === "reservation") {
-      const { reservation, balance } = await loadReservationPayContext(id);
-      const email = String(reservation.customer_email || "").trim();
+      const ctx = await loadReservationPayContext(id);
+      const email = String(ctx.reservation.customer_email || "").trim();
       if (!email) {
         throw new Error(
           "Reservation customer has no email — set email on the customer record first"
         );
       }
-      // Reservation prices in CRM are treated as USD (same as autopilot)
-      const amountUsd = await toUsdAmount(balance, "USD", defaultIlsSpot);
+      const amountUsd = await toUsdAmount(ctx.balance, "USD", defaultIlsSpot);
+      const quote = buildReservationQuoteSnapshot(ctx, amountUsd);
       const invoiceNumber =
-        reservationInvoiceNumber(reservation.reservation_code) ||
-        `RES-ID${reservation.id}`;
+        reservationInvoiceNumber(ctx.reservation.reservation_code) ||
+        `RES-ID${ctx.reservation.id}`;
+      if (req.method === "GET") {
+        sendJson(res, 200, {
+          ok: true,
+          preview: true,
+          quote,
+          invoiceNumber,
+        });
+        return;
+      }
       const result = await createOrReusePaymentRequest({
         token,
-        customerName: reservation.customer_name || email,
+        customerName: quote.customerName || email,
         customerEmail: email,
         invoiceNumber,
         amountUsd,
-        lineItemName: `Reservation ${reservation.reservation_code || reservation.id} balance`,
-        payerMemo: `CRM reservation id ${reservation.id}`,
+        lineItemName: quote.lineItem,
+        payerMemo: `Exact CRM reservation quote: id ${ctx.reservation.id} | ${quote.summary}`,
       });
       try {
         await appendReservationNote(
-          reservation.id,
-          `${result.reused ? "Reused" : "Created"} ${result.payUrl} (${invoiceNumber}) $${amountUsd}`
+          ctx.reservation.id,
+          `${result.reused ? "Reused" : "Created"} ${result.payUrl} | ${quote.summary} | ${invoiceNumber}`
         );
       } catch (e) {
         console.warn("res note failed", e.message);
@@ -180,6 +270,7 @@ async function handlePayApi(req, res, kind, id) {
         amountUsd,
         slug: result.invoice.slug,
         invoiceId: result.invoice.id,
+        quote,
       });
       return;
     }
@@ -286,10 +377,10 @@ const server = http.createServer(async (req, res) => {
   }
 
   const payMatch = url.pathname.match(
-    /^\/__nesher_pay\/(hotel|reservation)\/(\d+)\/?$/
+    /^\/__nesher_pay\/(hotel-offer|hotel|reservation)\/(\d+)\/?$/
   );
   if (payMatch) {
-    await handlePayApi(req, res, payMatch[1], payMatch[2]);
+    await handlePayApi(req, res, payMatch[1], payMatch[2], url.searchParams);
     return;
   }
 

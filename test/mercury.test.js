@@ -141,14 +141,17 @@ describe("createOrReusePaymentRequest", () => {
 describe("injectPayButtons", () => {
   it("injects hotel detail button and assets", () => {
     const html = `<!doctype html><html><head><title>x</title></head><body>
+      <div class="jrm-offer-actions">
+        <a href="/jrm/hotels/offer/50/quote/pdf/">Quote PDF</a>
+      </div>
       <a class="jrm-btn primary" href="/jrm/hotels/89/payment/add/">Add payment</a>
       </body></html>`;
     const out = injectPayButtons(html, "/jrm/hotels/89/");
     assert.match(out, new RegExp(BUTTON_MARKER));
-    assert.match(out, /data-kind="hotel"/);
-    assert.match(out, /data-id="89"/);
+    assert.match(out, /data-kind="hotel-offer"/);
+    assert.match(out, /data-id="50"/);
     assert.match(out, /nesher-mercury-pay-js/);
-    assert.match(out, /Mercury Pay Link/);
+    assert.match(out, /Mercury Pay \(this quote\)/);
   });
 
   it("injects reservation list pay buttons", () => {

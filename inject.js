@@ -1,5 +1,6 @@
 /**
  * HTML injection helpers for CRM list/detail pages.
+ * Buttons bind to exact quotes: hotel-offer/:offerId or reservation/:id.
  */
 
 export const BUTTON_MARKER = "data-nesher-mercury-pay";
@@ -32,8 +33,22 @@ const CSS = `
     font-weight: 600;
     word-break: break-all;
   }
-  .nesher-mercury-wrap { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+  .nesher-mercury-wrap {
+    display: inline-flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px;
+    max-width: 100%;
+  }
   .nesher-mercury-err { color: #b91c1c; font-size: 12px; margin-left: 6px; }
+  .nesher-mercury-quote {
+    display: block;
+    width: 100%;
+    margin-top: 4px;
+    font-size: 12px;
+    color: #334155;
+    font-weight: 600;
+  }
 </style>
 `;
 
@@ -48,15 +63,55 @@ const SCRIPT = `
     return m ? decodeURIComponent(m[1]) : "";
   }
 
+  function pathFor(kind, id) {
+    if (kind === "hotel-offer") return "/__nesher_pay/hotel-offer/" + id + "/";
+    if (kind === "hotel") return "/__nesher_pay/hotel/" + id + "/";
+    if (kind === "reservation") return "/__nesher_pay/reservation/" + id + "/";
+    return null;
+  }
+
+  function showQuote(wrap, data) {
+    var q = data && data.quote;
+    var el = wrap.querySelector(".nesher-mercury-quote");
+    if (!q) return;
+    if (!el) {
+      el = document.createElement("span");
+      el.className = "nesher-mercury-quote";
+      wrap.appendChild(el);
+    }
+    el.textContent = q.summary || ("$" + (data.amountUsd || "") + " · " + (data.invoiceNumber || ""));
+  }
+
   async function createLink(kind, id, btn) {
     var wrap = btn.closest(".nesher-mercury-wrap") || btn.parentElement;
     var err = wrap.querySelector(".nesher-mercury-err");
     var link = wrap.querySelector(".nesher-mercury-link");
     if (err) err.textContent = "";
     btn.disabled = true;
-    btn.textContent = "Creating…";
+    var defaultLabel = btn.getAttribute("data-label") || "Mercury Pay Link";
+    btn.textContent = "Reading quote…";
+    var url = pathFor(kind, id);
+    if (!url) {
+      btn.disabled = false;
+      btn.textContent = defaultLabel;
+      return;
+    }
     try {
-      var res = await fetch("/__nesher_pay/" + kind + "/" + id + "/", {
+      // Preview exact quote first so staff sees what will be charged
+      var prev = await fetch(url, {
+        method: "GET",
+        credentials: "same-origin",
+        headers: { "X-Requested-With": "XMLHttpRequest", Accept: "application/json" }
+      });
+      var preview = await prev.json().catch(function () { return {}; });
+      if (prev.ok && preview.quote) {
+        showQuote(wrap, preview);
+        btn.textContent = "Creating $" + Number(preview.quote.amountUsd).toFixed(2) + "…";
+      } else {
+        btn.textContent = "Creating…";
+      }
+
+      var res = await fetch(url, {
         method: "POST",
         credentials: "same-origin",
         headers: {
@@ -68,6 +123,7 @@ const SCRIPT = `
       });
       var data = await res.json().catch(function () { return {}; });
       if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
+      showQuote(wrap, data);
       if (!link) {
         link = document.createElement("a");
         link.className = "nesher-mercury-link";
@@ -76,7 +132,7 @@ const SCRIPT = `
         wrap.appendChild(link);
       }
       link.href = data.payUrl;
-      link.textContent = data.reused ? "Pay link (existing)" : "Pay link (ready)";
+      link.textContent = data.reused ? "Open pay link (existing)" : "Open pay link (ready)";
       btn.textContent = data.reused ? "Show pay link" : "Pay link ready";
       try { await navigator.clipboard.writeText(data.payUrl); } catch (e) {}
     } catch (e) {
@@ -86,7 +142,7 @@ const SCRIPT = `
         wrap.appendChild(err);
       }
       err.textContent = e.message || String(e);
-      btn.textContent = "Mercury Pay Link";
+      btn.textContent = defaultLabel;
     } finally {
       btn.disabled = false;
     }
@@ -106,10 +162,11 @@ const SCRIPT = `
 `;
 
 function buttonHtml(kind, id, label) {
+  const text = label || "Mercury Pay Link";
   return (
     `<span class="nesher-mercury-wrap">` +
     `<button type="button" class="nesher-mercury-btn" ${BUTTON_MARKER} ` +
-    `data-kind="${kind}" data-id="${id}">${label || "Mercury Pay Link"}</button>` +
+    `data-kind="${kind}" data-id="${id}" data-label="${text.replace(/"/g, "&quot;")}">${text}</button>` +
     `</span>`
   );
 }
@@ -122,59 +179,61 @@ function buttonHtml(kind, id, label) {
 export function injectPayButtons(html, path) {
   if (!html || typeof html !== "string") return html;
   if (html.includes("nesher-mercury-pay-js")) return html;
-  // only HTML documents
   if (!/<\/body>/i.test(html) && !/<html/i.test(html)) return html;
 
   let out = html;
   const p = path || "";
 
-  // Hotel detail: /jrm/hotels/89/
+  // Hotel detail: bind Pay to EACH offer (exact quote)
   const hotelDetail = p.match(/^\/jrm\/hotels\/(\d+)\/?$/);
   if (hotelDetail) {
-    const id = hotelDetail[1];
-    const btn = buttonHtml("hotel", id);
-    // Prefer next to existing payment button
-    if (/payment\/add\//i.test(out)) {
-      out = out.replace(
-        /(<a[^>]+href="\/jrm\/hotels\/\d+\/payment\/add\/"[^>]*>[\s\S]*?<\/a>)/i,
-        `$1 ${btn}`
-      );
-    } else if (/class="jrm-btn[^"]*"[^>]*>/i.test(out)) {
-      out = out.replace(
-        /(class="jrm-btn[^"]*"[^>]*>[\s\S]*?<\/a>)/i,
-        `$1 ${btn}`
-      );
-    } else {
-      out = out.replace(/<\/body>/i, `${btn}</body>`);
+    const requestId = hotelDetail[1];
+    // Inject next to each offer's action row (quote/pdf links identify offer id)
+    out = out.replace(
+      /(<div class="jrm-offer-actions">)([\s\S]*?)(<\/div>)/gi,
+      (full, open, inner, close) => {
+        if (inner.includes(BUTTON_MARKER)) return full;
+        const m = inner.match(/\/jrm\/hotels\/offer\/(\d+)\//);
+        if (!m) return full;
+        const offerId = m[1];
+        const btn = buttonHtml(
+          "hotel-offer",
+          offerId,
+          "Mercury Pay (this quote)"
+        );
+        return `${open}${inner} ${btn}${close}`;
+      }
+    );
+    // Fallback if no offer-actions found: request-level with resolve
+    if (!out.includes(BUTTON_MARKER)) {
+      const btn = buttonHtml("hotel", requestId, "Mercury Pay Link");
+      if (/payment\/add\//i.test(out)) {
+        out = out.replace(
+          /(<a[^>]+href="\/jrm\/hotels\/\d+\/payment\/add\/"[^>]*>[\s\S]*?<\/a>)/i,
+          `$1 ${btn}`
+        );
+      } else {
+        out = out.replace(/<\/body>/i, `${btn}</body>`);
+      }
     }
   }
 
-  // Hotel list: /jrm/hotels/
+  // Hotel list: request-level Pay (server resolves exact sent/accepted quote)
   if (/^\/jrm\/hotels\/?$/.test(p) || /^\/jrm\/hotels\/\?/.test(p)) {
-    // After each detail link /jrm/hotels/ID/
-    out = out.replace(
-      /href="(\/jrm\/hotels\/(\d+)\/)"/g,
-      (match, href, id, offset, whole) => {
-        // only transform once per id near the link - add marker in a following injection pass
-        return match;
-      }
-    );
-    // Inject a small action cell by appending buttons near request links in table rows
     out = out.replace(
       /(<a[^>]*href="\/jrm\/hotels\/(\d+)\/"[^>]*>)([\s\S]*?)(<\/a>)/gi,
       (full, open, id, text, close) => {
-        // Skip nav-only repeats: if text is very short number or # only, still OK
         if (full.includes(BUTTON_MARKER)) return full;
-        return `${open}${text}${close} ${buttonHtml("hotel", id, "Pay")}`;
+        return `${open}${text}${close} ${buttonHtml("hotel", id, "Pay quote")}`;
       }
     );
   }
 
-  // Reservation detail: /reservations/280/
+  // Reservation detail
   const resDetail = p.match(/^\/reservations\/(\d+)\/?$/);
   if (resDetail) {
     const id = resDetail[1];
-    const btn = buttonHtml("reservation", id);
+    const btn = buttonHtml("reservation", id, "Mercury Pay (balance due)");
     if (/payments\/add\//i.test(out)) {
       out = out.replace(
         /(<a[^>]+href="\/reservations\/\d+\/payments\/add\/"[^>]*>[\s\S]*?<\/a>)/i,
@@ -194,14 +253,12 @@ export function injectPayButtons(html, path) {
       /(<a[^>]*href="\/reservations\/(\d+)\/"[^>]*>)([\s\S]*?)(<\/a>)/gi,
       (full, open, id, text, close) => {
         if (full.includes(BUTTON_MARKER)) return full;
-        // skip edit/delete only links already matched separately
         if (/\/(edit|delete)\//i.test(open)) return full;
-        return `${open}${text}${close} ${buttonHtml("reservation", id, "Pay")}`;
+        return `${open}${text}${close} ${buttonHtml("reservation", id, "Pay due")}`;
       }
     );
   }
 
-  // assets once
   if (!out.includes("nesher-mercury-pay-css")) {
     if (/<\/head>/i.test(out)) {
       out = out.replace(/<\/head>/i, `${CSS}</head>`);
