@@ -23,6 +23,13 @@ import {
   buildReservationQuoteSnapshot,
   resolveCustomerEmail,
 } from "./quote.js";
+import {
+  waConfig,
+  downloadWhatsAppMedia,
+  getContact,
+  listContactMessages,
+  sendContactAudio,
+} from "./whatsapp-media.js";
 
 const PORT = Number(process.env.PORT || 8080);
 const UPSTREAM =
@@ -308,6 +315,107 @@ async function handlePayApi(req, res, kind, id, query) {
   }
 }
 
+function readBodyBuffer(req, limit = 12 * 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on("data", (c) => {
+      size += c.length;
+      if (size > limit) {
+        reject(new Error("Body too large (max 12MB)"));
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on("end", () => resolve(Buffer.concat(chunks)));
+    req.on("error", reject);
+  });
+}
+
+async function handleWaMedia(req, res, mediaId) {
+  if (req.method !== "GET") {
+    sendJson(res, 405, { error: "GET only" });
+    return;
+  }
+  if (!(await requireStaff(req, res))) return;
+  try {
+    const file = await downloadWhatsAppMedia(mediaId);
+    res.writeHead(200, {
+      "Content-Type": file.mimeType || "audio/ogg",
+      "Content-Length": String(file.buffer.length),
+      "Cache-Control": "private, max-age=300",
+    });
+    res.end(file.buffer);
+  } catch (e) {
+    console.error("wa media", e.message);
+    sendJson(res, 400, { error: e.message || String(e) });
+  }
+}
+
+async function handleWaMessages(req, res, contactId) {
+  if (req.method !== "GET") {
+    sendJson(res, 405, { error: "GET only" });
+    return;
+  }
+  if (!(await requireStaff(req, res))) return;
+  try {
+    const contact = await getContact(contactId);
+    const messages = await listContactMessages(contactId);
+    sendJson(res, 200, {
+      ok: true,
+      contact: {
+        id: Number(contact.id),
+        phone: contact.phone_number,
+        name: contact.display_name,
+      },
+      messages,
+      whatsappConfigured: waConfig().configured,
+    });
+  } catch (e) {
+    console.error("wa messages", e.message);
+    sendJson(res, 400, { error: e.message || String(e) });
+  }
+}
+
+async function handleWaSendAudio(req, res, contactId) {
+  if (req.method !== "POST") {
+    sendJson(res, 405, { error: "POST only" });
+    return;
+  }
+  if (!(await requireStaff(req, res))) return;
+  try {
+    const raw = await readBodyBuffer(req);
+    const ct = String(req.headers["content-type"] || "");
+    let buffer;
+    let mimeType = "audio/webm";
+    let isVoice = true;
+
+    if (ct.includes("application/json")) {
+      const j = JSON.parse(raw.toString("utf8") || "{}");
+      if (!j.audioBase64) throw new Error("audioBase64 required");
+      buffer = Buffer.from(j.audioBase64, "base64");
+      mimeType = j.mimeType || "audio/webm";
+      isVoice = j.voice !== false;
+    } else {
+      buffer = raw;
+      mimeType = ct.split(";")[0].trim() || "audio/webm";
+    }
+    if (!buffer.length) throw new Error("Empty audio");
+
+    const out = await sendContactAudio({
+      contactId,
+      buffer,
+      mimeType,
+      isVoice,
+    });
+    sendJson(res, 200, out);
+  } catch (e) {
+    console.error("wa send-audio", e.message);
+    sendJson(res, 400, { error: e.message || String(e) });
+  }
+}
+
 function proxyWithInject(req, res) {
   const pathOnly = (req.url || "/").split("?")[0];
   const shouldInject =
@@ -393,6 +501,7 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
 
   if (url.pathname === "/__nesher_pay/health") {
+    const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
       upstream: UPSTREAM,
@@ -400,7 +509,31 @@ const server = http.createServer(async (req, res) => {
         process.env.MERCURY_TOKEN_NESHER || process.env.MERCURY_TOKEN
       ),
       hasDb: Boolean(process.env.DATABASE_URL || process.env.DATABASE_PUBLIC_URL),
+      hasWhatsApp: wa.configured,
     });
+    return;
+  }
+
+  // ── WhatsApp audio / media API (staff session required) ─────────────
+  const waMediaMatch = url.pathname.match(
+    /^\/__nesher_wa\/media\/(\d+)\/?$/
+  );
+  if (waMediaMatch) {
+    await handleWaMedia(req, res, waMediaMatch[1]);
+    return;
+  }
+  const waMsgsMatch = url.pathname.match(
+    /^\/__nesher_wa\/contact\/(\d+)\/messages\/?$/
+  );
+  if (waMsgsMatch) {
+    await handleWaMessages(req, res, waMsgsMatch[1]);
+    return;
+  }
+  const waSendAudioMatch = url.pathname.match(
+    /^\/__nesher_wa\/contact\/(\d+)\/send-audio\/?$/
+  );
+  if (waSendAudioMatch) {
+    await handleWaSendAudio(req, res, waSendAudioMatch[1]);
     return;
   }
 

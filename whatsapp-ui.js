@@ -380,6 +380,109 @@ const CSS = `
     background: #1ebe57 !important;
   }
 
+  /* Live thread overlay (API-driven, plays audio + send voice) */
+  .wa-live-thread {
+    display: flex;
+    flex-direction: column;
+    min-height: 62vh;
+    background: #efeae2;
+  }
+  .wa-live-msgs {
+    flex: 1;
+    overflow-y: auto;
+    padding: 14px 12px 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .wa-live-bubble {
+    max-width: min(78%, 520px);
+    padding: 8px 10px 4px;
+    border-radius: 10px;
+    font-size: 14.5px;
+    line-height: 1.4;
+    box-shadow: 0 1px 0.5px rgba(11,20,26,0.13);
+    word-wrap: break-word;
+  }
+  .wa-live-bubble.in {
+    align-self: flex-start;
+    background: #fff;
+    border-top-left-radius: 0;
+  }
+  .wa-live-bubble.out {
+    align-self: flex-end;
+    background: #d9fdd3;
+    border-top-right-radius: 0;
+  }
+  .wa-live-bubble .wa-ts {
+    display: block;
+    text-align: right;
+    font-size: 11px;
+    color: #667781;
+    margin-top: 4px;
+  }
+  .wa-live-bubble audio {
+    display: block;
+    width: min(260px, 70vw);
+    margin: 4px 0 2px;
+    height: 36px;
+  }
+  .wa-voice-label {
+    font-size: 12px;
+    color: #54656f;
+    margin-bottom: 2px;
+  }
+  .wa-live-composer {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 12px;
+    background: #f0f2f5;
+    border-top: 1px solid #e9edef;
+  }
+  .wa-mic-btn, .wa-file-btn {
+    width: 46px;
+    height: 46px;
+    border: none;
+    border-radius: 50%;
+    background: #075e54;
+    color: #fff;
+    font-size: 18px;
+    cursor: pointer;
+    flex-shrink: 0;
+    display: grid;
+    place-items: center;
+  }
+  .wa-mic-btn.recording {
+    background: #dc2626;
+    animation: wa-pulse 1s infinite;
+  }
+  @keyframes wa-pulse {
+    0% { box-shadow: 0 0 0 0 rgba(220,38,38,0.45); }
+    70% { box-shadow: 0 0 0 12px rgba(220,38,38,0); }
+    100% { box-shadow: 0 0 0 0 rgba(220,38,38,0); }
+  }
+  .wa-mic-btn:disabled, .wa-file-btn:disabled { opacity: 0.55; cursor: wait; }
+  .wa-rec-status {
+    flex: 1;
+    font-size: 13px;
+    color: #54656f;
+    min-width: 0;
+  }
+  .wa-rec-status strong { color: #dc2626; }
+  .wa-live-error {
+    color: #b91c1c;
+    font-size: 12px;
+    padding: 0 12px 8px;
+    background: #f0f2f5;
+  }
+  .wa-live-hint {
+    font-size: 11px;
+    color: #8696a0;
+    padding: 0 12px 10px;
+    background: #f0f2f5;
+  }
+
   /* Warning banners keep readable */
   body.nesher-wa-page .message.warning,
   body.nesher-wa-page .message.error,
@@ -546,6 +649,19 @@ const SCRIPT = `
     return true;
   }
 
+  function contactIdFromPath() {
+    var m = location.pathname.match(/\\/whatsapp\\/(\\d+)\\/?/);
+    return m ? m[1] : null;
+  }
+
+  function fmtTs(iso) {
+    if (!iso) return "";
+    try {
+      var d = new Date(iso);
+      return d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+    } catch (e) { return String(iso); }
+  }
+
   function enhanceChat() {
     var path = location.pathname.replace(/\\/+$/, "");
     if (!/^\\/whatsapp\\/\\d+$/.test(path)) return false;
@@ -565,7 +681,7 @@ const SCRIPT = `
       back.className = "wa-back";
       back.href = "/whatsapp/";
       back.setAttribute("aria-label", "Back to inbox");
-      back.textContent = "←";
+      back.textContent = "\\u00AB";
       var titles = document.createElement("div");
       var h = header.querySelector("h1");
       var t = document.createElement("div");
@@ -574,7 +690,7 @@ const SCRIPT = `
       var sub = document.createElement("div");
       sub.className = "wa-sub";
       var muted = header.querySelector(".muted, p");
-      sub.textContent = (muted && muted.textContent) || "WhatsApp · reply within 24h of last customer message";
+      sub.textContent = (muted && muted.textContent) || "WhatsApp · voice + text · 24h reply window";
       titles.appendChild(t);
       titles.appendChild(sub);
       bar.appendChild(back);
@@ -599,7 +715,229 @@ const SCRIPT = `
       }
     });
 
+    // Live thread with audio play + send (API)
+    mountLiveThread(mainCard, contactIdFromPath());
+
     return true;
+  }
+
+  function mountLiveThread(mainCard, contactId) {
+    if (!contactId || mainCard.querySelector(".wa-live-thread")) return;
+
+    var shell = document.createElement("div");
+    shell.className = "wa-live-thread";
+    shell.innerHTML =
+      '<div class="wa-live-msgs" data-role="msgs"><div class="wa-rec-status" style="padding:16px">Loading messages…</div></div>' +
+      '<div class="wa-live-error" data-role="err" hidden></div>' +
+      '<div class="wa-live-composer">' +
+      '  <button type="button" class="wa-file-btn" data-role="file" title="Attach audio file">📎</button>' +
+      '  <input type="file" accept="audio/*,.ogg,.mp3,.m4a,.aac,.webm" data-role="file-input" hidden>' +
+      '  <div class="wa-rec-status" data-role="status">Hold mic to record a voice note, or attach an audio file.</div>' +
+      '  <button type="button" class="wa-mic-btn" data-role="mic" title="Record voice note">🎤</button>' +
+      "</div>" +
+      '<div class="wa-live-hint">Voice notes are sent as WhatsApp voice (OGG/Opus). Inbound audio plays here.</div>';
+
+    // Insert after chat header if present
+    var headerEl = mainCard.querySelector(".wa-chat-header");
+    if (headerEl && headerEl.nextSibling) {
+      mainCard.insertBefore(shell, headerEl.nextSibling);
+    } else {
+      mainCard.appendChild(shell);
+    }
+
+    var msgsEl = shell.querySelector('[data-role="msgs"]');
+    var errEl = shell.querySelector('[data-role="err"]');
+    var statusEl = shell.querySelector('[data-role="status"]');
+    var micBtn = shell.querySelector('[data-role="mic"]');
+    var fileBtn = shell.querySelector('[data-role="file"]');
+    var fileInput = shell.querySelector('[data-role="file-input"]');
+    var recorder = null;
+    var chunks = [];
+    var recording = false;
+
+    function showErr(msg) {
+      if (!msg) { errEl.hidden = true; errEl.textContent = ""; return; }
+      errEl.hidden = false;
+      errEl.textContent = msg;
+    }
+
+    function renderMessages(payload) {
+      var list = (payload && payload.messages) || [];
+      msgsEl.innerHTML = "";
+      if (!list.length) {
+        msgsEl.innerHTML = '<div class="wa-rec-status" style="padding:20px;text-align:center">No messages yet in this chat.</div>';
+        return;
+      }
+      list.forEach(function (m) {
+        var b = document.createElement("div");
+        b.className = "wa-live-bubble " + (m.direction === "outbound" ? "out" : "in");
+        if (m.messageType === "audio") {
+          var label = document.createElement("div");
+          label.className = "wa-voice-label";
+          label.textContent = m.voice || /voice/i.test(m.body || "") ? "🎤 Voice note" : "🔊 Audio";
+          b.appendChild(label);
+          if (m.mediaId) {
+            var audio = document.createElement("audio");
+            audio.controls = true;
+            audio.preload = "none";
+            audio.src = "/__nesher_wa/media/" + encodeURIComponent(m.mediaId) + "/";
+            b.appendChild(audio);
+          } else {
+            var p = document.createElement("div");
+            p.textContent = m.body || "[audio]";
+            b.appendChild(p);
+          }
+        } else {
+          var text = document.createElement("div");
+          text.textContent = m.body || "";
+          b.appendChild(text);
+        }
+        var ts = document.createElement("span");
+        ts.className = "wa-ts";
+        ts.textContent = fmtTs(m.messageAt) + (m.status && m.direction === "outbound" ? " · " + m.status : "");
+        b.appendChild(ts);
+        msgsEl.appendChild(b);
+      });
+      msgsEl.scrollTop = msgsEl.scrollHeight;
+
+      if (payload.contact && payload.contact.name) {
+        var title = document.querySelector(".wa-chat-header .wa-title");
+        if (title) title.textContent = payload.contact.name;
+        var sub = document.querySelector(".wa-chat-header .wa-sub");
+        if (sub && payload.contact.phone) sub.textContent = "+" + String(payload.contact.phone).replace(/^\\+/, "") + " · WhatsApp";
+      }
+      if (payload.whatsappConfigured === false) {
+        showErr("WhatsApp token not configured on proxy — set WHATSAPP_ACCESS_TOKEN + WHATSAPP_PHONE_NUMBER_ID.");
+      }
+    }
+
+    async function refresh() {
+      try {
+        var res = await fetch("/__nesher_wa/contact/" + contactId + "/messages/", {
+          credentials: "same-origin",
+          headers: { Accept: "application/json" }
+        });
+        var data = await res.json().catch(function () { return {}; });
+        if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
+        showErr("");
+        renderMessages(data);
+      } catch (e) {
+        msgsEl.innerHTML = "";
+        showErr(e.message || String(e));
+        statusEl.textContent = "Could not load messages (are you logged in?). Django thread still below if present.";
+      }
+    }
+
+    function blobToBase64(blob) {
+      return new Promise(function (resolve, reject) {
+        var r = new FileReader();
+        r.onload = function () {
+          var s = String(r.result || "");
+          var i = s.indexOf(",");
+          resolve(i >= 0 ? s.slice(i + 1) : s);
+        };
+        r.onerror = reject;
+        r.readAsDataURL(blob);
+      });
+    }
+
+    async function sendAudioBlob(blob, mime, voice) {
+      showErr("");
+      statusEl.innerHTML = "Sending voice note…";
+      micBtn.disabled = true;
+      fileBtn.disabled = true;
+      try {
+        var b64 = await blobToBase64(blob);
+        var res = await fetch("/__nesher_wa/contact/" + contactId + "/send-audio/", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Requested-With": "XMLHttpRequest"
+          },
+          body: JSON.stringify({
+            audioBase64: b64,
+            mimeType: mime || blob.type || "audio/webm",
+            voice: voice !== false
+          })
+        });
+        var data = await res.json().catch(function () { return {}; });
+        if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
+        statusEl.textContent = "Voice note sent ✓";
+        await refresh();
+      } catch (e) {
+        showErr(e.message || String(e));
+        statusEl.textContent = "Send failed — try again.";
+      } finally {
+        micBtn.disabled = false;
+        fileBtn.disabled = false;
+      }
+    }
+
+    async function startRec() {
+      if (recording) return;
+      showErr("");
+      try {
+        var stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        var mime = "";
+        var candidates = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/mp4"];
+        for (var i = 0; i < candidates.length; i++) {
+          if (window.MediaRecorder && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(candidates[i])) {
+            mime = candidates[i];
+            break;
+          }
+        }
+        chunks = [];
+        recorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
+        recorder.ondataavailable = function (ev) {
+          if (ev.data && ev.data.size) chunks.push(ev.data);
+        };
+        recorder.onstop = async function () {
+          stream.getTracks().forEach(function (t) { t.stop(); });
+          var type = (recorder && recorder.mimeType) || mime || "audio/webm";
+          var blob = new Blob(chunks, { type: type });
+          recorder = null;
+          if (!blob.size) {
+            statusEl.textContent = "Empty recording — try again.";
+            return;
+          }
+          await sendAudioBlob(blob, type, true);
+        };
+        recorder.start();
+        recording = true;
+        micBtn.classList.add("recording");
+        micBtn.textContent = "⏹";
+        statusEl.innerHTML = "<strong>Recording…</strong> click mic again to send.";
+      } catch (e) {
+        showErr(e.message || "Microphone permission denied");
+      }
+    }
+
+    function stopRec() {
+      if (!recording || !recorder) return;
+      recording = false;
+      micBtn.classList.remove("recording");
+      micBtn.textContent = "🎤";
+      try { recorder.stop(); } catch (e) {}
+    }
+
+    micBtn.addEventListener("click", function () {
+      if (recording) stopRec();
+      else startRec();
+    });
+    fileBtn.addEventListener("click", function () { fileInput.click(); });
+    fileInput.addEventListener("change", async function () {
+      var f = fileInput.files && fileInput.files[0];
+      fileInput.value = "";
+      if (!f) return;
+      await sendAudioBlob(f, f.type || "audio/mpeg", /ogg|opus|webm/i.test(f.type || f.name));
+    });
+
+    refresh();
+    // light poll so inbound audio appears without full reload
+    setInterval(function () {
+      if (!document.hidden) refresh();
+    }, 12000);
   }
 
   function run() {
