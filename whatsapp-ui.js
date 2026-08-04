@@ -255,7 +255,7 @@ const CSS = `
     flex: 1; overflow-y: auto;
     padding: 18px 7% 12px;
     background-color: var(--wa-chat-bg);
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160' viewBox='0 0 160 160'%3E%3Cg fill='none' stroke='%230b141a' stroke-opacity='0.03' stroke-width='2' stroke-linecap='round'%3E%3Ccircle cx='24' cy='26' r='8'/%3E%3Cpath d='M96 18l9 9m0-9l-9 9'/%3E%3Cpath d='M32 108c7-9 16-9 23 0'/%3E%3Crect x='104' y='96' width='18' height='18' rx='5'/%3E%3Cpath d='M66 58h16m-8-8v16'/%3E%3Ccircle cx='134' cy='44' r='5'/%3E%3Cpath d='M14 66l7 7m0-7l-7 7'/%3E%3Cpath d='M126 140c5-6 11-6 16 0'/%3E%3Ccircle cx='58' cy='140' r='6'/%3E%3C/g%3E%3C/svg%3E");
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160' viewBox='0 0 160 160'%3E%3Cg fill='none' stroke='%230b141a' stroke-opacity='0.02' stroke-width='2' stroke-linecap='round'%3E%3Ccircle cx='24' cy='26' r='8'/%3E%3Cpath d='M96 18l9 9m0-9l-9 9'/%3E%3Cpath d='M32 108c7-9 16-9 23 0'/%3E%3Crect x='104' y='96' width='18' height='18' rx='5'/%3E%3Cpath d='M66 58h16m-8-8v16'/%3E%3Ccircle cx='134' cy='44' r='5'/%3E%3Cpath d='M14 66l7 7m0-7l-7 7'/%3E%3Cpath d='M126 140c5-6 11-6 16 0'/%3E%3Ccircle cx='58' cy='140' r='6'/%3E%3C/g%3E%3C/svg%3E");
     scroll-behavior: smooth;
     overscroll-behavior: contain;
   }
