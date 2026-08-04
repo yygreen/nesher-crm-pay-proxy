@@ -35,19 +35,29 @@ const PORT = Number(process.env.PORT || 8080);
 const UPSTREAM =
   process.env.CRM_UPSTREAM ||
   "https://nesher-crm-production.up.railway.app";
-// Django ALLOWED_HOSTS is locked to the public CRM hostname.
+// Default when request Host is the railway internal hostname.
 const PUBLIC_HOST = process.env.CRM_PUBLIC_HOST || "crm.flynesher.com";
+const ALLOWED_PUBLIC_HOSTS = new Set(
+  String(process.env.CRM_ALLOWED_HOSTS || "crm.flynesher.com,www.flynesher.com")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean)
+);
+
+/** Prefer the browser Host (crm or www) so Django ALLOWED_HOSTS + cookies work. */
+function publicHostFor(req) {
+  const raw = String(req?.headers?.host || "")
+    .split(":")[0]
+    .toLowerCase();
+  if (raw && ALLOWED_PUBLIC_HOSTS.has(raw)) return raw;
+  return PUBLIC_HOST;
+}
 
 const proxy = httpProxy.createProxyServer({
   target: UPSTREAM,
   changeOrigin: true,
   secure: true,
   xfwd: true,
-  headers: {
-    host: PUBLIC_HOST,
-    "x-forwarded-host": PUBLIC_HOST,
-    "x-forwarded-proto": "https",
-  },
 });
 
 proxy.on("error", (err, req, res) => {
@@ -58,9 +68,10 @@ proxy.on("error", (err, req, res) => {
   res.end("Bad gateway to CRM upstream");
 });
 
-proxy.on("proxyReq", (proxyReq) => {
-  proxyReq.setHeader("host", PUBLIC_HOST);
-  proxyReq.setHeader("x-forwarded-host", PUBLIC_HOST);
+proxy.on("proxyReq", (proxyReq, req) => {
+  const host = publicHostFor(req);
+  proxyReq.setHeader("host", host);
+  proxyReq.setHeader("x-forwarded-host", host);
   proxyReq.setHeader("x-forwarded-proto", "https");
 });
 
@@ -98,7 +109,7 @@ async function requireStaff(req, res) {
   const auth = await validateStaffSession({
     cookieHeader: req.headers.cookie || "",
     upstream: UPSTREAM,
-    publicHost: PUBLIC_HOST,
+    publicHost: publicHostFor(req),
   });
   if (!auth.ok) {
     sendJson(res, 401, {
