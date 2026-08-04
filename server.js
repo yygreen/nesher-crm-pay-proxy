@@ -9,6 +9,7 @@ import {
   defaultIlsSpot,
 } from "./mercury.js";
 import { injectPayButtons } from "./inject.js";
+import { injectWhatsAppUi } from "./whatsapp-ui.js";
 import {
   loadHotelPayContext,
   loadHotelOfferPayContext,
@@ -286,7 +287,8 @@ function proxyWithInject(req, res) {
   const pathOnly = (req.url || "/").split("?")[0];
   const shouldInject =
     /^\/jrm\/hotels(\/|$)/.test(pathOnly) ||
-    /^\/reservations(\/|$)/.test(pathOnly);
+    /^\/reservations(\/|$)/.test(pathOnly) ||
+    /^\/whatsapp(\/|$)/.test(pathOnly);
 
   if (!shouldInject || req.method !== "GET") {
     proxy.web(req, res);
@@ -332,7 +334,8 @@ function proxyWithInject(req, res) {
       if (isHtml(headers) && this.statusCode === 200) {
         try {
           const text = body.toString("utf8");
-          const injected = injectPayButtons(text, pathOnly);
+          let injected = injectPayButtons(text, pathOnly);
+          injected = injectWhatsAppUi(injected, pathOnly);
           body = Buffer.from(injected, "utf8");
         } catch (e) {
           console.error("inject failed", e.message);
