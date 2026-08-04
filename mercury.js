@@ -3,6 +3,8 @@
  * HTTP boundary is injectable for unit tests.
  */
 
+import { fetchWithTimeout } from "./http.js";
+
 /** Override with MERCURY_API_BASE when Railway egress IPs are not on the token whitelist. */
 export function mercuryApiBase() {
   const base = (process.env.MERCURY_API_BASE || "https://api.mercury.com").replace(
@@ -65,9 +67,14 @@ export async function toUsdAmount(amount, currency, getIlsSpot) {
   return Math.round(n * 100) / 100;
 }
 
+/** Fallback if FX APIs hang or fail — update occasionally; +3% still applied in toUsdAmount. */
+const FALLBACK_ILS_PER_USD = Number(process.env.FALLBACK_ILS_PER_USD || 3.3);
+
 export async function defaultIlsSpot() {
   try {
-    const r = await fetch("https://open.er-api.com/v6/latest/USD");
+    const r = await fetchWithTimeout("https://open.er-api.com/v6/latest/USD", {
+      timeoutMs: 4000,
+    });
     if (r.ok) {
       const j = await r.json();
       if (j?.rates?.ILS) return Number(j.rates.ILS);
@@ -75,10 +82,19 @@ export async function defaultIlsSpot() {
   } catch {
     /* fall through */
   }
-  const r2 = await fetch("https://api.frankfurter.app/latest?from=USD&to=ILS");
-  if (!r2.ok) throw new Error("FX rate fetch failed");
-  const j2 = await r2.json();
-  return Number(j2.rates.ILS);
+  try {
+    const r2 = await fetchWithTimeout(
+      "https://api.frankfurter.app/latest?from=USD&to=ILS",
+      { timeoutMs: 4000 }
+    );
+    if (r2.ok) {
+      const j2 = await r2.json();
+      if (j2?.rates?.ILS) return Number(j2.rates.ILS);
+    }
+  } catch {
+    /* fall through */
+  }
+  return FALLBACK_ILS_PER_USD;
 }
 
 /**
@@ -96,7 +112,9 @@ export async function defaultIlsSpot() {
  * @returns {Promise<{ reused: boolean, invoice: object, payUrl: string }>}
  */
 export async function createOrReusePaymentRequest(opts) {
-  const fetchImpl = opts.fetchImpl || fetch;
+  const rawFetch = opts.fetchImpl || fetch;
+  const fetchImpl = (url, init = {}) =>
+    fetchWithTimeout(url, { timeoutMs: opts.timeoutMs || 12000, ...init }, rawFetch);
   const token = normalizeToken(opts.token);
   if (!token) throw new Error("MERCURY_TOKEN missing");
   const email = String(opts.customerEmail || "").trim().toLowerCase();

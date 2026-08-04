@@ -82,47 +82,51 @@ const SCRIPT = `
     el.textContent = q.summary || ("$" + (data.amountUsd || "") + " · " + (data.invoiceNumber || ""));
   }
 
+  function fetchJson(url, opts, timeoutMs) {
+    var ctrl = new AbortController();
+    var t = setTimeout(function () { ctrl.abort(); }, timeoutMs || 25000);
+    var o = opts || {};
+    o.signal = ctrl.signal;
+    o.credentials = "same-origin";
+    return fetch(url, o).then(function (res) {
+      return res.json().catch(function () { return {}; }).then(function (data) {
+        return { res: res, data: data };
+      });
+    }).finally(function () { clearTimeout(t); });
+  }
+
   async function createLink(kind, id, btn) {
+    if (btn.getAttribute("data-busy") === "1") return;
     var wrap = btn.closest(".nesher-mercury-wrap") || btn.parentElement;
     var err = wrap.querySelector(".nesher-mercury-err");
     var link = wrap.querySelector(".nesher-mercury-link");
     if (err) err.textContent = "";
+    btn.setAttribute("data-busy", "1");
     btn.disabled = true;
     var defaultLabel = btn.getAttribute("data-label") || "Mercury Pay Link";
-    btn.textContent = "Reading quote…";
+    btn.textContent = "Creating…";
     var url = pathFor(kind, id);
     if (!url) {
       btn.disabled = false;
+      btn.removeAttribute("data-busy");
       btn.textContent = defaultLabel;
       return;
     }
     try {
-      // Preview exact quote first so staff sees what will be charged
-      var prev = await fetch(url, {
-        method: "GET",
-        credentials: "same-origin",
-        headers: { "X-Requested-With": "XMLHttpRequest", Accept: "application/json" }
-      });
-      var preview = await prev.json().catch(function () { return {}; });
-      if (prev.ok && preview.quote) {
-        showQuote(wrap, preview);
-        btn.textContent = "Creating $" + Number(preview.quote.amountUsd).toFixed(2) + "…";
-      } else {
-        btn.textContent = "Creating…";
-      }
-
-      var res = await fetch(url, {
+      // Single POST (returns quote + payUrl) — one round-trip, less chance to hang
+      var out = await fetchJson(url, {
         method: "POST",
-        credentials: "same-origin",
         headers: {
           "Content-Type": "application/json",
           "X-CSRFToken": csrf(),
-          "X-Requested-With": "XMLHttpRequest"
+          "X-Requested-With": "XMLHttpRequest",
+          Accept: "application/json"
         },
         body: JSON.stringify({})
-      });
-      var data = await res.json().catch(function () { return {}; });
-      if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
+      }, 28000);
+      var data = out.data || {};
+      if (!out.res.ok) throw new Error(data.error || ("HTTP " + out.res.status));
+      if (!data.payUrl) throw new Error("No pay URL returned");
       showQuote(wrap, data);
       if (!link) {
         link = document.createElement("a");
@@ -141,10 +145,14 @@ const SCRIPT = `
         err.className = "nesher-mercury-err";
         wrap.appendChild(err);
       }
-      err.textContent = e.message || String(e);
+      var msg = e && e.name === "AbortError"
+        ? "Timed out — try again (Mercury/network slow)"
+        : (e.message || String(e));
+      err.textContent = msg;
       btn.textContent = defaultLabel;
     } finally {
       btn.disabled = false;
+      btn.removeAttribute("data-busy");
     }
   }
 
@@ -152,6 +160,7 @@ const SCRIPT = `
     var btn = ev.target.closest("[" + ${JSON.stringify(BUTTON_MARKER)} + "]");
     if (!btn) return;
     ev.preventDefault();
+    ev.stopPropagation();
     var kind = btn.getAttribute("data-kind");
     var id = btn.getAttribute("data-id");
     if (!kind || !id) return;

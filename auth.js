@@ -3,6 +3,8 @@
  * Presence of "sessionid=" alone is NOT enough — forged values must fail.
  */
 
+import { fetchWithTimeout } from "./http.js";
+
 const LOGIN_MARKERS = [
   /name=["']password["']/i,
   /Nesher CRM Login/i,
@@ -78,9 +80,12 @@ export async function validateStaffSession(opts) {
   if (!upstream) return { ok: false, reason: "upstream_not_configured" };
 
   const url = `${upstream}/jrm/hotels/`;
+  const timeoutMs = Number(opts.timeoutMs || process.env.AUTH_TIMEOUT_MS || 5000);
   let res;
   try {
-    res = await fetchImpl(url, {
+    const doFetch = (u, init) =>
+      fetchWithTimeout(u, { timeoutMs, ...init }, fetchImpl);
+    res = await doFetch(url, {
       method: "GET",
       redirect: "manual",
       headers: {
