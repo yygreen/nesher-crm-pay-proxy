@@ -3,7 +3,14 @@
  * HTTP boundary is injectable for unit tests.
  */
 
-const MERCURY_API = "https://api.mercury.com/api/v1";
+/** Override with MERCURY_API_BASE when Railway egress IPs are not on the token whitelist. */
+export function mercuryApiBase() {
+  const base = (process.env.MERCURY_API_BASE || "https://api.mercury.com").replace(
+    /\/$/,
+    ""
+  );
+  return `${base}/api/v1`;
+}
 const DEFAULT_DEST = "841f6d7c-53b8-11f1-a581-8f1a5e965da2";
 
 export function payUrlFromSlug(slug) {
@@ -112,6 +119,8 @@ export async function createOrReusePaymentRequest(opts) {
     "Content-Type": "application/json",
   };
 
+  const MERCURY_API = mercuryApiBase();
+
   // 1) Reuse unpaid invoice with same number
   const listRes = await fetchImpl(`${MERCURY_API}/ar/invoices`, { headers });
   if (!listRes.ok) {
@@ -202,4 +211,4 @@ export async function createOrReusePaymentRequest(opts) {
   };
 }
 
-export { MERCURY_API, DEFAULT_DEST };
+export { DEFAULT_DEST };
