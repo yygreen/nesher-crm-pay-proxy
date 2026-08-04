@@ -20,15 +20,18 @@ const PORT = Number(process.env.PORT || 8080);
 const UPSTREAM =
   process.env.CRM_UPSTREAM ||
   "https://nesher-crm-production.up.railway.app";
+// Django ALLOWED_HOSTS is locked to the public CRM hostname.
+const PUBLIC_HOST = process.env.CRM_PUBLIC_HOST || "crm.flynesher.com";
 
 const proxy = httpProxy.createProxyServer({
   target: UPSTREAM,
   changeOrigin: true,
   secure: true,
   xfwd: true,
-  // preserve host for Django allowed hosts? Use upstream host.
   headers: {
-    host: new URL(UPSTREAM).host,
+    host: PUBLIC_HOST,
+    "x-forwarded-host": PUBLIC_HOST,
+    "x-forwarded-proto": "https",
   },
 });
 
@@ -38,6 +41,12 @@ proxy.on("error", (err, req, res) => {
     res.writeHead(502, { "Content-Type": "text/plain" });
   }
   res.end("Bad gateway to CRM upstream");
+});
+
+proxy.on("proxyReq", (proxyReq) => {
+  proxyReq.setHeader("host", PUBLIC_HOST);
+  proxyReq.setHeader("x-forwarded-host", PUBLIC_HOST);
+  proxyReq.setHeader("x-forwarded-proto", "https");
 });
 
 function isHtml(headers) {
