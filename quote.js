@@ -2,9 +2,22 @@
  * Build a clear quote snapshot for UI + invoice memo (exact CRM quote → Mercury).
  */
 
+function toIsoDate(v) {
+  if (v == null || v === "") return null;
+  if (v instanceof Date && !Number.isNaN(v.getTime())) {
+    return v.toISOString().slice(0, 10);
+  }
+  const s = String(v);
+  // already ISO-ish
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10);
+  const d = new Date(s);
+  if (!Number.isNaN(d.getTime())) return d.toISOString().slice(0, 10);
+  return s.slice(0, 10);
+}
+
 export function formatStay(checkIn, checkOut) {
-  const a = checkIn ? String(checkIn).slice(0, 10) : null;
-  const b = checkOut ? String(checkOut).slice(0, 10) : null;
+  const a = toIsoDate(checkIn);
+  const b = toIsoDate(checkOut);
   if (a && b) return `${a} → ${b}`;
   if (a) return a;
   return null;
