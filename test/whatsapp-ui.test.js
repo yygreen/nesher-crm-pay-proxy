@@ -28,3 +28,29 @@ test("injectWhatsAppUi is idempotent", () => {
   const twice = injectWhatsAppUi(once, "/whatsapp/");
   assert.equal(twice, once);
 });
+
+test("injectWhatsAppUi adds assets on chat detail pages", () => {
+  const out = injectWhatsAppUi(sample, "/whatsapp/4/");
+  assert.match(out, new RegExp(WA_UI_MARKER + "-js"));
+  assert.match(out, /wa-composer|wa-msgs|wa-details/);
+});
+
+test("injected browser script is syntactically valid JS", () => {
+  const out = injectWhatsAppUi(sample, "/whatsapp/");
+  const m = out.match(/<script id="nesher-wa-ui-js">([\s\S]*?)<\/script>/);
+  assert.ok(m, "script block present");
+  assert.doesNotThrow(() => new Function(m[1]));
+});
+
+test("template-literal escaping kept regexes intact in the emitted script", () => {
+  const out = injectWhatsAppUi(sample, "/whatsapp/");
+  const m = out.match(/<script id="nesher-wa-ui-js">([\s\S]*?)<\/script>/);
+  const body = m[1];
+  for (const probe of [
+    "/^\\/whatsapp\\/(\\d+)\\/?$/",
+    "replace(/\\D/g",
+    "split(/\\s+/)",
+  ]) {
+    assert.ok(body.includes(probe), "missing regex: " + probe);
+  }
+});

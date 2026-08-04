@@ -398,7 +398,7 @@ const CSS = `
     box-shadow: inset 0 0 0 1px var(--wa-divider);
     transition: box-shadow .15s ease;
   }
-  .wa-input-wrap:focus-within { box-shadow: inset 0 0 0 2px var(--wa-green-bright); }
+  .wa-input-wrap:focus-within { box-shadow: inset 0 0 0 1px #b8dcd2; }
   .wa-input {
     flex: 1; border: none; outline: none; resize: none;
     background: transparent;
@@ -538,6 +538,12 @@ const CSS = `
     .wa-app { position: relative; }
   }
   @media (max-width: 640px) {
+    /* CRM topbar has no wrap and forces the body wider than small viewports */
+    body.nesher-wa-page { overflow-x: hidden; }
+    body.nesher-wa-page .topbar { padding: 8px 12px; }
+    body.nesher-wa-page .topbar-inner { flex-wrap: wrap; gap: 8px; }
+    body.nesher-wa-page .brand { font-size: 15px; }
+    body.nesher-wa-page .navbar { padding: 6px 12px; }
     body.nesher-wa-page .container { margin: 8px auto 12px !important; padding: 0 !important; }
     body.nesher-wa-page .container > .card { border-radius: 0 !important; border-left: none; border-right: none; }
     .wa-app { height: calc(100vh - 130px); height: calc(100dvh - 130px); }
@@ -1440,7 +1446,9 @@ const SCRIPT = `
     document.addEventListener("visibilitychange", function () {
       if (!document.hidden) refresh();
     });
-    input.focus();
+    if (window.matchMedia && window.matchMedia("(min-width: 641px)").matches) {
+      input.focus();
+    }
     return true;
   }
 
