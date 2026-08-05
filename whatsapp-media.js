@@ -58,14 +58,18 @@ export async function downloadWhatsAppMedia(mediaId) {
 }
 
 /**
- * Convert browser WebM/other to OGG Opus via ffmpeg (required for WA voice notes).
+ * Convert any browser audio to AAC/M4A via ffmpeg. OGG-Opus voice notes sent
+ * through the Cloud API error with "audio is no longer available" on iPhones
+ * (verified 2026-08-05 — even a bit-perfect WhatsApp-native OGG failed when
+ * re-sent via the API), so ALL outbound audio ships as AAC, which every
+ * device plays natively.
  * @param {Buffer} input
  * @param {string} inputExt e.g. .webm .ogg .mp3
  */
-export async function toOggOpus(input, inputExt = ".webm") {
+export async function toAacM4a(input, inputExt = ".webm") {
   const dir = await mkdtemp(path.join(tmpdir(), "wa-audio-"));
   const inPath = path.join(dir, `in${inputExt.startsWith(".") ? inputExt : `.${inputExt}`}`);
-  const outPath = path.join(dir, "out.ogg");
+  const outPath = path.join(dir, "out.m4a");
   await writeFile(inPath, input);
 
   await new Promise((resolve, reject) => {
@@ -76,13 +80,15 @@ export async function toOggOpus(input, inputExt = ".webm") {
         "-i",
         inPath,
         "-c:a",
-        "libopus",
+        "aac",
         "-b:a",
-        "32k",
+        "64k",
         "-ac",
         "1",
         "-ar",
-        "16000",
+        "44100",
+        "-movflags",
+        "+faststart",
         outPath,
       ],
       { stdio: ["ignore", "ignore", "pipe"] }
@@ -348,37 +354,32 @@ export async function sendContactAudio({
   const isMp3 = /mpeg|mp3/i.test(uploadMime);
   const isM4a = /mp4|m4a|aac/i.test(uploadMime);
 
-  if (voice || (!isOgg && !isMp3 && !isM4a)) {
-    // Convert browser webm/etc → ogg opus for reliable voice notes
+  if (isMp3) {
+    // Already universally playable — pass through untouched.
+    uploadMime = "audio/mpeg";
+    filename = "audio.mp3";
+  } else if (isM4a) {
+    uploadMime = "audio/mp4";
+    filename = "audio.m4a";
+  } else {
+    // webm recordings, ogg, and everything else → AAC/M4A (never OGG: it
+    // errors on iPhones when sent via the Cloud API).
     const ext = isOgg
       ? ".ogg"
       : /webm/i.test(uploadMime)
         ? ".webm"
-        : /mp4|m4a/i.test(uploadMime)
-          ? ".m4a"
-          : ".webm";
-    uploadBuf = await toOggOpus(buffer, ext);
-    uploadMime = "audio/ogg";
-    filename = "voice.ogg";
-    voice = true;
-  } else if (isOgg) {
-    uploadMime = "audio/ogg";
-    filename = "voice.ogg";
-  } else if (isMp3) {
-    uploadMime = "audio/mpeg";
-    filename = "audio.mp3";
-    voice = false;
-  } else if (isM4a) {
+        : ".webm";
+    uploadBuf = await toAacM4a(buffer, ext);
     uploadMime = "audio/mp4";
-    filename = "audio.m4a";
-    voice = false;
+    filename = "voice.m4a";
   }
 
   const mediaId = await uploadWhatsAppMedia(uploadBuf, uploadMime, filename);
   const { wamid } = await sendWhatsAppAudio({
     to: contact.phone_number,
     mediaId,
-    isVoice: voice,
+    // Meta's voice flag is OGG-only; never send it with AAC/MP3 payloads.
+    isVoice: false,
   });
   const messageId = await recordOutboundAudio({
     contactId: contact.id,
