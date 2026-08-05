@@ -322,6 +322,15 @@ const CSS = `
   .wa-msg.pending .wa-bubble { opacity: .82; }
   .wa-msg.failed .wa-bubble { box-shadow: 0 0 0 1px rgba(220,38,38,.4); cursor: pointer; }
 
+  /* Agent attribution (group-chat style sender names on outbound bubbles) */
+  .wa-sender { font-size: 12px; font-weight: 600; line-height: 1.25; margin-bottom: 1px; }
+  .wa-sender[data-tone="1"] { color: #0b7ea4; }
+  .wa-sender[data-tone="2"] { color: #6d28d9; }
+  .wa-sender[data-tone="3"] { color: #d97706; }
+  .wa-sender[data-tone="4"] { color: #be185d; }
+  .wa-sender[data-tone="5"] { color: #0f766e; }
+  .wa-preview-sender { font-weight: 600; color: #667781; margin-right: 3px; flex: none; }
+
   /* Voice / audio bubble */
   .wa-audio { display: flex; align-items: center; gap: 10px; min-width: 230px; padding: 3px 0 2px; }
   .wa-audio-btn {
@@ -771,6 +780,9 @@ const SCRIPT = `
       var p = previewFor(chat.lastMessage);
       if (chat.lastMessage && chat.lastMessage.direction === "outbound") {
         prev.appendChild(ticksFor(chat.lastMessage.status));
+        if (chat.lastMessage.sentBy) {
+          prev.appendChild(el("span", "wa-preview-sender", String(chat.lastMessage.sentBy).split(" ")[0] + ":"));
+        }
       }
       if (p.voice) prev.appendChild(icon("micSm", "wa-ticks"));
       var pt = el("span", "wa-preview-text", p.text || (chat.lastMessage ? "" : fmtPhone(chat.phone)));
@@ -1094,6 +1106,7 @@ const SCRIPT = `
     var rendered = {};       // id -> {node, status, tickEl}
     var lastDayK = null;
     var lastDir = null;
+    var lastOutSender = null;
     var firstLoad = true;
 
     function buildMsg(mUi) {
@@ -1105,11 +1118,19 @@ const SCRIPT = `
         msgs.appendChild(div);
         lastDayK = k;
         lastDir = null;
+        lastOutSender = null;
       }
       var dir = mUi.direction === "outbound" ? "out" : "in";
-      var row = el("div", "wa-msg " + dir + (dir !== lastDir ? " first" : ""));
+      var isRunStart = dir !== lastDir;
+      var row = el("div", "wa-msg " + dir + (isRunStart ? " first" : ""));
       lastDir = dir;
       var bub = el("div", "wa-bubble");
+      if (dir === "out" && mUi.sentBy && (isRunStart || mUi.sentBy !== lastOutSender)) {
+        var sender = el("div", "wa-sender", mUi.sentBy);
+        sender.setAttribute("data-tone", tone(mUi.sentBy));
+        bub.appendChild(sender);
+      }
+      if (dir === "out") lastOutSender = mUi.sentBy || lastOutSender;
       if (isAudioMsg(mUi)) {
         bub.appendChild(audioBubbleBody(mUi));
       } else {

@@ -195,16 +195,18 @@ export async function listInboxSummaries() {
             c.is_archived, c.customer_id, cust.full_name AS customer_name,
             m.direction AS lm_direction, m.status AS lm_status,
             m.message_type AS lm_type, m.body AS lm_body,
-            m.message_at AS lm_at, m.raw_payload AS lm_raw
+            m.message_at AS lm_at, m.raw_payload AS lm_raw,
+            COALESCE(NULLIF(TRIM(u.first_name || ' ' || u.last_name), ''), u.username) AS lm_sender
      FROM core_whatsappcontact c
      LEFT JOIN core_customer cust ON cust.id = c.customer_id
      LEFT JOIN LATERAL (
-       SELECT direction, status, message_type, body, message_at, raw_payload
+       SELECT direction, status, message_type, body, message_at, raw_payload, sent_by_id
        FROM core_whatsappmessage
        WHERE contact_id = c.id
        ORDER BY message_at DESC, id DESC
        LIMIT 1
      ) m ON TRUE
+     LEFT JOIN auth_user u ON u.id = m.sent_by_id
      ORDER BY COALESCE(m.message_at, c.last_message_at, c.created_at) DESC NULLS LAST`
   );
   return r.rows.map((row) => ({
@@ -223,6 +225,7 @@ export async function listInboxSummaries() {
           body: row.lm_body,
           messageAt: row.lm_at,
           voice: Boolean(row.lm_raw?.audio?.voice),
+          sentBy: row.lm_sender || null,
         }
       : null,
   }));
@@ -249,11 +252,13 @@ export async function listContactMessages(contactId, limit = 100) {
   const id = Number(contactId);
   const lim = Math.min(Math.max(Number(limit) || 100, 1), 300);
   const r = await p.query(
-    `SELECT id, direction, status, message_type, body, whatsapp_message_id,
-            raw_payload, error_message, message_at, created_at, sent_by_id
-     FROM core_whatsappmessage
-     WHERE contact_id = $1
-     ORDER BY message_at ASC, id ASC
+    `SELECT m.id, m.direction, m.status, m.message_type, m.body, m.whatsapp_message_id,
+            m.raw_payload, m.error_message, m.message_at, m.created_at, m.sent_by_id,
+            COALESCE(NULLIF(TRIM(u.first_name || ' ' || u.last_name), ''), u.username) AS sender
+     FROM core_whatsappmessage m
+     LEFT JOIN auth_user u ON u.id = m.sent_by_id
+     WHERE m.contact_id = $1
+     ORDER BY m.message_at ASC, m.id ASC
      LIMIT $2`,
     [id, lim]
   );
@@ -272,6 +277,7 @@ export async function listContactMessages(contactId, limit = 100) {
       mediaId: audio.id || null,
       voice: Boolean(audio.voice),
       mimeType: audio.mime_type || null,
+      sentBy: row.sender || null,
     };
   });
 }
