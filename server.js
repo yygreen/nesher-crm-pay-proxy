@@ -28,6 +28,7 @@ import {
   sessionUserId,
   stampAgentTag,
   listAgents,
+  transcribeMessage,
 } from "./whatsapp-media.js";
 
 const PORT = Number(process.env.PORT || 8080);
@@ -571,6 +572,24 @@ const server = http.createServer(async (req, res) => {
       sendJson(res, 200, { ok: true, agents: await listAgents() });
     } catch (e) {
       sendJson(res, 500, { error: e.message });
+    }
+    return;
+  }
+  const waTranscribeMatch = url.pathname.match(
+    /^\/__nesher_wa\/message\/(\d+)\/transcribe\/?$/
+  );
+  if (waTranscribeMatch) {
+    if (req.method !== "POST") {
+      sendJson(res, 405, { error: "POST only" });
+      return;
+    }
+    if (!(await requireStaff(req, res))) return;
+    try {
+      const out = await transcribeMessage(waTranscribeMatch[1]);
+      sendJson(res, 200, { ok: true, text: out.text, cached: out.cached });
+    } catch (e) {
+      console.error("wa transcribe", e.message);
+      sendJson(res, 400, { error: e.message || String(e) });
     }
     return;
   }

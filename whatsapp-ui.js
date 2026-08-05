@@ -331,6 +331,26 @@ const CSS = `
   .wa-sender[data-tone="5"] { color: #0f766e; }
   .wa-preview-sender { font-weight: 600; color: #667781; margin-right: 3px; flex: none; }
 
+  /* Transcribe-to-English on voice notes */
+  .wa-transcribe-btn {
+    display: inline-flex; align-items: center; gap: 5px;
+    border: none; background: transparent; color: #027eb5;
+    font-size: 12px; font-weight: 600; cursor: pointer;
+    padding: 3px 0 0; margin: 0;
+  }
+  .wa-transcribe-btn:hover { text-decoration: underline; }
+  .wa-transcribe-btn:disabled { color: #8696a0; cursor: wait; text-decoration: none; }
+  .wa-transcript {
+    margin-top: 6px; padding: 7px 10px;
+    background: rgba(11,20,26,0.05); border-left: 3px solid #027eb5;
+    border-radius: 6px; font-size: 13px; color: #1f2c33; line-height: 1.45;
+    direction: ltr; text-align: left; white-space: pre-wrap;
+  }
+  .wa-transcript .wa-transcript-label {
+    display: block; font-size: 10.5px; font-weight: 700; color: #667781;
+    text-transform: uppercase; letter-spacing: .04em; margin-bottom: 2px;
+  }
+
   /* "Sign as" identity chip + picker */
   .wa-identity {
     display: inline-flex; align-items: center; gap: 5px;
@@ -1167,6 +1187,47 @@ const SCRIPT = `
       rate.type = "button";
       box.appendChild(btn); box.appendChild(mid); box.appendChild(rate);
       wrap.appendChild(box);
+
+      /* Transcribe → English (Yiddish/Hebrew voice notes; cached per message) */
+      function showTranscript(text) {
+        var t = el("div", "wa-transcript");
+        t.appendChild(el("span", "wa-transcript-label", "English \\u00b7 auto-transcribed"));
+        t.appendChild(document.createTextNode(text));
+        wrap.appendChild(t);
+      }
+      if (mUi.transcriptEn) {
+        showTranscript(mUi.transcriptEn);
+      } else if (mUi.id) {
+        var trBtn = el("button", "wa-transcribe-btn");
+        trBtn.type = "button";
+        trBtn.textContent = "Transcribe \\u2192 English";
+        trBtn.title = "Transcribe this voice note into English (only your team sees it)";
+        trBtn.addEventListener("click", function () {
+          trBtn.disabled = true;
+          trBtn.textContent = "Transcribing\\u2026";
+          fetch("/__nesher_wa/message/" + mUi.id + "/transcribe/", {
+            method: "POST",
+            credentials: "same-origin",
+            headers: { Accept: "application/json", "X-Requested-With": "XMLHttpRequest" }
+          })
+            .then(function (r) {
+              return r.json().catch(function () { return {}; }).then(function (d) {
+                if (!r.ok) throw new Error(d.error || ("HTTP " + r.status));
+                return d;
+              });
+            })
+            .then(function (d) {
+              trBtn.remove();
+              showTranscript(d.text || "");
+            })
+            .catch(function (e) {
+              trBtn.disabled = false;
+              trBtn.textContent = "Transcribe \\u2192 English";
+              toast("Transcription failed: " + (e.message || e), "error");
+            });
+        });
+        wrap.appendChild(trBtn);
+      }
 
       var audio = null;
       var rates = [1, 1.5, 2];

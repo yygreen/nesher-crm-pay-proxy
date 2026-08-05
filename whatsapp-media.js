@@ -287,6 +287,7 @@ export async function listContactMessages(contactId, limit = 100) {
       mimeType: audio.mime_type || null,
       sentBy: row.sender || null,
       agentTag: (raw.agent_tag || "").trim() || null,
+      transcriptEn: String(raw.transcript_en || "").trim() || null,
     };
   });
 }
@@ -333,6 +334,82 @@ export async function sessionUserId(sessionKey) {
     /* attribution is best-effort — never block the send */
   }
   return null;
+}
+
+/**
+ * Transcribe + translate a voice-note message to English via Gemini
+ * (handles Yiddish/Hebrew/English audio). Result is cached on the message
+ * row (raw_payload.transcript_en) so the whole team shares one transcription.
+ * Internal-only — nothing is sent back to the customer.
+ */
+export async function transcribeMessage(messageId) {
+  const p = getPool();
+  const id = Number(messageId);
+  if (!Number.isFinite(id)) throw new Error("Invalid message id");
+  const r = await p.query(
+    `SELECT id, message_type, raw_payload FROM core_whatsappmessage WHERE id = $1`,
+    [id]
+  );
+  if (!r.rows.length) throw new Error(`Message ${id} not found`);
+  const raw = r.rows[0].raw_payload || {};
+  const cached = String(raw.transcript_en || "").trim();
+  if (cached) return { text: cached, cached: true };
+  if (r.rows[0].message_type !== "audio" || !raw.audio?.id) {
+    throw new Error("Not an audio message");
+  }
+
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) throw new Error("Transcription not configured (GEMINI_API_KEY missing)");
+  const model = process.env.GEMINI_TRANSCRIBE_MODEL || "gemini-2.5-flash";
+
+  const media = await downloadWhatsAppMedia(raw.audio.id);
+  if (media.buffer.length > 18 * 1024 * 1024) throw new Error("Audio too large to transcribe");
+
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [
+          {
+            parts: [
+              {
+                inline_data: {
+                  mime_type: media.mimeType.split(";")[0] || "audio/ogg",
+                  data: media.buffer.toString("base64"),
+                },
+              },
+              {
+                text:
+                  "This is a WhatsApp voice note from a travel-agency customer or agent, most likely in Yiddish (possibly Hebrew or English, or mixed). " +
+                  "Transcribe it and translate it into natural, plain English. " +
+                  "Return ONLY the English translation of what was said — no preamble, no notes, no original-language text. " +
+                  "If a name, number, or date is unclear, mark it like [unclear].",
+              },
+            ],
+          },
+        ],
+      }),
+    }
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data?.error?.message || `Transcription HTTP ${res.status}`);
+  }
+  const text = String(
+    data?.candidates?.[0]?.content?.parts?.map((pt) => pt.text || "").join("") || ""
+  ).trim();
+  if (!text) throw new Error("Transcription came back empty — try again");
+
+  await p.query(
+    `UPDATE core_whatsappmessage
+     SET raw_payload = COALESCE(raw_payload, '{}'::jsonb) ||
+       jsonb_build_object('transcript_en', $2::text, 'transcript_model', $3::text)
+     WHERE id = $1`,
+    [id, text.slice(0, 8000), model]
+  );
+  return { text, cached: false };
 }
 
 /**
