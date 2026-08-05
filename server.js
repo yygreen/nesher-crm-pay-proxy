@@ -31,6 +31,9 @@ import {
   stampAgentTag,
   listAgents,
   transcribeMessage,
+  listApprovedTemplates,
+  startChat,
+  whatsappByCustomer,
 } from "./whatsapp-media.js";
 
 const PORT = Number(process.env.PORT || 8080);
@@ -449,7 +452,8 @@ function proxyWithInject(req, res) {
   const shouldInject =
     /^\/jrm\/hotels(\/|$)/.test(pathOnly) ||
     /^\/reservations(\/|$)/.test(pathOnly) ||
-    /^\/whatsapp(\/|$)/.test(pathOnly);
+    /^\/whatsapp(\/|$)/.test(pathOnly) ||
+    /^\/customers\/\d+\/?$/.test(pathOnly);
 
   if (!shouldInject || req.method !== "GET") {
     proxy.web(req, res);
@@ -606,6 +610,54 @@ const server = http.createServer(async (req, res) => {
     if (!(await requireStaff(req, res))) return;
     try {
       sendJson(res, 200, { ok: true, agents: await listAgents() });
+    } catch (e) {
+      sendJson(res, 500, { error: e.message });
+    }
+    return;
+  }
+  if (/^\/__nesher_wa\/templates\/?$/.test(url.pathname)) {
+    if (!(await requireStaff(req, res))) return;
+    try {
+      sendJson(res, 200, { ok: true, templates: await listApprovedTemplates() });
+    } catch (e) {
+      sendJson(res, 500, { error: e.message });
+    }
+    return;
+  }
+  if (/^\/__nesher_wa\/new-chat\/?$/.test(url.pathname)) {
+    if (req.method !== "POST") {
+      sendJson(res, 405, { error: "POST only" });
+      return;
+    }
+    if (!(await requireStaff(req, res))) return;
+    try {
+      const body = await readJson(req);
+      const sentById = await sessionUserId(
+        extractSessionId(String(req.headers.cookie || ""))
+      );
+      const out = await startChat({
+        phone: body.phone,
+        name: typeof body.name === "string" ? body.name.slice(0, 80) : "",
+        templateName: String(body.templateName || ""),
+        params: Array.isArray(body.params) ? body.params : [],
+        sentById,
+        agentTag: typeof body.agentTag === "string" ? body.agentTag : "",
+      });
+      sendJson(res, 200, { ok: true, ...out });
+    } catch (e) {
+      console.error("wa new-chat", e.message);
+      sendJson(res, 400, { error: e.message || String(e) });
+    }
+    return;
+  }
+  const waByCustMatch = url.pathname.match(
+    /^\/__nesher_wa\/by-customer\/(\d+)\/?$/
+  );
+  if (waByCustMatch) {
+    if (!(await requireStaff(req, res))) return;
+    try {
+      const info = await whatsappByCustomer(waByCustMatch[1]);
+      sendJson(res, 200, { ok: true, whatsapp: info });
     } catch (e) {
       sendJson(res, 500, { error: e.message });
     }

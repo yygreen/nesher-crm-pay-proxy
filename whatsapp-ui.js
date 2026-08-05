@@ -351,6 +351,19 @@ const CSS = `
     text-transform: uppercase; letter-spacing: .04em; margin-bottom: 2px;
   }
 
+  /* New chat (business-initiated, template) */
+  .wa-newchat-btn {
+    border: 1.5px solid rgba(255,255,255,0.7); background: rgba(255,255,255,0.12);
+    color: #fff; font-size: 13px; font-weight: 700; border-radius: 999px;
+    padding: 6px 14px; cursor: pointer; white-space: nowrap; flex: none; margin-right: 10px;
+  }
+  .wa-newchat-btn:hover { background: rgba(255,255,255,0.24); }
+  .wa-nc-body {
+    background: #f8fafb; border: 1px solid #e2e8ea; border-radius: 8px;
+    padding: 8px 10px; font-size: 12.5px; color: #3b4a54; margin-bottom: 10px; line-height: 1.4;
+  }
+  .wa-nc-err { color: #dc2626; font-size: 12.5px; margin-bottom: 8px; min-height: 16px; }
+
   /* "Sign as" identity chip + picker */
   .wa-identity {
     display: inline-flex; align-items: center; gap: 5px;
@@ -797,9 +810,101 @@ const SCRIPT = `
     var pill = el("span", "wa-pill");
     pill.appendChild(el("span", "dot"));
     pill.appendChild(document.createTextNode("Cloud API live"));
-    bar.appendChild(logo); bar.appendChild(titles); bar.appendChild(pill);
+    var newBtn = el("button", "wa-newchat-btn", "+ New chat");
+    newBtn.type = "button";
+    newBtn.title = "Start a WhatsApp conversation with someone who has not messaged us (uses an approved template)";
+    newBtn.addEventListener("click", openNewChat);
+    bar.appendChild(logo); bar.appendChild(titles); bar.appendChild(newBtn); bar.appendChild(pill);
     outerCard.insertBefore(bar, outerCard.firstChild);
     header.style.display = "none";
+
+    function openNewChat() {
+      var overlay = el("div", "wa-id-overlay");
+      var card = el("div", "wa-id-card");
+      card.appendChild(el("h3", "", "New WhatsApp chat"));
+      card.appendChild(el("p", "", "WhatsApp requires an approved template for the FIRST message to someone who never wrote to us. Once they reply, the chat is free-form."));
+      var phone = el("input", "wa-id-free");
+      phone.type = "text"; phone.placeholder = "Phone \\u2014 international digits, e.g. 972501234567"; phone.maxLength = 20;
+      var nameIn = el("input", "wa-id-free");
+      nameIn.type = "text"; nameIn.placeholder = "Name (optional)"; nameIn.maxLength = 80;
+      var tplSel = el("select", "wa-id-free");
+      var bodyPrev = el("div", "wa-nc-body", "Loading templates\\u2026");
+      var varHost = el("div");
+      var err = el("div", "wa-nc-err", "");
+      var templates = [];
+      function renderTpl() {
+        var t = templates[tplSel.selectedIndex];
+        varHost.innerHTML = "";
+        if (!t) { bodyPrev.textContent = "No approved templates yet \\u2014 one is pending Meta approval; try again soon."; return; }
+        bodyPrev.textContent = t.body;
+        for (var i = 1; i <= t.varCount; i++) {
+          var vi = el("input", "wa-id-free");
+          vi.type = "text"; vi.placeholder = "Value for {{" + i + "}}"; vi.maxLength = 500;
+          vi.setAttribute("data-var", String(i));
+          varHost.appendChild(vi);
+        }
+      }
+      fetch("/__nesher_wa/templates/", { credentials: "same-origin", headers: { Accept: "application/json" } })
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+          templates = d.templates || [];
+          tplSel.innerHTML = "";
+          templates.forEach(function (t) {
+            var o = el("option", "", t.name + " (" + t.language + ")");
+            tplSel.appendChild(o);
+          });
+          renderTpl();
+        })
+        .catch(function () { bodyPrev.textContent = "Could not load templates."; });
+      tplSel.addEventListener("change", renderTpl);
+      var actions = el("div", "wa-id-actions");
+      var cancel = el("button", "wa-id-cancel", "Cancel");
+      cancel.type = "button";
+      cancel.addEventListener("click", function () { overlay.remove(); });
+      var send = el("button", "wa-id-save", "Send");
+      send.type = "button";
+      send.addEventListener("click", function () {
+        err.textContent = "";
+        var t = templates[tplSel.selectedIndex];
+        var digits = phone.value.replace(/\\D/g, "");
+        if (!t) { err.textContent = "No approved template available yet."; return; }
+        if (digits.length < 9) { err.textContent = "Enter the full international number (digits only)."; return; }
+        var params = [];
+        var ok = true;
+        qa("input[data-var]", varHost).forEach(function (vi) {
+          if (!vi.value.trim()) ok = false;
+          params.push(vi.value.trim());
+        });
+        if (!ok) { err.textContent = "Fill in every template value."; return; }
+        var who = "";
+        try { who = (localStorage.getItem("nesherWaAgentName") || "").trim(); } catch (e) {}
+        send.disabled = true; send.textContent = "Sending\\u2026";
+        fetch("/__nesher_wa/new-chat/", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json", "X-Requested-With": "XMLHttpRequest" },
+          body: JSON.stringify({ phone: digits, name: nameIn.value.trim(), templateName: t.name, params: params, agentTag: who })
+        })
+          .then(function (r) {
+            return r.json().catch(function () { return {}; }).then(function (d) {
+              if (!r.ok) throw new Error(d.error || ("HTTP " + r.status));
+              return d;
+            });
+          })
+          .then(function (d) { location.href = "/whatsapp/" + d.contactId + "/"; })
+          .catch(function (e) {
+            send.disabled = false; send.textContent = "Send";
+            err.textContent = e.message || String(e);
+          });
+      });
+      actions.appendChild(cancel); actions.appendChild(send);
+      card.appendChild(phone); card.appendChild(nameIn); card.appendChild(tplSel);
+      card.appendChild(bodyPrev); card.appendChild(varHost); card.appendChild(err); card.appendChild(actions);
+      overlay.appendChild(card);
+      overlay.addEventListener("click", function (ev) { if (ev.target === overlay) overlay.remove(); });
+      document.body.appendChild(overlay);
+      phone.focus();
+    }
 
     /* seed data from the server-rendered table */
     var table = q("table", outerCard);
@@ -1700,9 +1805,43 @@ const SCRIPT = `
  * @param {string} html
  * @param {string} path
  */
+/* WhatsApp presence card on a customer detail page — self-contained script,
+ * fetches /__nesher_wa/by-customer/<id>/ and renders a link into the chat. */
+function customerCardScript(customerId) {
+  return `
+<script id="${WA_UI_MARKER}-cust">
+(function () {
+  fetch("/__nesher_wa/by-customer/${customerId}/", { credentials: "same-origin", headers: { Accept: "application/json" } })
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      var w = d && d.whatsapp;
+      if (!w) return;
+      var card = document.createElement("div");
+      card.style.cssText = "margin:12px 0;padding:13px 16px;border:1px solid #b9e6d3;border-left:4px solid #008069;border-radius:10px;background:#f0faf6;font-size:14px;color:#1f2c33;display:flex;align-items:center;gap:10px;flex-wrap:wrap;";
+      var when = w.lastAt ? new Date(w.lastAt).toLocaleString() : "no messages yet";
+      card.innerHTML =
+        '<strong style="color:#008069">WhatsApp</strong>' +
+        '<span>' + (w.name || w.phone) + ' \\u00b7 ' + w.messages + ' messages \\u00b7 last: ' + when + '</span>' +
+        '<a href="/whatsapp/' + w.contactId + '/" style="margin-left:auto;background:#008069;color:#fff;font-weight:700;border-radius:999px;padding:6px 16px;text-decoration:none;">Open conversation</a>';
+      var host = document.querySelector(".container") || document.body;
+      host.insertBefore(card, host.children[1] || null);
+    })
+    .catch(function () {});
+})();
+</script>`;
+}
+
 export function injectWhatsAppUi(html, path) {
   if (!html || typeof html !== "string") return html;
   if (html.includes(`${WA_UI_MARKER}-js`)) return html;
+  const custMatch = String(path || "").match(/^\/customers\/(\d+)\/?$/);
+  if (custMatch) {
+    if (html.includes(`${WA_UI_MARKER}-cust`)) return html;
+    if (/<\/body>/i.test(html)) {
+      return html.replace(/<\/body>/i, `${customerCardScript(custMatch[1])}</body>`);
+    }
+    return html;
+  }
   if (!/^\/whatsapp(\/|$)/.test(path || "")) return html;
   if (!/<\/body>/i.test(html) && !/<html/i.test(html)) return html;
 

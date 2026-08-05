@@ -197,6 +197,7 @@ export async function getContact(contactId) {
  */
 export async function listInboxSummaries() {
   const p = getPool();
+  await autoLinkContacts().catch(() => {});
   const r = await p.query(
     `SELECT c.id, c.phone_number, c.display_name, c.unread_count,
             c.is_archived, c.customer_id, cust.full_name AS customer_name,
@@ -463,6 +464,174 @@ export async function listAgents() {
     username: u.username,
     name: u.full_name || u.username,
   }));
+}
+
+/**
+ * Auto-link unlinked WhatsApp contacts to customers by phone (last 9 digits;
+ * only when exactly ONE customer matches, so shared/ambiguous numbers are
+ * never guessed). Cheap single statement — safe to run on every inbox load.
+ */
+export async function autoLinkContacts() {
+  const p = getPool();
+  const r = await p.query(
+    `WITH cand AS (
+       SELECT wc.id wc_id, c.id cust_id,
+              count(*) OVER (PARTITION BY wc.id) matches
+       FROM core_whatsappcontact wc
+       JOIN core_customer c
+         ON length(regexp_replace(coalesce(c.phone,''), '\\D', '', 'g')) >= 9
+        AND right(regexp_replace(c.phone, '\\D', '', 'g'), 9)
+          = right(regexp_replace(wc.phone_number, '\\D', '', 'g'), 9)
+       WHERE wc.customer_id IS NULL
+     )
+     UPDATE core_whatsappcontact wc SET customer_id = cand.cust_id, updated_at = now()
+     FROM cand WHERE wc.id = cand.wc_id AND cand.matches = 1
+     RETURNING wc.id, wc.customer_id`
+  );
+  return r.rows;
+}
+
+/**
+ * WhatsApp presence for a customer detail page: contact + message stats.
+ */
+export async function whatsappByCustomer(customerId) {
+  const p = getPool();
+  const id = Number(customerId);
+  if (!Number.isFinite(id)) return null;
+  const r = await p.query(
+    `SELECT wc.id, wc.phone_number, wc.display_name,
+            count(m.id) AS msg_count, max(m.message_at) AS last_at
+     FROM core_whatsappcontact wc
+     LEFT JOIN core_whatsappmessage m ON m.contact_id = wc.id
+     WHERE wc.customer_id = $1
+     GROUP BY wc.id ORDER BY max(m.message_at) DESC NULLS LAST LIMIT 1`,
+    [id]
+  );
+  if (!r.rows.length) return null;
+  const row = r.rows[0];
+  return {
+    contactId: Number(row.id),
+    phone: row.phone_number,
+    name: row.display_name,
+    messages: Number(row.msg_count) || 0,
+    lastAt: row.last_at,
+  };
+}
+
+/**
+ * Approved templates (needed to START a conversation — Meta requires a
+ * pre-approved template for any business-initiated message).
+ */
+export async function listApprovedTemplates() {
+  const { token } = waConfig();
+  if (!token) throw new Error("WhatsApp not configured on proxy");
+  const res = await fetch(
+    `${GRAPH}/${process.env.WHATSAPP_BUSINESS_ACCOUNT_ID || "1548491333738289"}/message_templates?fields=name,status,category,language,components&limit=50`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data?.error?.message || `Templates HTTP ${res.status}`);
+  return (data.data || [])
+    .filter((t) => t.status === "APPROVED")
+    .map((t) => {
+      const body = (t.components || []).find((c) => c.type === "BODY");
+      const text = body?.text || "";
+      const varCount = (text.match(/\{\{\d+\}\}/g) || []).length;
+      return { name: t.name, language: t.language, category: t.category, body: text, varCount };
+    });
+}
+
+/**
+ * Start a business-initiated conversation: send an approved template to a
+ * phone that never messaged us, create/reuse the contact row, record the
+ * rendered message, and auto-link to a customer by phone.
+ */
+export async function startChat({ phone, name = "", templateName, params = [], sentById = null, agentTag = "" }) {
+  const { token, phoneNumberId } = waConfig();
+  if (!token || !phoneNumberId) throw new Error("WhatsApp not configured on proxy");
+  const digits = String(phone || "").replace(/\D/g, "");
+  if (digits.length < 9) throw new Error("Phone must be international digits, e.g. 972539240985");
+
+  const templates = await listApprovedTemplates();
+  const tpl = templates.find((t) => t.name === templateName);
+  if (!tpl) throw new Error(`Template "${templateName}" is not approved yet`);
+  if (params.length !== tpl.varCount) {
+    throw new Error(`Template needs ${tpl.varCount} value(s), got ${params.length}`);
+  }
+
+  const payload = {
+    messaging_product: "whatsapp",
+    to: digits,
+    type: "template",
+    template: {
+      name: tpl.name,
+      language: { code: tpl.language },
+      ...(tpl.varCount
+        ? {
+            components: [
+              {
+                type: "body",
+                parameters: params.map((v) => ({ type: "text", text: String(v).slice(0, 500) })),
+              },
+            ],
+          }
+        : {}),
+    },
+  };
+  const res = await fetch(`${GRAPH}/${phoneNumberId}/messages`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data?.error?.message || `Template send HTTP ${res.status}`);
+  const wamid = data?.messages?.[0]?.id || "";
+
+  const p = getPool();
+  const now = new Date();
+  const existing = await p.query(
+    `SELECT id FROM core_whatsappcontact WHERE regexp_replace(phone_number, '\\D', '', 'g') = $1 LIMIT 1`,
+    [digits]
+  );
+  let contactId;
+  if (existing.rows.length) {
+    contactId = Number(existing.rows[0].id);
+    if (name) {
+      await p.query(
+        `UPDATE core_whatsappcontact SET display_name = COALESCE(NULLIF(display_name, ''), $2), updated_at = $3 WHERE id = $1`,
+        [contactId, name, now]
+      );
+    }
+  } else {
+    const ins = await p.query(
+      `INSERT INTO core_whatsappcontact
+        (phone_number, display_name, last_message_at, unread_count, is_archived, notes, created_at, updated_at, customer_id)
+       VALUES ($1, $2, $3, 0, false, '', $3, $3, NULL) RETURNING id`,
+      [digits, name || digits, now]
+    );
+    contactId = Number(ins.rows[0].id);
+  }
+
+  let rendered = tpl.body;
+  params.forEach((v, i) => {
+    rendered = rendered.split(`{{${i + 1}}}`).join(String(v));
+  });
+  const raw = { type: "template", template: tpl.name, direction: "outbound" };
+  const tag = String(agentTag || "").trim().slice(0, 40);
+  if (tag) raw.agent_tag = tag;
+  await p.query(
+    `INSERT INTO core_whatsappmessage
+      (direction, status, message_type, body, whatsapp_message_id, raw_payload,
+       error_message, created_at, message_at, contact_id, customer_id, sent_by_id)
+     VALUES ('outbound', 'sent', 'text', $1, $2, $3::jsonb, '', $4, $4, $5, NULL, $6)`,
+    [rendered, wamid || `tpl-${Date.now()}`, JSON.stringify(raw), now, contactId, sentById == null ? null : Number(sentById)]
+  );
+  await p.query(
+    `UPDATE core_whatsappcontact SET last_message_at = $1, updated_at = $1 WHERE id = $2`,
+    [now, contactId]
+  );
+  await autoLinkContacts().catch(() => {});
+  return { contactId, wamid };
 }
 
 /**
