@@ -518,6 +518,7 @@ const server = http.createServer(async (req, res) => {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
+      build: "2026-08-05-memo2",
       upstream: UPSTREAM,
       hasMercury: Boolean(
         process.env.MERCURY_TOKEN_NESHER || process.env.MERCURY_TOKEN
