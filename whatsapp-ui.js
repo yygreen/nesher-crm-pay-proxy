@@ -331,6 +331,50 @@ const CSS = `
   .wa-sender[data-tone="5"] { color: #0f766e; }
   .wa-preview-sender { font-weight: 600; color: #667781; margin-right: 3px; flex: none; }
 
+  /* "Sign as" identity chip + picker */
+  .wa-identity {
+    display: inline-flex; align-items: center; gap: 5px;
+    border: 1.5px solid #d1d7db; background: #fff; color: #3b4a54;
+    font-size: 12.5px; font-weight: 600; border-radius: 999px;
+    padding: 4px 11px; cursor: pointer; white-space: nowrap; flex: none;
+  }
+  .wa-identity:hover { border-color: var(--wa-green); color: var(--wa-green-deep); }
+  .wa-identity.unset { border-style: dashed; color: #8696a0; }
+  .wa-identity svg { width: 13px; height: 13px; }
+  .wa-id-overlay {
+    position: fixed; inset: 0; z-index: 60;
+    background: rgba(11,20,26,0.45);
+    display: flex; align-items: center; justify-content: center;
+  }
+  .wa-id-card {
+    background: #fff; border-radius: 14px; padding: 20px 22px;
+    width: min(330px, 90vw); box-shadow: 0 12px 40px rgba(11,20,26,0.3);
+  }
+  .wa-id-card h3 { margin: 0 0 4px; font-size: 16px; color: #111b21; }
+  .wa-id-card p { margin: 0 0 12px; font-size: 12.5px; color: #667781; }
+  .wa-id-list { display: flex; flex-wrap: wrap; gap: 7px; margin-bottom: 12px; }
+  .wa-id-opt {
+    border: 1.5px solid #d1d7db; background: #f8fafb; color: #3b4a54;
+    font-size: 13px; font-weight: 600; border-radius: 999px;
+    padding: 6px 13px; cursor: pointer;
+  }
+  .wa-id-opt:hover, .wa-id-opt.sel { border-color: var(--wa-green); background: #e7f8f2; color: var(--wa-green-deep); }
+  .wa-id-free {
+    width: 100%; box-sizing: border-box; border: 1.5px solid #d1d7db;
+    border-radius: 9px; padding: 8px 11px; font-size: 13.5px; margin-bottom: 12px;
+  }
+  .wa-id-free:focus { outline: none; border-color: var(--wa-green); }
+  .wa-id-actions { display: flex; gap: 8px; justify-content: flex-end; }
+  .wa-id-save {
+    border: none; background: var(--wa-green); color: #fff; font-weight: 700;
+    font-size: 13.5px; border-radius: 999px; padding: 8px 18px; cursor: pointer;
+  }
+  .wa-id-save:disabled { opacity: .5; cursor: default; }
+  .wa-id-cancel {
+    border: none; background: transparent; color: #667781; font-size: 13.5px;
+    border-radius: 999px; padding: 8px 12px; cursor: pointer;
+  }
+
   /* Voice / audio bubble */
   .wa-audio { display: flex; align-items: center; gap: 10px; min-width: 230px; padding: 3px 0 2px; }
   .wa-audio-btn {
@@ -782,8 +826,9 @@ const SCRIPT = `
       var p = previewFor(chat.lastMessage);
       if (chat.lastMessage && chat.lastMessage.direction === "outbound") {
         prev.appendChild(ticksFor(chat.lastMessage.status));
-        if (chat.lastMessage.sentBy) {
-          prev.appendChild(el("span", "wa-preview-sender", String(chat.lastMessage.sentBy).split(" ")[0] + ":"));
+        var lmWho = chat.lastMessage.agentTag || chat.lastMessage.sentBy;
+        if (lmWho) {
+          prev.appendChild(el("span", "wa-preview-sender", String(lmWho).split(" ")[0] + ":"));
         }
       }
       if (p.voice) prev.appendChild(icon("micSm", "wa-ticks"));
@@ -940,6 +985,79 @@ const SCRIPT = `
       try { localStorage.setItem(DETAILS_KEY, open ? "1" : "0"); } catch (e) {}
     }
 
+    /* "Sign as" identity — self-declared, per browser, shown only internally */
+    var ID_KEY = "nesherWaAgentName";
+    function agentName() {
+      try { return (localStorage.getItem(ID_KEY) || "").trim(); } catch (e) { return ""; }
+    }
+    var PEN_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>';
+    var idChip = el("button", "wa-identity");
+    idChip.type = "button";
+    idChip.title = "Who is replying from this computer";
+    function refreshIdChip() {
+      var n = agentName();
+      idChip.innerHTML = PEN_SVG + "<span>" + (n ? n.replace(/</g, "&lt;") : "Sign as\\u2026") + "</span>";
+      idChip.classList.toggle("unset", !n);
+    }
+    refreshIdChip();
+    function openIdentityPicker(onDone) {
+      var overlay = el("div", "wa-id-overlay");
+      var card = el("div", "wa-id-card");
+      card.appendChild(el("h3", "", "Who is replying?"));
+      card.appendChild(el("p", "", "Shown only inside the CRM \\u2014 customers never see it. Saved on this computer."));
+      var list = el("div", "wa-id-list");
+      var free = el("input", "wa-id-free");
+      free.type = "text"; free.placeholder = "Or type your name\\u2026"; free.maxLength = 40;
+      var chosen = "";
+      function syncSave() { save.disabled = !(chosen || free.value.trim()); }
+      fetch("/__nesher_wa/agents/", { credentials: "same-origin", headers: { Accept: "application/json" } })
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+          var seen = {};
+          (d.agents || []).forEach(function (a) {
+            var nm = (a.name || a.username || "").trim();
+            if (!nm || seen[nm]) return;
+            seen[nm] = true;
+            var b = el("button", "wa-id-opt", nm);
+            b.type = "button";
+            b.addEventListener("click", function () {
+              chosen = nm; free.value = "";
+              Array.prototype.forEach.call(list.children, function (c) { c.classList.remove("sel"); });
+              b.classList.add("sel");
+              syncSave();
+            });
+            list.appendChild(b);
+          });
+        })
+        .catch(function () {});
+      free.addEventListener("input", function () {
+        chosen = "";
+        Array.prototype.forEach.call(list.children, function (c) { c.classList.remove("sel"); });
+        syncSave();
+      });
+      var actions = el("div", "wa-id-actions");
+      var cancel = el("button", "wa-id-cancel", "Cancel");
+      cancel.type = "button";
+      var save = el("button", "wa-id-save", "Save");
+      save.type = "button"; save.disabled = true;
+      cancel.addEventListener("click", function () { overlay.remove(); });
+      save.addEventListener("click", function () {
+        var n = (chosen || free.value.trim()).slice(0, 40);
+        if (!n) return;
+        try { localStorage.setItem(ID_KEY, n); } catch (e) {}
+        refreshIdChip();
+        overlay.remove();
+        if (onDone) onDone();
+      });
+      free.addEventListener("keydown", function (ev) { if (ev.key === "Enter") save.click(); });
+      actions.appendChild(cancel); actions.appendChild(save);
+      card.appendChild(list); card.appendChild(free); card.appendChild(actions);
+      overlay.appendChild(card);
+      overlay.addEventListener("click", function (ev) { if (ev.target === overlay) overlay.remove(); });
+      document.body.appendChild(overlay);
+    }
+    idChip.addEventListener("click", function () { openIdentityPicker(null); });
+
     /* chat header */
     var head = el("div", "wa-chat-head");
     var back = el("a", "wa-icon-btn");
@@ -965,7 +1083,8 @@ const SCRIPT = `
     infoBtn.type = "button"; infoBtn.innerHTML = I.info;
     infoBtn.setAttribute("aria-label", "Contact details");
     infoBtn.title = "Contact details";
-    head.appendChild(back); head.appendChild(av); head.appendChild(ht); head.appendChild(infoBtn);
+    head.appendChild(back); head.appendChild(av); head.appendChild(ht);
+    head.appendChild(idChip); head.appendChild(infoBtn);
     pane.appendChild(head);
 
     infoBtn.addEventListener("click", function () { setDetails(!app.classList.contains("details-open")); });
@@ -1127,12 +1246,13 @@ const SCRIPT = `
       var row = el("div", "wa-msg " + dir + (isRunStart ? " first" : ""));
       lastDir = dir;
       var bub = el("div", "wa-bubble");
-      if (dir === "out" && mUi.sentBy && (isRunStart || mUi.sentBy !== lastOutSender)) {
-        var sender = el("div", "wa-sender", mUi.sentBy);
-        sender.setAttribute("data-tone", tone(mUi.sentBy));
+      var who = mUi.agentTag || mUi.sentBy;
+      if (dir === "out" && who && (isRunStart || who !== lastOutSender)) {
+        var sender = el("div", "wa-sender", who);
+        sender.setAttribute("data-tone", tone(who));
         bub.appendChild(sender);
       }
-      if (dir === "out") lastOutSender = mUi.sentBy || lastOutSender;
+      if (dir === "out") lastOutSender = who || lastOutSender;
       if (isAudioMsg(mUi)) {
         bub.appendChild(audioBubbleBody(mUi));
       } else {
@@ -1331,6 +1451,8 @@ const SCRIPT = `
     function sendText() {
       var text = input.value.trim();
       if (!text) return;
+      var who = agentName();
+      if (!who) { openIdentityPicker(function () { sendText(); }); return; }
       input.value = "";
       syncButtons(); autoGrow();
       input.focus();
@@ -1343,7 +1465,7 @@ const SCRIPT = `
         body: fd,
         credentials: "same-origin",
         redirect: "follow",
-        headers: { "X-Requested-With": "XMLHttpRequest" }
+        headers: { "X-Requested-With": "XMLHttpRequest", "X-Agent-Tag": encodeURIComponent(who) }
       })
         .then(function (r) {
           return r.text().then(function (html) {
@@ -1381,6 +1503,8 @@ const SCRIPT = `
       });
     }
     function sendAudioBlob(blob, mime, isVoice) {
+      var who = agentName();
+      if (!who) { openIdentityPicker(function () { sendAudioBlob(blob, mime, isVoice); }); return Promise.resolve(); }
       var row = addPending("", true);
       micBtn.disabled = true; attach.disabled = true;
       return blobToBase64(blob)
@@ -1389,7 +1513,7 @@ const SCRIPT = `
             method: "POST",
             credentials: "same-origin",
             headers: { "Content-Type": "application/json", "X-Requested-With": "XMLHttpRequest" },
-            body: JSON.stringify({ audioBase64: b64, mimeType: mime || blob.type || "audio/webm", voice: isVoice !== false })
+            body: JSON.stringify({ audioBase64: b64, mimeType: mime || blob.type || "audio/webm", voice: isVoice !== false, agentTag: who })
           });
         })
         .then(function (r) {

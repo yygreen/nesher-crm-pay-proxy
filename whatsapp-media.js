@@ -233,6 +233,7 @@ export async function listInboxSummaries() {
           messageAt: row.lm_at,
           voice: Boolean(row.lm_raw?.audio?.voice),
           sentBy: row.lm_sender || null,
+          agentTag: String(row.lm_raw?.agent_tag || "").trim() || null,
         }
       : null,
   }));
@@ -285,6 +286,7 @@ export async function listContactMessages(contactId, limit = 100) {
       voice: Boolean(audio.voice),
       mimeType: audio.mime_type || null,
       sentBy: row.sender || null,
+      agentTag: (raw.agent_tag || "").trim() || null,
     };
   });
 }
@@ -334,6 +336,47 @@ export async function sessionUserId(sessionKey) {
 }
 
 /**
+ * Stamp a self-declared agent name onto the newest just-sent outbound text
+ * row for a contact (Django creates the row; the proxy only sees the POST
+ * pass through). Internal-only: raw_payload.agent_tag never reaches Meta.
+ * Targets rows from the last 90s that aren't tagged yet.
+ */
+export async function stampAgentTag(contactId, tag) {
+  const clean = String(tag || "").trim().slice(0, 40);
+  if (!clean) return false;
+  const p = getPool();
+  const r = await p.query(
+    `UPDATE core_whatsappmessage
+     SET raw_payload = COALESCE(raw_payload, '{}'::jsonb) || jsonb_build_object('agent_tag', $2::text)
+     WHERE id = (
+       SELECT id FROM core_whatsappmessage
+       WHERE contact_id = $1 AND direction = 'outbound' AND message_type = 'text'
+         AND created_at > now() - interval '90 seconds'
+         AND COALESCE(raw_payload->>'agent_tag', '') = ''
+       ORDER BY id DESC LIMIT 1
+     )`,
+    [Number(contactId), clean]
+  );
+  return r.rowCount > 0;
+}
+
+/**
+ * Active CRM users for the "Sign as" picker.
+ */
+export async function listAgents() {
+  const p = getPool();
+  const r = await p.query(
+    `SELECT id, username, TRIM(first_name || ' ' || last_name) AS full_name
+     FROM auth_user WHERE is_active ORDER BY username`
+  );
+  return r.rows.map((u) => ({
+    id: Number(u.id),
+    username: u.username,
+    name: u.full_name || u.username,
+  }));
+}
+
+/**
  * Persist outbound audio row + bump contact last_message_at.
  */
 export async function recordOutboundAudio({
@@ -343,6 +386,7 @@ export async function recordOutboundAudio({
   mimeType,
   isVoice,
   sentById = null,
+  agentTag = "",
 }) {
   const p = getPool();
   const now = new Date();
@@ -355,6 +399,8 @@ export async function recordOutboundAudio({
     },
     direction: "outbound",
   };
+  const tag = String(agentTag || "").trim().slice(0, 40);
+  if (tag) raw.agent_tag = tag;
   const ins = await p.query(
     `INSERT INTO core_whatsappmessage
       (direction, status, message_type, body, whatsapp_message_id, raw_payload,
@@ -389,6 +435,7 @@ export async function sendContactAudio({
   mimeType = "audio/webm",
   isVoice = true,
   sentById = null,
+  agentTag = "",
 }) {
   const contact = await getContact(contactId);
   let uploadBuf = buffer;
@@ -436,6 +483,7 @@ export async function sendContactAudio({
     mimeType: uploadMime,
     isVoice: voice,
     sentById,
+    agentTag,
   });
   return {
     ok: true,

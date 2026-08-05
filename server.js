@@ -26,6 +26,8 @@ import {
   markContactRead,
   sendContactAudio,
   sessionUserId,
+  stampAgentTag,
+  listAgents,
 } from "./whatsapp-media.js";
 
 const PORT = Number(process.env.PORT || 8080);
@@ -406,12 +408,14 @@ async function handleWaSendAudio(req, res, contactId) {
     let mimeType = "audio/webm";
     let isVoice = true;
 
+    let agentTag = "";
     if (ct.includes("application/json")) {
       const j = JSON.parse(raw.toString("utf8") || "{}");
       if (!j.audioBase64) throw new Error("audioBase64 required");
       buffer = Buffer.from(j.audioBase64, "base64");
       mimeType = j.mimeType || "audio/webm";
       isVoice = j.voice !== false;
+      agentTag = typeof j.agentTag === "string" ? j.agentTag : "";
     } else {
       buffer = raw;
       mimeType = ct.split(";")[0].trim() || "audio/webm";
@@ -427,6 +431,7 @@ async function handleWaSendAudio(req, res, contactId) {
       mimeType,
       isVoice,
       sentById,
+      agentTag,
     });
     sendJson(res, 200, out);
   } catch (e) {
@@ -559,6 +564,40 @@ const server = http.createServer(async (req, res) => {
   if (waSendAudioMatch) {
     await handleWaSendAudio(req, res, waSendAudioMatch[1]);
     return;
+  }
+  if (/^\/__nesher_wa\/agents\/?$/.test(url.pathname)) {
+    if (!(await requireStaff(req, res))) return;
+    try {
+      sendJson(res, 200, { ok: true, agents: await listAgents() });
+    } catch (e) {
+      sendJson(res, 500, { error: e.message });
+    }
+    return;
+  }
+
+  // Text replies POST straight to Django through this proxy. When the UI
+  // declares who is typing (X-Agent-Tag), stamp that name onto the row Django
+  // is about to create — retries because the row lands during/after this
+  // request. Fire-and-forget: stamping must never delay the reply itself.
+  const replyMatch = url.pathname.match(/^\/whatsapp\/(\d+)\/reply\/?$/);
+  if (replyMatch && req.method === "POST" && req.headers["x-agent-tag"]) {
+    let tag = "";
+    try {
+      tag = decodeURIComponent(String(req.headers["x-agent-tag"]));
+    } catch {
+      tag = String(req.headers["x-agent-tag"]);
+    }
+    const contactId = replyMatch[1];
+    (async () => {
+      for (const delayMs of [1500, 3000, 6000]) {
+        await new Promise((r) => setTimeout(r, delayMs));
+        try {
+          if (await stampAgentTag(contactId, tag)) return;
+        } catch (e) {
+          console.error("agent-tag stamp", e.message);
+        }
+      }
+    })();
   }
 
   const payMatch = url.pathname.match(
