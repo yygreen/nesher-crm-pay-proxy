@@ -83,12 +83,12 @@ async function recordHotelPayment(pool, inv, target, out) {
     `INSERT INTO core_jrmhotelpayment
        (payment_date, amount, currency, method, reference, note, created_at,
         created_by_id, offer_id, request_id, card_last4)
-     VALUES ($1, $2, 'USD', 'card', $3, $4, NOW(), NULL, $5, $6, '')`,
+     VALUES ($1, $2, 'USD', 'mercury', $3, $4, NOW(), NULL, $5, $6, '')`,
     [
       paidAtOf(inv),
       amount,
       `Mercury ${inv.invoiceNumber} ${marker(inv)}`,
-      `[Mercury sync] Invoice ${inv.invoiceNumber} paid $${amount.toFixed(2)} USD via Mercury pay link.`,
+      `[Mercury sync] Invoice ${inv.invoiceNumber} paid $${amount.toFixed(2)} USD via Mercury pay link (card or ACH bank debit — Mercury does not disclose which).`,
       offerId,
       target.requestId,
     ]
@@ -146,11 +146,11 @@ async function recordReservationPayment(pool, inv, target, out) {
           reservation_id, cash_location, cash_location_other,
           points_account_id, points_qty, transfer_details, zelle_address,
           points_cost_per_point)
-       VALUES ($1, 'card', $2, $3, NOW(), NULL, $4, '', '', NULL, 0, '', '', 0)`,
+       VALUES ($1, 'mercury', $2, $3, NOW(), NULL, $4, '', '', NULL, 0, '', '', 0)`,
       [
         amount,
         paidAtOf(inv),
-        `[Mercury sync] Invoice ${inv.invoiceNumber} paid via Mercury pay link. ${marker(inv)}`,
+        `[Mercury sync] Invoice ${inv.invoiceNumber} paid via Mercury pay link (card or ACH bank debit — Mercury does not disclose which). ${marker(inv)}`,
         reservationId,
       ]
     );

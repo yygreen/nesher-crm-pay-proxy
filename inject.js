@@ -825,7 +825,9 @@ const SCRIPT = `
         '<div class="nesher-success-check">' + ICON_CHECK + "</div>" +
         '<div class="nesher-success-amt">' + money(amount) + "</div>" +
         '<div class="nesher-success-meta">' + esc(meta) + "</div>" +
-        (data.reused ? '<div class="nesher-pill">Existing unpaid link reused — same URL as before</div>' : "") +
+        (data.updated
+          ? '<div class="nesher-pill">Existing link updated — same URL, new amount/details</div>'
+          : (data.reused ? '<div class="nesher-pill">Existing unpaid link reused — same URL as before</div>' : "")) +
         '<div class="nesher-url-box">' +
           '<input id="nesher-success-url" readonly value="' + esc(data.payUrl) + '" aria-label="Payment link URL" />' +
           '<button type="button" class="nesher-btn-sec" id="nesher-copy-url">Copy</button>' +

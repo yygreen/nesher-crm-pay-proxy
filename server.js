@@ -263,7 +263,7 @@ async function handlePayApi(req, res, kind, id, query) {
     try {
       const d = draftBundle.draft;
       const ph = d.emailPlaceholder ? " (placeholder email)" : "";
-      const note = `[Automated Mercury] ${result.reused ? "Reused" : "Created"} pay link ${result.payUrl} | ${d.summary} | invoice ${d.invoiceNumber}${ph}`;
+      const note = `[Automated Mercury] ${result.updated ? "Updated" : result.reused ? "Reused" : "Created"} pay link ${result.payUrl} | ${d.summary} | invoice ${d.invoiceNumber}${ph}`;
       if (kind === "reservation") {
         await appendReservationNote(ctx.reservation.id, note);
       } else if (ctx.request?.id) {
@@ -276,6 +276,7 @@ async function handlePayApi(req, res, kind, id, query) {
     sendJson(res, 200, {
       ok: true,
       reused: result.reused,
+      updated: Boolean(result.updated),
       payUrl: result.payUrl,
       invoiceNumber: draftBundle.draft.invoiceNumber,
       amountUsd: draftBundle.draft.amountUsd,
@@ -539,7 +540,7 @@ const server = http.createServer(async (req, res) => {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-08-05-paysync2",
+      build: "2026-08-05-editable",
       upstream: UPSTREAM,
       paySync: lastPaySync
         ? {

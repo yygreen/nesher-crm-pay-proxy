@@ -86,6 +86,68 @@ describe("createOrReusePaymentRequest", () => {
     assert.equal(calls.filter((c) => c.method === "POST").length, 0);
   });
 
+  it("updates the existing unpaid invoice in place when the amount changed", async () => {
+    const calls = [];
+    const fetchImpl = async (url, init = {}) => {
+      const method = init.method || "GET";
+      calls.push({ url, method });
+      if (url.endsWith("/ar/invoices") && method === "GET") {
+        return {
+          ok: true,
+          async json() {
+            return {
+              invoices: [
+                {
+                  id: "inv-1",
+                  invoiceNumber: "JRM-189-O50",
+                  status: "Unpaid",
+                  slug: "existingslug",
+                  amount: 100,
+                  invoiceDate: "2026-08-02",
+                  dueDate: "2026-08-03",
+                },
+              ],
+            };
+          },
+        };
+      }
+      if (url.endsWith("/ar/customers") && method === "GET") {
+        return {
+          ok: true,
+          async json() {
+            return { customers: [{ id: "cust-1", email: "t@example.com" }] };
+          },
+        };
+      }
+      if (url.endsWith("/ar/invoices/inv-1") && method === "POST") {
+        const body = JSON.parse(init.body);
+        assert.equal(body.invoiceNumber, "JRM-189-O50");
+        assert.equal(body.lineItems[0].unitPrice, 150);
+        assert.equal(body.customerId, "cust-1");
+        assert.equal(body.sendEmailOption, "DontSend");
+        return {
+          ok: true,
+          async json() {
+            return { id: "inv-1", slug: "existingslug", amount: 150, status: "Unpaid" };
+          },
+        };
+      }
+      throw new Error(`unexpected ${method} ${url}`);
+    };
+    const result = await createOrReusePaymentRequest({
+      token: "secret-token:test",
+      customerName: "Test",
+      customerEmail: "t@example.com",
+      invoiceNumber: "JRM-189-O50",
+      amountUsd: 150,
+      fetchImpl,
+    });
+    assert.equal(result.updated, true);
+    assert.equal(result.reused, false);
+    assert.equal(result.payUrl, "https://app.mercury.com/pay/existingslug");
+    assert.equal(calls.filter((c) => c.url.endsWith("/ar/invoices") && c.method === "POST").length, 0);
+  });
+
   it("creates customer + invoice when none exists", async () => {
     const fetchImpl = async (url, init = {}) => {
       const method = init.method || "GET";

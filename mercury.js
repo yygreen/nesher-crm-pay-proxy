@@ -175,7 +175,15 @@ export async function createOrReusePaymentRequest(opts) {
 
   const MERCURY_API = mercuryApiBase();
 
-  // 1) Reuse unpaid invoice with same number
+  const amountOf = (items) =>
+    Math.round(items.reduce((s, li) => s + li.unitPrice * li.quantity, 0) * 100) / 100;
+  const memoOf = (m) =>
+    String(
+      m || `Nesher CRM pay link for ${invoiceNumber}. Do not reply to this memo.`
+    ).slice(0, 2000);
+
+  // 1) Existing unpaid invoice with the same number: reuse when identical,
+  //    UPDATE in place when the draft changed (same link, new details).
   const listRes = await fetchImpl(`${MERCURY_API}/ar/invoices`, { headers });
   if (!listRes.ok) {
     const t = await listRes.text();
@@ -189,11 +197,22 @@ export async function createOrReusePaymentRequest(opts) {
       String(inv.status || "").toLowerCase() === "unpaid"
   );
   if (existing?.slug) {
-    return {
-      reused: true,
-      invoice: existing,
-      payUrl: payUrlFromSlug(existing.slug),
-    };
+    const sameAmount =
+      Math.abs(Number(existing.amount) - amountOf(lineItems)) < 0.005;
+    const sameMemo =
+      String(existing.payerMemo || "") === memoOf(opts.payerMemo) ||
+      existing.payerMemo === undefined; // list payloads may omit the memo
+    const sameLines =
+      !Array.isArray(existing.lineItems) ||
+      existing.lineItems.map((li) => li.name).join("|") ===
+        lineItems.map((li) => li.name).join("|");
+    if (sameAmount && sameMemo && sameLines) {
+      return {
+        reused: true,
+        invoice: existing,
+        payUrl: payUrlFromSlug(existing.slug),
+      };
+    }
   }
 
   // 2) Find or create customer by email
@@ -220,14 +239,11 @@ export async function createOrReusePaymentRequest(opts) {
     customer = await createCust.json();
   }
 
-  // 3) Create invoice — pack every detail into payerMemo + multi line items
+  // 3) Create or update invoice — pack every detail into payerMemo + line items
   const today = new Date();
   const due = new Date(today.getTime() + 24 * 60 * 60 * 1000);
   const iso = (d) => d.toISOString().slice(0, 10);
-  const memo = String(
-    opts.payerMemo ||
-      `Nesher CRM pay link for ${invoiceNumber}. Do not reply to this memo.`
-  ).slice(0, 2000);
+  const memo = memoOf(opts.payerMemo);
   const body = {
     customerId: customer.id,
     destinationAccountId: dest,
@@ -255,6 +271,37 @@ export async function createOrReusePaymentRequest(opts) {
   if (spStart && spEnd && spStart <= spEnd) {
     body.servicePeriodStartDate = spStart;
     body.servicePeriodEndDate = spEnd;
+  }
+
+  if (existing?.slug) {
+    // Same invoice number, details changed → update in place (same pay URL).
+    // Mercury update is POST /ar/invoices/{id} with the FULL body (PUT/PATCH → 405).
+    if (existing.invoiceDate) body.invoiceDate = existing.invoiceDate;
+    if (existing.dueDate && existing.dueDate >= iso(today)) {
+      body.dueDate = existing.dueDate;
+    }
+    const updRes = await fetchImpl(`${MERCURY_API}/ar/invoices/${existing.id}`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    });
+    if (!updRes.ok) {
+      const t = await updRes.text();
+      throw new Error(`Mercury update invoice failed: ${updRes.status} ${t}`);
+    }
+    let updated = {};
+    try {
+      updated = await updRes.json();
+    } catch {
+      updated = {};
+    }
+    const invoice = { ...existing, ...updated };
+    return {
+      reused: false,
+      updated: true,
+      invoice,
+      payUrl: payUrlFromSlug(invoice.slug || existing.slug),
+    };
   }
 
   const invRes = await fetchImpl(`${MERCURY_API}/ar/invoices`, {
