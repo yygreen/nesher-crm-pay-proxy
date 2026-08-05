@@ -1,4 +1,5 @@
 import http from "node:http";
+import crypto from "node:crypto";
 import { URL } from "node:url";
 import httpProxy from "http-proxy";
 import { createOrReusePaymentRequest } from "./mercury.js";
@@ -540,11 +541,69 @@ function proxyWithInject(req, res) {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
 
+  // ── Mercury AR relay for the JRM Concierge booking machine ────────────────
+  // Vercel egress IPs rotate and cannot sit on the Mercury token's IP
+  // whitelist; this Railway service's egress IP already does. Key-gated,
+  // GET/POST only, AR paths ONLY (invoices/customers) — the money-moving API
+  // surface is never reachable through here. The Mercury token stays on
+  // Railway; the caller never holds it.
+  const relayMatch = url.pathname.match(/^\/__mercury_relay\/(.+)$/);
+  if (relayMatch) {
+    const relayKey = process.env.MERCURY_RELAY_KEY || "";
+    const given = String(req.headers["x-relay-key"] || "");
+    const keyOk =
+      relayKey.length >= 24 &&
+      given.length === relayKey.length &&
+      crypto.timingSafeEqual(Buffer.from(given), Buffer.from(relayKey));
+    if (!keyOk) {
+      sendJson(res, 403, { error: "relay key" });
+      return;
+    }
+    const relPath = relayMatch[1];
+    const pathOk = /^ar\/(invoices|customers)(\/[A-Za-z0-9-]+)?(\/cancel)?$/.test(relPath);
+    if (!pathOk || !["GET", "POST"].includes(req.method || "")) {
+      sendJson(res, 404, { error: "not relayed" });
+      return;
+    }
+    let token = process.env.MERCURY_TOKEN_NESHER || process.env.MERCURY_TOKEN || "";
+    if (token && !token.startsWith("secret-token:") && token.startsWith("mercury_")) token = "secret-token:" + token;
+    if (!token) {
+      sendJson(res, 503, { error: "MERCURY_TOKEN_NESHER not configured" });
+      return;
+    }
+    try {
+      const bodyRaw = req.method === "POST" ? await new Promise((resolve, reject) => {
+        const chunks = [];
+        req.on("data", (c) => chunks.push(c));
+        req.on("end", () => resolve(Buffer.concat(chunks)));
+        req.on("error", reject);
+      }) : null;
+      const upstreamRes = await fetch(`https://api.mercury.com/api/v1/${relPath}`, {
+        method: req.method,
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/json",
+          "Content-Type": "application/json",
+        },
+        body: bodyRaw && bodyRaw.length ? bodyRaw : undefined,
+      });
+      const text = await upstreamRes.text();
+      res.writeHead(upstreamRes.status, {
+        "Content-Type": upstreamRes.headers.get("content-type") || "application/json",
+        "Cache-Control": "no-store",
+      });
+      res.end(text);
+    } catch (e) {
+      sendJson(res, 502, { error: "relay upstream failed", detail: String(e.message || e).slice(0, 200) });
+    }
+    return;
+  }
+
   if (url.pathname === "/__nesher_pay/health") {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-08-05-editable",
+      build: "2026-08-05-mercury-relay",
       upstream: UPSTREAM,
       paySync: lastPaySync
         ? {
@@ -560,6 +619,7 @@ const server = http.createServer(async (req, res) => {
       ),
       hasDb: Boolean(process.env.DATABASE_URL || process.env.DATABASE_PUBLIC_URL),
       hasWhatsApp: wa.configured,
+      hasMercuryRelay: (process.env.MERCURY_RELAY_KEY || "").length >= 24,
     });
     return;
   }
