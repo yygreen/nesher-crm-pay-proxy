@@ -20,6 +20,7 @@ function mapOffer(row) {
     id: Number(row.id),
     hotel_name: row.hotel_name,
     customer_price: row.customer_price != null ? Number(row.customer_price) : null,
+    hotel_price: row.hotel_price != null ? Number(row.hotel_price) : null,
     currency: row.currency,
     vat_status: row.vat_status,
     room_type: row.room_type,
@@ -27,6 +28,21 @@ function mapOffer(row) {
     sent_to_customer_at: row.sent_to_customer_at,
     customer_answer_status: row.customer_answer_status,
     request_id: Number(row.request_id),
+  };
+}
+
+/** USD payments recorded against a hotel request; non-USD are counted, not summed. */
+async function loadHotelPayments(requestId) {
+  const rows = await softQuery(
+    `SELECT COALESCE(SUM(amount) FILTER (WHERE UPPER(TRIM(currency)) IN ('USD','US$','$')), 0) AS paid_usd,
+            COUNT(*) FILTER (WHERE UPPER(TRIM(currency)) NOT IN ('USD','US$','$')) AS other_count
+     FROM core_jrmhotelpayment
+     WHERE request_id = $1`,
+    [Number(requestId)]
+  );
+  return {
+    paidUsd: Number(rows[0]?.paid_usd || 0),
+    otherCurrencyCount: Number(rows[0]?.other_count || 0),
   };
 }
 
@@ -67,7 +83,7 @@ export async function loadHotelOfferPayContext(offerId) {
   if (!Number.isFinite(id)) throw new Error("Invalid offer id");
 
   const r = await p.query(
-    `SELECT o.id, o.hotel_name, o.customer_price, o.currency, o.vat_status, o.room_type,
+    `SELECT o.id, o.hotel_name, o.customer_price, o.hotel_price, o.currency, o.vat_status, o.room_type,
             o.sent_to_customer, o.sent_to_customer_at, o.customer_answer_status, o.request_id,
             r.id AS req_id, r.customer_name, r.email, r.phone, r.status AS req_status,
             r.city, r.check_in, r.check_out, r.internal_notes
@@ -90,7 +106,8 @@ export async function loadHotelOfferPayContext(offerId) {
     internal_notes: row.internal_notes,
   });
   const offer = mapOffer(row);
-  return { request, offer, soft: true };
+  const payments = await loadHotelPayments(request.id);
+  return { request, offer, payments, soft: true };
 }
 
 /**
@@ -121,12 +138,14 @@ export async function loadHotelPayContext(requestId, offerId = null) {
   const request = mapRequest(req.rows[0]);
 
   const offersRes = await p.query(
-    `SELECT id, hotel_name, customer_price, currency, vat_status, room_type,
+    `SELECT id, hotel_name, customer_price, hotel_price, currency, vat_status, room_type,
             sent_to_customer, sent_to_customer_at, customer_answer_status, request_id
      FROM core_jrmhoteloffer
      WHERE request_id = $1
      ORDER BY
-       CASE WHEN customer_price IS NOT NULL AND customer_price::numeric > 0 THEN 0 ELSE 1 END,
+       CASE WHEN customer_price IS NOT NULL AND customer_price::numeric > 0 THEN 0
+            WHEN hotel_price IS NOT NULL AND hotel_price::numeric > 0 THEN 1
+            ELSE 2 END,
        CASE WHEN customer_answer_status ILIKE 'accepted%' OR customer_answer_status ILIKE 'book%' THEN 0 ELSE 1 END,
        CASE WHEN sent_to_customer IS TRUE THEN 0 ELSE 1 END,
        sent_to_customer_at DESC NULLS LAST,
@@ -167,18 +186,34 @@ export async function loadHotelPayContext(requestId, offerId = null) {
     offer = priced[0];
     resolution = "multiple_priced_pick_latest";
     ambiguous = true;
-  } else if (allOffers.length === 1) {
-    offer = allOffers[0];
-    resolution = "single_unpriced_offer";
-  } else if (allOffers.length > 1) {
-    offer = allOffers[0];
-    resolution = "latest_unpriced_offer";
-    ambiguous = true;
+  } else {
+    // No customer-priced offer — fall back to offers priced at hotel cost
+    const hotelPriced = allOffers.filter(
+      (o) => Number.isFinite(Number(o.hotel_price)) && Number(o.hotel_price) > 0
+    );
+    if (hotelPriced.length === 1) {
+      offer = hotelPriced[0];
+      resolution = "hotel_price_only";
+    } else if (hotelPriced.length > 1) {
+      offer = hotelPriced[0];
+      resolution = "hotel_price_only_latest";
+      ambiguous = true;
+    } else if (allOffers.length === 1) {
+      offer = allOffers[0];
+      resolution = "single_unpriced_offer";
+    } else if (allOffers.length > 1) {
+      offer = allOffers[0];
+      resolution = "latest_unpriced_offer";
+      ambiguous = true;
+    }
   }
+
+  const payments = await loadHotelPayments(id);
 
   return {
     request,
     offer,
+    payments,
     resolution,
     soft: true,
     ambiguous,

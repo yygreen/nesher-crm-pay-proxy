@@ -324,7 +324,7 @@ export function buildReservationDraft(ctx, overridesIn = {}) {
 
 export async function buildHotelDraft(ctx, overridesIn = {}) {
   const overrides = parseOverrides(overridesIn);
-  const { request, offer, resolution, allOffers = [], ambiguous } = ctx;
+  const { request, offer, resolution, allOffers = [], ambiguous, payments } = ctx;
   const stay = formatStay(request.check_in, request.check_out);
   const resolved = resolveCustomerEmail(
     overrides.customerEmail !== undefined
@@ -343,6 +343,8 @@ export async function buildHotelDraft(ctx, overridesIn = {}) {
     overrides.amountUsd !== undefined ? Number(overrides.amountUsd) : NaN;
   let currency = offer?.currency || "USD";
   let customerPrice = Number(offer?.customer_price) || 0;
+  const hotelPrice = Number(offer?.hotel_price) || 0;
+  let usedHotelPrice = false;
 
   if (!Number.isFinite(amountUsd) || amountUsd <= 0) {
     if (customerPrice > 0) {
@@ -355,8 +357,30 @@ export async function buildHotelDraft(ctx, overridesIn = {}) {
       } catch {
         amountUsd = 0;
       }
+    } else if (hotelPrice > 0) {
+      // No customer price set — pre-fill from the hotel's own price so staff
+      // always has an amount to start from; they add markup in the field.
+      try {
+        amountUsd = await toUsdAmount(hotelPrice, currency, defaultIlsSpot);
+        usedHotelPrice = true;
+      } catch {
+        amountUsd = 0;
+      }
     } else {
       amountUsd = 0;
+    }
+  }
+
+  // Deduct USD payments already recorded on this request (auto amounts only —
+  // an explicit staff override is charged as typed).
+  const paidUsd = Number(payments?.paidUsd || 0);
+  const quotedUsd = amountUsd > 0 ? amountUsd : 0;
+  let fullyPaid = false;
+  if (overrides.amountUsd === undefined && amountUsd > 0 && paidUsd > 0) {
+    amountUsd = Math.round((amountUsd - paidUsd) * 100) / 100;
+    if (amountUsd <= 0) {
+      amountUsd = 0;
+      fullyPaid = true;
     }
   }
 
@@ -366,7 +390,9 @@ export async function buildHotelDraft(ctx, overridesIn = {}) {
       missingField(
         "amountUsd",
         "Amount due (USD)",
-        "No customer price on this offer — enter the USD amount to charge."
+        fullyPaid
+          ? `Recorded payments ($${paidUsd.toFixed(2)}) already cover the quote ($${quotedUsd.toFixed(2)}) — enter an amount only if charging more.`
+          : "No customer price on this offer — enter the USD amount to charge."
       )
     );
   }
@@ -460,6 +486,19 @@ export async function buildHotelDraft(ctx, overridesIn = {}) {
         : `VAT: ${offer.vat_status}`
     );
   }
+  if (paidUsd > 0 && quotedUsd > 0 && overrides.amountUsd === undefined && !fullyPaid) {
+    const usd2 = (n) =>
+      Number(n || 0).toLocaleString("en-US", {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+      });
+    memoLines.push(
+      "",
+      `Booking total: $${usd2(quotedUsd)}`,
+      `Paid to date: $${usd2(paidUsd)}`,
+      `Balance due: $${usd2(amountUsd)} USD`
+    );
+  }
   if (overrides.payerMemo) {
     memoLines.push("", `Note: ${overrides.payerMemo}`);
   }
@@ -490,11 +529,31 @@ export async function buildHotelDraft(ctx, overridesIn = {}) {
     );
   }
 
+  if (usedHotelPrice && !fullyPaid) {
+    advice.push(
+      `Amount pre-filled from the hotel's own price (${hotelPrice} ${currency || "USD"}) — no JRM markup added. Adjust before creating if this quote should be higher.`
+    );
+  }
+  if (paidUsd > 0 && !fullyPaid && overrides.amountUsd === undefined) {
+    advice.push(
+      `$${paidUsd.toFixed(2)} in recorded payments deducted — amount due is the remaining balance.`
+    );
+  }
+  if (Number(payments?.otherCurrencyCount) > 0) {
+    advice.push(
+      `${payments.otherCurrencyCount} recorded payment(s) in another currency were NOT deducted — check the request's payment history.`
+    );
+  }
+
   const internalNote = [
     `CRM hotel request #${request.id}`,
     offer?.id ? `offer #${offer.id}` : null,
     resolution ? `resolved via ${resolution}` : null,
     customerPrice > 0 ? `quoted ${customerPrice} ${currency || "USD"}` : null,
+    usedHotelPrice
+      ? `amount from hotel_price ${hotelPrice} ${currency || "USD"} (no markup)`
+      : null,
+    paidUsd > 0 ? `payments recorded $${paidUsd.toFixed(2)} USD` : null,
     offer?.customer_answer_status
       ? `customer answer: ${offer.customer_answer_status}`
       : null,
@@ -517,7 +576,8 @@ export async function buildHotelDraft(ctx, overridesIn = {}) {
       amountUsd,
       currency: "USD",
       sourceCurrency: currency,
-      sourceAmount: customerPrice,
+      sourceAmount: customerPrice > 0 ? customerPrice : usedHotelPrice ? hotelPrice : 0,
+      amountSource: usedHotelPrice ? "offer.hotel_price" : customerPrice > 0 ? "offer.customer_price" : null,
       internalNote,
       servicePeriodStartDate: toIsoDate(request.check_in) || undefined,
       servicePeriodEndDate: toIsoDate(request.check_out) || undefined,
@@ -543,6 +603,9 @@ export async function buildHotelDraft(ctx, overridesIn = {}) {
         children: request.children ?? null,
         rooms: request.rooms ?? null,
         vatStatus: offer?.vat_status || null,
+        customerPrice: quotedUsd,
+        amountPaid: overrides.amountUsd === undefined ? paidUsd : 0,
+        balance: amountUsd,
         resolution: resolution || null,
         allOffers: (allOffers || []).map((o) => ({
           id: o.id,

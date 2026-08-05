@@ -150,6 +150,52 @@ describe("buildHotelDraft — soft unpriced", () => {
     assert.match(filled.draft.payerMemo, /Jerusalem/);
     assert.equal(filled.draft.invoiceNumber, "JRM-189-O50");
   });
+
+  it("pre-fills amount from hotel_price when customer_price missing", async () => {
+    const d = await buildHotelDraft({
+      request: { id: 87, customer_name: "Guest", email: "g@ex.com" },
+      offer: {
+        id: 46,
+        hotel_name: "Inbal",
+        customer_price: null,
+        hotel_price: 1000,
+        currency: "USD",
+      },
+      resolution: "hotel_price_only",
+      payments: { paidUsd: 0, otherCurrencyCount: 0 },
+    });
+    assert.equal(d.draft.amountUsd, 1000);
+    assert.equal(d.canCreate, true);
+    assert.equal(d.draft.amountSource, "offer.hotel_price");
+    assert.ok(d.advice.some((a) => /hotel's own price/.test(a)));
+  });
+
+  it("deducts recorded USD payments from the auto amount", async () => {
+    const base = {
+      request: { id: 87, customer_name: "Guest", email: "g@ex.com" },
+      offer: { id: 46, hotel_name: "Inbal", customer_price: 1200, currency: "USD" },
+      resolution: "explicit_offer",
+      payments: { paidUsd: 400, otherCurrencyCount: 0 },
+    };
+    const d = await buildHotelDraft(base);
+    assert.equal(d.draft.amountUsd, 800);
+    assert.equal(d.draft.details.amountPaid, 400);
+    assert.match(d.draft.payerMemo, /Paid to date: \$400\.00/);
+    assert.match(d.draft.payerMemo, /Balance due: \$800\.00/);
+
+    // Fully paid — soft-asks for a new amount instead of charging $0
+    const paidUp = await buildHotelDraft({
+      ...base,
+      payments: { paidUsd: 1200, otherCurrencyCount: 0 },
+    });
+    assert.equal(paidUp.canCreate, false);
+    assert.ok(paidUp.missing.some((m) => m.field === "amountUsd" && /already cover/.test(m.reason)));
+
+    // Staff override wins untouched — no deduction applied
+    const over = await buildHotelDraft(base, { amountUsd: 500 });
+    assert.equal(over.draft.amountUsd, 500);
+    assert.equal(over.draft.details.amountPaid, 0);
+  });
 });
 
 describe("buildLineItems multi", () => {
