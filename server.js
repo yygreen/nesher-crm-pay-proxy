@@ -11,7 +11,7 @@ import {
   appendHotelNote,
   appendReservationNote,
 } from "./db.js";
-import { validateStaffSession } from "./auth.js";
+import { validateStaffSession, extractSessionId } from "./auth.js";
 import {
   buildReservationDraft,
   buildHotelDraft,
@@ -25,6 +25,7 @@ import {
   listInboxSummaries,
   markContactRead,
   sendContactAudio,
+  sessionUserId,
 } from "./whatsapp-media.js";
 
 const PORT = Number(process.env.PORT || 8080);
@@ -417,11 +418,15 @@ async function handleWaSendAudio(req, res, contactId) {
     }
     if (!buffer.length) throw new Error("Empty audio");
 
+    const sentById = await sessionUserId(
+      extractSessionId(String(req.headers.cookie || ""))
+    );
     const out = await sendContactAudio({
       contactId,
       buffer,
       mimeType,
       isVoice,
+      sentById,
     });
     sendJson(res, 200, out);
   } catch (e) {

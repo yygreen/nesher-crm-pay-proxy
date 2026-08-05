@@ -7,6 +7,7 @@ import { spawn } from "node:child_process";
 import { writeFile, readFile, unlink, mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import zlib from "node:zlib";
 import { getPool } from "./db.js";
 
 const GRAPH = process.env.WA_GRAPH_VERSION
@@ -289,6 +290,50 @@ export async function listContactMessages(contactId, limit = 100) {
 }
 
 /**
+ * Resolve the Django user id behind a sessionid cookie (django_session table).
+ * Handles both storage formats: legacy base64(hash:json) and the modern
+ * signing.dumps "payload:timestamp:sig" (payload optionally "."-prefixed
+ * zlib-compressed). Signature is NOT verified here — the auth layer already
+ * validated the session against the live CRM; this only reads who it is.
+ */
+export async function sessionUserId(sessionKey) {
+  if (!sessionKey) return null;
+  try {
+    const p = getPool();
+    const r = await p.query(
+      `SELECT session_data FROM django_session WHERE session_key = $1 AND expire_date > now()`,
+      [String(sessionKey)]
+    );
+    if (!r.rows.length) return null;
+    const data = String(r.rows[0].session_data || "");
+    const candidates = [];
+    const seg = data.split(":")[0];
+    for (let payload of [seg, data]) {
+      try {
+        let compressed = false;
+        if (payload.startsWith(".")) {
+          compressed = true;
+          payload = payload.slice(1);
+        }
+        const pad = "=".repeat((4 - (payload.length % 4)) % 4);
+        let buf = Buffer.from(payload.replace(/-/g, "+").replace(/_/g, "/") + pad, "base64");
+        if (compressed) buf = zlib.inflateSync(buf);
+        candidates.push(buf.toString("utf8"));
+      } catch {
+        /* try next form */
+      }
+    }
+    for (const text of candidates) {
+      const m = text.match(/"_auth_user_id"\s*:\s*"?(\d+)"?/);
+      if (m) return Number(m[1]);
+    }
+  } catch {
+    /* attribution is best-effort — never block the send */
+  }
+  return null;
+}
+
+/**
  * Persist outbound audio row + bump contact last_message_at.
  */
 export async function recordOutboundAudio({
@@ -297,6 +342,7 @@ export async function recordOutboundAudio({
   mediaId,
   mimeType,
   isVoice,
+  sentById = null,
 }) {
   const p = getPool();
   const now = new Date();
@@ -314,7 +360,7 @@ export async function recordOutboundAudio({
       (direction, status, message_type, body, whatsapp_message_id, raw_payload,
        error_message, created_at, message_at, contact_id, customer_id, sent_by_id)
      VALUES
-      ('outbound', 'sent', 'audio', $1, $2, $3::jsonb, '', $4, $4, $5, NULL, NULL)
+      ('outbound', 'sent', 'audio', $1, $2, $3::jsonb, '', $4, $4, $5, NULL, $6)
      RETURNING id`,
     [
       isVoice ? "[voice note sent]" : "[audio sent]",
@@ -322,6 +368,7 @@ export async function recordOutboundAudio({
       JSON.stringify(raw),
       now,
       Number(contactId),
+      sentById == null ? null : Number(sentById),
     ]
   );
   await p.query(
@@ -341,6 +388,7 @@ export async function sendContactAudio({
   buffer,
   mimeType = "audio/webm",
   isVoice = true,
+  sentById = null,
 }) {
   const contact = await getContact(contactId);
   let uploadBuf = buffer;
@@ -387,6 +435,7 @@ export async function sendContactAudio({
     mediaId,
     mimeType: uploadMime,
     isVoice: voice,
+    sentById,
   });
   return {
     ok: true,
