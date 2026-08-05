@@ -5,12 +5,14 @@ import { createOrReusePaymentRequest } from "./mercury.js";
 import { injectPayButtons } from "./inject.js";
 import { injectWhatsAppUi } from "./whatsapp-ui.js";
 import {
+  getPool,
   loadHotelPayContext,
   loadHotelOfferPayContext,
   loadReservationPayContext,
   appendHotelNote,
   appendReservationNote,
 } from "./db.js";
+import { syncPaidInvoices } from "./payments-sync.js";
 import { validateStaffSession, extractSessionId } from "./auth.js";
 import {
   buildReservationDraft,
@@ -529,8 +531,17 @@ const server = http.createServer(async (req, res) => {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-08-05-autofill",
+      build: "2026-08-05-paysync",
       upstream: UPSTREAM,
+      paySync: lastPaySync
+        ? {
+            at: lastPaySync.at,
+            checked: lastPaySync.checked,
+            recorded: lastPaySync.recorded.length,
+            skipped: lastPaySync.skipped.length,
+            errors: lastPaySync.errors.length,
+          }
+        : null,
       hasMercury: Boolean(
         process.env.MERCURY_TOKEN_NESHER || process.env.MERCURY_TOKEN
       ),
@@ -564,6 +575,22 @@ const server = http.createServer(async (req, res) => {
   );
   if (waSendAudioMatch) {
     await handleWaSendAudio(req, res, waSendAudioMatch[1]);
+    return;
+  }
+
+  // Manual Mercury→CRM payment sync (the scheduler also runs this every 5 min)
+  if (/^\/__nesher_pay\/sync-payments\/?$/.test(url.pathname)) {
+    if (req.method !== "POST") {
+      sendJson(res, 405, { error: "POST only" });
+      return;
+    }
+    if (!(await requireStaff(req, res))) return;
+    try {
+      const out = await runPaySync("manual");
+      sendJson(res, 200, { ok: true, ...out });
+    } catch (e) {
+      sendJson(res, 500, { error: e.message });
+    }
     return;
   }
   if (/^\/__nesher_wa\/agents\/?$/.test(url.pathname)) {
@@ -633,3 +660,41 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`nesher-crm-pay-proxy listening on ${PORT} → ${UPSTREAM}`);
 });
+
+// ── Mercury → CRM payment sync: on boot, then every 5 minutes ──
+let lastPaySync = null;
+let paySyncBusy = false;
+
+async function runPaySync(trigger) {
+  if (paySyncBusy) return lastPaySync || { skippedRun: "busy" };
+  paySyncBusy = true;
+  try {
+    const out = await syncPaidInvoices({
+      token: process.env.MERCURY_TOKEN_NESHER || process.env.MERCURY_TOKEN,
+      pool: getPool(),
+    });
+    lastPaySync = out;
+    if (out.recorded.length || out.errors.length) {
+      console.log(
+        `pay-sync (${trigger}): recorded=${JSON.stringify(out.recorded)} errors=${JSON.stringify(out.errors)}`
+      );
+    }
+    return out;
+  } catch (e) {
+    console.error(`pay-sync (${trigger}) failed:`, e.message);
+    lastPaySync = { at: new Date().toISOString(), checked: 0, recorded: [], skipped: [], errors: [e.message] };
+    return lastPaySync;
+  } finally {
+    paySyncBusy = false;
+  }
+}
+
+if (
+  (process.env.MERCURY_TOKEN_NESHER || process.env.MERCURY_TOKEN) &&
+  (process.env.DATABASE_URL || process.env.DATABASE_PUBLIC_URL)
+) {
+  setTimeout(() => runPaySync("boot"), 15 * 1000);
+  setInterval(() => runPaySync("interval"), 5 * 60 * 1000);
+} else {
+  console.warn("pay-sync disabled: MERCURY_TOKEN or DATABASE_URL missing");
+}
