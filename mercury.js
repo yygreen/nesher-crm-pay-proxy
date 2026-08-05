@@ -242,6 +242,20 @@ export async function createOrReusePaymentRequest(opts) {
     payerMemo: memo,
     lineItems,
   };
+  // Optional invoice metadata — poNumber shows to the payer; internalNote is
+  // org-only; service period renders as the covered date range.
+  const isoOnly = (s) =>
+    /^\d{4}-\d{2}-\d{2}$/.test(String(s || "")) ? String(s) : null;
+  if (opts.poNumber) body.poNumber = String(opts.poNumber).slice(0, 100);
+  if (opts.internalNote) {
+    body.internalNote = String(opts.internalNote).slice(0, 1000);
+  }
+  const spStart = isoOnly(opts.servicePeriodStartDate);
+  const spEnd = isoOnly(opts.servicePeriodEndDate);
+  if (spStart && spEnd && spStart <= spEnd) {
+    body.servicePeriodStartDate = spStart;
+    body.servicePeriodEndDate = spEnd;
+  }
 
   const invRes = await fetchImpl(`${MERCURY_API}/ar/invoices`, {
     method: "POST",

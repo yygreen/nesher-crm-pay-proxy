@@ -504,6 +504,11 @@ const SCRIPT = `
     return "$" + v.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   }
 
+  // Our own inboxes sometimes stand in for a missing customer email.
+  function isOwnEmail(v) {
+    return /@(jrmhotels\\.com|flynesher\\.com)\\s*$/i.test(String(v || "").trim());
+  }
+
   function banner(kind, lines) {
     var out = '<div class="nesher-banner ' + kind + '">' +
       (kind === "warn" ? ICON_WARN : ICON_INFO) + "<div>";
@@ -722,15 +727,16 @@ const SCRIPT = `
       '<input type="text" id="nesher-f-name" value="' + esc(draft.customerName || "") + '" placeholder="Customer name" />' +
       (nameMiss ? '<div class="nesher-hint warn">' + esc(nameMiss.reason) + "</div>" : "") +
       "</div>";
+    var ownEmail = draft.emailPlaceholder || isOwnEmail(draft.customerEmail);
     html += '<div class="nesher-field' + (emailMiss && emailMiss.required ? " miss" : "") + '">' +
       '<label for="nesher-f-email">Email' +
-      (draft.emailPlaceholder ? ' <span class="nesher-chip warn">placeholder</span>' : "") + "</label>" +
+      ' <span class="nesher-chip warn nesher-own-chip"' + (ownEmail ? "" : ' style="display:none"') + ">our email</span></label>" +
       '<input type="email" id="nesher-f-email" value="' + esc(draft.customerEmail || "") + '" placeholder="customer@email.com" />' +
-      (emailMiss
+      '<div class="nesher-hint warn nesher-own-note"' + (ownEmail ? "" : ' style="display:none"') + ">" +
+      "This is OUR inbox, not the customer's — the invoice email comes to us. Share the pay link with the customer directly, or enter their real email.</div>" +
+      (!ownEmail && emailMiss
         ? '<div class="nesher-hint warn">' + esc(emailMiss.reason) + "</div>"
-        : (draft.emailPlaceholder
-          ? '<div class="nesher-hint warn">CRM has no email — this placeholder works, a real one is better.</div>'
-          : "")) +
+        : "") +
       "</div>";
     html += "</div></div>";
 
@@ -766,6 +772,18 @@ const SCRIPT = `
     createBtn.textContent = "Create payment link";
     openRoot(root);
 
+    var emailInput = document.getElementById("nesher-f-email");
+    if (emailInput) {
+      emailInput.addEventListener("input", function () {
+        var own = isOwnEmail(emailInput.value);
+        var fld = emailInput.closest(".nesher-field");
+        var chip = fld.querySelector(".nesher-own-chip");
+        var note = fld.querySelector(".nesher-own-note");
+        if (chip) chip.style.display = own ? "" : "none";
+        if (note) note.style.display = own ? "" : "none";
+      });
+    }
+
     var amt = document.getElementById("nesher-f-amount");
     if (amt && amtEmpty) amt.focus();
     else createBtn.focus();
@@ -783,7 +801,10 @@ const SCRIPT = `
       '<span class="nesher-chip ok">Link ready</span>'));
 
     var amount = Number(data.amountUsd || draft.amountUsd);
-    var meta = [data.invoiceNumber || draft.invoiceNumber, draft.customerName, draft.customerEmail]
+    var emailBit = draft.customerEmail
+      ? draft.customerEmail + (isOwnEmail(draft.customerEmail) ? " (our inbox — send the customer the link)" : "")
+      : "";
+    var meta = [data.invoiceNumber || draft.invoiceNumber, draft.customerName, emailBit]
       .filter(function (x) { return x && String(x).trim(); }).join(" · ");
 
     var body = document.getElementById("nesher-pay-body");

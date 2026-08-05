@@ -137,53 +137,59 @@ export function buildReservationDraft(ctx, overridesIn = {}) {
     ];
   }
 
+  // Customer-facing memo: reads like a booking confirmation, not a debug log.
+  // Internal fields (CRM ids, price source, booking method) stay out of it.
+  const usd = (n) =>
+    Number(n || 0).toLocaleString("en-US", {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    });
   const memoLines = [
-    `Nesher / FlyNesher payment request`,
-    `Booking / PNR: ${code}`,
-    `CRM reservation id: ${reservation.id}`,
-    name ? `Customer: ${name}` : null,
-    resolved.email ? `Email: ${resolved.email}` : null,
-    reservation.phone ? `Phone: ${reservation.phone}` : null,
-    reservation.booking_method
-      ? `Booking method: ${reservation.booking_method}`
-      : null,
-    quote.priceSource ? `Price source: ${quote.priceSource}` : null,
-    `Quoted: $${Number(quote.customer_price || amountUsd || 0).toFixed(2)}`,
-    `Already paid: $${Number(quote.amount_paid || 0).toFixed(2)}`,
-    `Amount due: $${Number(amountUsd || 0).toFixed(2)} USD`,
-  ].filter(Boolean);
+    `Nesher / FlyNesher — trip services`,
+    name && name !== "Customer" ? `For: ${name}` : null,
+    `Booking reference: ${code}`,
+  ].filter((l) => l !== null);
 
+  if (journeys.length) {
+    memoLines.push("", "Included in this payment:");
+    for (const j of journeys.slice(0, 20)) {
+      const priceBit =
+        Number(j.customer_price) > 0 ? ` — $${usd(j.customer_price)}` : "";
+      const conf = j.confirmation_number
+        ? ` (conf ${j.confirmation_number})`
+        : "";
+      memoLines.push(`  - ${j.label || j.line_type || "Service"}${priceBit}${conf}`);
+    }
+  }
   if (travelers.length) {
     memoLines.push(
+      "",
       `Travelers (${travelers.length}): ${travelers
         .map((t) => t.full_name || "Traveler")
         .join(", ")}`
     );
   }
   if (flights.length) {
-    memoLines.push("Flights:");
+    memoLines.push("", "Flights:");
     for (const f of flights.slice(0, 12)) {
       memoLines.push(
-        `  ${f.airline || ""} ${f.flight_number || ""} ${f.from_location || "?"}→${f.to_location || "?"} ${f.departure_date || ""} ${f.departure_time || ""}`.trim()
+        `  ${f.airline || ""} ${f.flight_number || ""}  ${f.from_location || "?"} → ${f.to_location || "?"}  ${f.departure_date || ""} ${f.departure_time || ""}`
+          .replace(/\s+$/, "")
       );
     }
   }
-  if (journeys.length) {
-    memoLines.push("Services / tickets:");
-    for (const j of journeys.slice(0, 20)) {
-      const priceBit =
-        Number(j.customer_price) > 0
-          ? ` $${Number(j.customer_price).toFixed(2)}`
-          : "";
-      const conf = j.confirmation_number
-        ? ` (conf ${j.confirmation_number})`
-        : "";
-      memoLines.push(`  - ${j.label || j.line_type || "line"}${priceBit}${conf}`);
-    }
+  if (Number(quote.amount_paid) > 0) {
+    memoLines.push(
+      "",
+      `Trip total: $${usd(quote.customer_price)}`,
+      `Paid to date: $${usd(quote.amount_paid)}`,
+      `Balance due: $${usd(amountUsd)} USD`
+    );
   }
   if (overrides.payerMemo) {
-    memoLines.push(`Staff note: ${overrides.payerMemo}`);
+    memoLines.push("", `Note: ${overrides.payerMemo}`);
   }
+  memoLines.push("", "Thank you for traveling with Nesher / FlyNesher.");
 
   const missing = [];
   if (!(amountUsd > 0)) {
@@ -259,6 +265,25 @@ export function buildReservationDraft(ctx, overridesIn = {}) {
   }
   for (const w of warnings) advice.push(w);
 
+  // Service period from flight dates; internal CRM facts go to Mercury's
+  // internalNote (org-visible, hidden from the payer).
+  const flightDates = flights
+    .map((f) => String(f.departure_date || ""))
+    .filter((s) => /^\d{4}-\d{2}-\d{2}$/.test(s))
+    .sort();
+  const internalNote = [
+    `CRM reservation ${reservation.id}`,
+    reservation.booking_method
+      ? `booked via ${reservation.booking_method}`
+      : null,
+    quote.priceSource ? `price source: ${quote.priceSource}` : null,
+    `quoted $${Number(quote.customer_price || amountUsd || 0).toFixed(2)} · paid $${Number(quote.amount_paid || 0).toFixed(2)} · due $${Number(amountUsd || 0).toFixed(2)}`,
+    resolved.email ? `email: ${resolved.email}` : null,
+  ]
+    .filter(Boolean)
+    .join(" · ")
+    .slice(0, 1000);
+
   return {
     kind: "reservation",
     canCreate: amountUsd > 0 && Boolean(resolved.email),
@@ -275,6 +300,10 @@ export function buildReservationDraft(ctx, overridesIn = {}) {
       lineItems,
       payerMemo: memoLines.join("\n").slice(0, 1800),
       lineItemName: lineItems[0]?.name || `Reservation ${code}`,
+      poNumber: code || undefined,
+      internalNote,
+      servicePeriodStartDate: flightDates[0] || undefined,
+      servicePeriodEndDate: flightDates[flightDates.length - 1] || undefined,
       summary,
       details: {
         reservationId: Number(reservation.id),
@@ -378,10 +407,13 @@ export async function buildHotelDraft(ctx, overridesIn = {}) {
       ? hotelInvoiceNumber(request.id, offer.id)
       : `JRM-1${request.id}`);
 
+  const plural = (n, one, many) => `${n} ${Number(n) === 1 ? one : many}`;
   const guests = [
-    request.adults != null ? `${request.adults} adults` : null,
-    request.children != null ? `${request.children} children` : null,
-    request.rooms != null ? `${request.rooms} rooms` : null,
+    request.adults != null ? plural(request.adults, "adult", "adults") : null,
+    request.children != null
+      ? plural(request.children, "child", "children")
+      : null,
+    request.rooms != null ? plural(request.rooms, "room", "rooms") : null,
   ]
     .filter(Boolean)
     .join(", ");
@@ -398,36 +430,40 @@ export async function buildHotelDraft(ctx, overridesIn = {}) {
         .join(" ")
   ).slice(0, 180);
 
+  // Customer-facing memo: reads like a booking confirmation, not a CRM dump.
+  // Internal fields (request/offer ids, resolution path, answer status) stay out.
+  const hotelLine = [offer?.hotel_name, offer?.room_type]
+    .filter(Boolean)
+    .join(" — ");
+  const stayLine =
+    stay ||
+    [toIsoDate(request.check_in), toIsoDate(request.check_out)]
+      .filter(Boolean)
+      .join(" → ");
   const memoLines = [
-    `Nesher / JRM Hotels payment request`,
-    `CRM hotel request #${request.id}`,
-    offer?.id ? `Offer #${offer.id}` : null,
-    `Invoice: ${invoiceNumber}`,
-    name ? `Customer: ${name}` : null,
-    resolved.email ? `Email: ${resolved.email}` : null,
-    request.phone ? `Phone: ${request.phone}` : null,
-    offer?.hotel_name ? `Hotel: ${offer.hotel_name}` : null,
-    offer?.room_type ? `Room: ${offer.room_type}` : null,
-    request.city ? `City: ${request.city}` : null,
-    stay ? `Stay: ${stay}` : null,
-    toIsoDate(request.check_in)
-      ? `Check-in: ${toIsoDate(request.check_in)}`
-      : null,
-    toIsoDate(request.check_out)
-      ? `Check-out: ${toIsoDate(request.check_out)}`
-      : null,
-    guests ? `Guests: ${guests}` : null,
-    customerPrice > 0
-      ? `Quoted: ${customerPrice} ${currency || ""}`.trim()
-      : null,
-    offer?.vat_status ? `VAT: ${offer.vat_status}` : null,
-    offer?.customer_answer_status
-      ? `Customer answer: ${offer.customer_answer_status}`
-      : null,
-    `Amount due: $${Number(amountUsd || 0).toFixed(2)} USD`,
-    resolution ? `Resolved via: ${resolution}` : null,
-    overrides.payerMemo ? `Staff note: ${overrides.payerMemo}` : null,
-  ].filter(Boolean);
+    `JRM Hotels / Nesher — hotel booking`,
+    name && name !== "Customer" ? `For: ${name}` : null,
+    `Booking reference: ${invoiceNumber}`,
+  ].filter((l) => l !== null);
+  if (hotelLine || request.city) {
+    memoLines.push(
+      "",
+      [hotelLine, request.city].filter(Boolean).join(", ")
+    );
+  }
+  if (stayLine) memoLines.push(`Stay: ${stayLine}`);
+  if (guests) memoLines.push(`Guests: ${guests}`);
+  if (offer?.vat_status) {
+    memoLines.push(
+      /^vat\b/i.test(offer.vat_status)
+        ? offer.vat_status
+        : `VAT: ${offer.vat_status}`
+    );
+  }
+  if (overrides.payerMemo) {
+    memoLines.push("", `Note: ${overrides.payerMemo}`);
+  }
+  memoLines.push("", "Thank you for booking with JRM Hotels / Nesher.");
 
   const summary = [
     offer?.hotel_name || `Request #${request.id}`,
@@ -454,6 +490,20 @@ export async function buildHotelDraft(ctx, overridesIn = {}) {
     );
   }
 
+  const internalNote = [
+    `CRM hotel request #${request.id}`,
+    offer?.id ? `offer #${offer.id}` : null,
+    resolution ? `resolved via ${resolution}` : null,
+    customerPrice > 0 ? `quoted ${customerPrice} ${currency || "USD"}` : null,
+    offer?.customer_answer_status
+      ? `customer answer: ${offer.customer_answer_status}`
+      : null,
+    resolved.email ? `email: ${resolved.email}` : null,
+  ]
+    .filter(Boolean)
+    .join(" · ")
+    .slice(0, 1000);
+
   return {
     kind: "hotel",
     canCreate: amountUsd > 0 && Boolean(resolved.email),
@@ -468,6 +518,9 @@ export async function buildHotelDraft(ctx, overridesIn = {}) {
       currency: "USD",
       sourceCurrency: currency,
       sourceAmount: customerPrice,
+      internalNote,
+      servicePeriodStartDate: toIsoDate(request.check_in) || undefined,
+      servicePeriodEndDate: toIsoDate(request.check_out) || undefined,
       invoiceNumber,
       lineItems:
         amountUsd > 0
@@ -516,5 +569,9 @@ export function mercuryOptsFromDraft(token, draftPayload) {
     lineItemName: d.lineItemName,
     lineItems: d.lineItems,
     payerMemo: d.payerMemo,
+    poNumber: d.poNumber || undefined,
+    internalNote: d.internalNote || undefined,
+    servicePeriodStartDate: d.servicePeriodStartDate || undefined,
+    servicePeriodEndDate: d.servicePeriodEndDate || undefined,
   };
 }
