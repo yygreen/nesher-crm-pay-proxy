@@ -578,7 +578,10 @@ const server = http.createServer(async (req, res) => {
         req.on("end", () => resolve(Buffer.concat(chunks)));
         req.on("error", reject);
       }) : null;
-      const upstreamRes = await fetch(`https://api.mercury.com/api/v1/${relPath}`, {
+      // Same egress path the pay modal itself uses: MERCURY_API_BASE (the
+      // whitelisted-IP relay tunnel) when set, the API directly otherwise.
+      const mercuryBase = (process.env.MERCURY_API_BASE || "https://api.mercury.com").replace(/\/$/, "");
+      const upstreamRes = await fetch(`${mercuryBase}/api/v1/${relPath}`, {
         method: req.method,
         headers: {
           Authorization: `Bearer ${token}`,
@@ -603,7 +606,7 @@ const server = http.createServer(async (req, res) => {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-08-05-mercury-relay",
+      build: "2026-08-05-mercury-relay-2",
       upstream: UPSTREAM,
       paySync: lastPaySync
         ? {
