@@ -439,7 +439,9 @@ const CSS = `
   .wa-composer.recording .wa-rec { display: flex; }
   .wa-composer.recording .wa-input-wrap,
   .wa-composer.recording .wa-attach-btn,
-  .wa-composer.recording .wa-mic-btn { display: none !important; }
+  .wa-composer.recording .wa-send-btn:not(.wa-mic-btn) { display: none !important; }
+  /* while recording the mic button IS the send-voice-note button — never hide it */
+  .wa-composer.recording .wa-mic-btn { display: grid !important; }
   .wa-rec-dot {
     width: 11px; height: 11px; border-radius: 50%; background: var(--wa-danger);
     animation: wa-blink 1.1s infinite;
@@ -1313,7 +1315,6 @@ const SCRIPT = `
     function syncButtons() {
       var has = input.value.trim().length > 0;
       sendBtn.classList.toggle("wa-hidden", !has);
-      micBtn.classList.toggle("wa-hidden", has);
     }
     function autoGrow() {
       input.style.height = "auto";
