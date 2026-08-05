@@ -337,11 +337,19 @@ export async function sessionUserId(sessionKey) {
 }
 
 /**
- * Transcribe + translate a voice-note message to English via Gemini
- * (handles Yiddish/Hebrew/English audio). Result is cached on the message
- * row (raw_payload.transcript_en) so the whole team shares one transcription.
- * Internal-only — nothing is sent back to the customer.
+ * Transcribe + translate a voice-note message to English via the YiddishLabs
+ * API (two steps: /transcriptions/sync → Yiddish text, /process/text
+ * translate-english). Result is cached on the message row
+ * (raw_payload.transcript_en + transcript_yi) so one transcription serves the
+ * whole team. Internal-only — nothing is sent back to the customer.
  */
+const YL_BASE = "https://app.yiddishlabs.com";
+// Cloudflare in front of app.yiddishlabs.com rejects non-browser user agents
+// with "error code: 1010" — every request must present a browser signature.
+const YL_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+  "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
+
 export async function transcribeMessage(messageId) {
   const p = getPool();
   const id = Number(messageId);
@@ -358,58 +366,62 @@ export async function transcribeMessage(messageId) {
     throw new Error("Not an audio message");
   }
 
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) throw new Error("Transcription not configured (GEMINI_API_KEY missing)");
-  const model = process.env.GEMINI_TRANSCRIBE_MODEL || "gemini-2.5-flash";
+  const apiKey = process.env.YIDDISHLABS_API_KEY;
+  if (!apiKey) throw new Error("Transcription not configured (YIDDISHLABS_API_KEY missing)");
 
   const media = await downloadWhatsAppMedia(raw.audio.id);
-  if (media.buffer.length > 18 * 1024 * 1024) throw new Error("Audio too large to transcribe");
+  if (media.buffer.length > 10 * 1024 * 1024) throw new Error("Audio too large to transcribe");
 
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [
-          {
-            parts: [
-              {
-                inline_data: {
-                  mime_type: media.mimeType.split(";")[0] || "audio/ogg",
-                  data: media.buffer.toString("base64"),
-                },
-              },
-              {
-                text:
-                  "This is a WhatsApp voice note from a travel-agency customer or agent, most likely in Yiddish (possibly Hebrew or English, or mixed). " +
-                  "Transcribe it and translate it into natural, plain English. " +
-                  "Return ONLY the English translation of what was said — no preamble, no notes, no original-language text. " +
-                  "If a name, number, or date is unclear, mark it like [unclear].",
-              },
-            ],
-          },
-        ],
-      }),
-    }
-  );
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    throw new Error(data?.error?.message || `Transcription HTTP ${res.status}`);
+  const mime = media.mimeType.split(";")[0].trim() || "audio/ogg";
+  const ext = /mp4|m4a|aac/i.test(mime) ? "m4a" : /mpeg|mp3/i.test(mime) ? "mp3" : "ogg";
+  const form = new FormData();
+  form.append("language", process.env.YIDDISHLABS_LANG || "auto");
+  form.append("rapid", process.env.YIDDISHLABS_RAPID || "true");
+  form.append("file", new Blob([media.buffer], { type: mime }), `note.${ext}`);
+  const tRes = await fetch(`${YL_BASE}/api/v1/transcriptions/sync`, {
+    method: "POST",
+    headers: {
+      "X-API-KEY": apiKey,
+      "User-Agent": YL_UA,
+      Accept: "application/json, text/plain, */*",
+    },
+    body: form,
+  });
+  const tData = await tRes.json().catch(() => ({}));
+  if (!tRes.ok) {
+    throw new Error(tData?.error || tData?.message || `YiddishLabs transcription HTTP ${tRes.status}`);
   }
-  const text = String(
-    data?.candidates?.[0]?.content?.parts?.map((pt) => pt.text || "").join("") || ""
-  ).trim();
-  if (!text) throw new Error("Transcription came back empty — try again");
+  const original = String(tData.text || "").trim();
+  if (!original) throw new Error("Transcription came back empty — try again");
+
+  const xRes = await fetch(`${YL_BASE}/api/v1/process/text`, {
+    method: "POST",
+    headers: {
+      "X-API-KEY": apiKey,
+      "User-Agent": YL_UA,
+      "Content-Type": "application/json",
+      Accept: "application/json, text/plain, */*",
+    },
+    body: JSON.stringify({ text_content: original, action: "translate-english" }),
+  });
+  const xData = await xRes.json().catch(() => ({}));
+  if (!xRes.ok) {
+    throw new Error(xData?.error || xData?.message || `YiddishLabs translation HTTP ${xRes.status}`);
+  }
+  const english = String(xData.text || "").trim() || original;
 
   await p.query(
     `UPDATE core_whatsappmessage
      SET raw_payload = COALESCE(raw_payload, '{}'::jsonb) ||
-       jsonb_build_object('transcript_en', $2::text, 'transcript_model', $3::text)
+       jsonb_build_object(
+         'transcript_en', $2::text,
+         'transcript_yi', $3::text,
+         'transcript_model', 'yiddishlabs'
+       )
      WHERE id = $1`,
-    [id, text.slice(0, 8000), model]
+    [id, english.slice(0, 8000), original.slice(0, 8000)]
   );
-  return { text, cached: false };
+  return { text: english, cached: false };
 }
 
 /**
