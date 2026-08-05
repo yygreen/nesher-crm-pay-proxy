@@ -1837,10 +1837,11 @@ export function injectWhatsAppUi(html, path) {
   const custMatch = String(path || "").match(/^\/customers\/(\d+)\/?$/);
   if (custMatch) {
     if (html.includes(`${WA_UI_MARKER}-cust`)) return html;
-    if (/<\/body>/i.test(html)) {
-      return html.replace(/<\/body>/i, `${customerCardScript(custMatch[1])}</body>`);
-    }
-    return html;
+    const script = customerCardScript(custMatch[1]);
+    // The CRM's customer template never closes <body> — append however we can.
+    if (/<\/body>/i.test(html)) return html.replace(/<\/body>/i, `${script}</body>`);
+    if (/<\/html>/i.test(html)) return html.replace(/<\/html>/i, `${script}</html>`);
+    return html + script;
   }
   if (!/^\/whatsapp(\/|$)/.test(path || "")) return html;
   if (!/<\/body>/i.test(html) && !/<html/i.test(html)) return html;
