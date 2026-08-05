@@ -56,6 +56,18 @@ const CSS = `
     max-width: 100%;
   }
   .nesher-mercury-err { color: #b91c1c; font-size: 12px; margin-left: 6px; }
+  .nesher-paid-badge {
+    display: inline-flex; align-items: center; gap: 5px;
+    background: #dcfce7; border: 1px solid #86efac; color: #15803d;
+    font: 600 12px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    padding: 2px 10px; border-radius: 999px; margin: 2px 6px;
+    white-space: nowrap; vertical-align: middle;
+  }
+  .nesher-paid-badge::before {
+    content: ""; width: 6px; height: 6px; border-radius: 50%; background: #22c55e;
+  }
+  .nesher-paid-badge.part { background: #fef9c3; border-color: #fde047; color: #a16207; }
+  .nesher-paid-badge.part::before { background: #eab308; }
   .nesher-mercury-quote {
     display: block;
     width: 100%;
@@ -1150,6 +1162,124 @@ export function injectPayButtons(html, path) {
   }
 
   return out;
+}
+
+function usdBadge(paid, price) {
+  const fmt = (n) =>
+    "$" +
+    Number(n).toLocaleString("en-US", {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    });
+  const full = !(price > 0) || paid >= price - 0.01;
+  return full
+    ? `<span class="nesher-paid-badge">PAID ${fmt(paid)}</span>`
+    : `<span class="nesher-paid-badge part">PAID ${fmt(paid)} of ${fmt(price)}</span>`;
+}
+
+/**
+ * Server-side "PAID" badges on CRM list/detail pages, straight from the
+ * payment tables — visible no matter how the CRM's own templates render.
+ * Soft: any DB error or a slow query (>1.5s) returns the HTML unchanged.
+ */
+export async function injectPaidBadges(html, path, pool) {
+  if (!html || typeof html !== "string" || !pool) return html;
+  const p = path || "";
+  if (!/^\/reservations(\/|$)|^\/jrm\/hotels(\/|$)/.test(p)) return html;
+  const withTimeout = (prom) =>
+    Promise.race([prom, new Promise((r) => setTimeout(() => r(null), 1500))]);
+  try {
+    const resDetail = p.match(/^\/reservations\/(\d+)\/?$/);
+    if (resDetail) {
+      const out = await withTimeout(
+        pool.query(
+          `SELECT customer_price, amount_paid FROM core_reservation WHERE id = $1`,
+          [Number(resDetail[1])]
+        )
+      );
+      const row = out && out.rows && out.rows[0];
+      if (row && Number(row.amount_paid) > 0) {
+        html = html.replace(
+          /<\/h1>/i,
+          `</h1> ${usdBadge(Number(row.amount_paid), Number(row.customer_price))}`
+        );
+      }
+      return html;
+    }
+    const hotelDetail = p.match(/^\/jrm\/hotels\/(\d+)\/?$/);
+    if (hotelDetail) {
+      const out = await withTimeout(
+        pool.query(
+          `SELECT COALESCE(SUM(amount) FILTER (WHERE UPPER(TRIM(currency)) IN ('USD','US$','$')), 0) AS paid
+           FROM core_jrmhotelpayment WHERE request_id = $1`,
+          [Number(hotelDetail[1])]
+        )
+      );
+      const paid = Number(out && out.rows && out.rows[0] && out.rows[0].paid) || 0;
+      if (paid > 0) html = html.replace(/<\/h1>/i, `</h1> ${usdBadge(paid, 0)}`);
+      return html;
+    }
+    if (/^\/reservations\/?(\?|$)/.test(p)) {
+      const ids = [
+        ...new Set(
+          [...html.matchAll(/href="\/reservations\/(\d+)\//g)].map((m) =>
+            Number(m[1])
+          )
+        ),
+      ];
+      if (!ids.length) return html;
+      const out = await withTimeout(
+        pool.query(
+          `SELECT id, customer_price, amount_paid FROM core_reservation
+           WHERE id = ANY($1) AND COALESCE(amount_paid, 0) > 0`,
+          [ids]
+        )
+      );
+      for (const row of (out && out.rows) || []) {
+        const re = new RegExp(
+          `(<a[^>]*href="/reservations/${row.id}/"[^>]*>[\\s\\S]*?</a>)`,
+          "i"
+        );
+        html = html.replace(re, (m) =>
+          /\/(edit|delete)\//i.test(m)
+            ? m
+            : `${m} ${usdBadge(Number(row.amount_paid), Number(row.customer_price))}`
+        );
+      }
+      return html;
+    }
+    if (/^\/jrm\/hotels\/?(\?|$)/.test(p)) {
+      const ids = [
+        ...new Set(
+          [...html.matchAll(/href="\/jrm\/hotels\/(\d+)\//g)].map((m) =>
+            Number(m[1])
+          )
+        ),
+      ];
+      if (!ids.length) return html;
+      const out = await withTimeout(
+        pool.query(
+          `SELECT request_id,
+                  COALESCE(SUM(amount) FILTER (WHERE UPPER(TRIM(currency)) IN ('USD','US$','$')), 0) AS paid
+           FROM core_jrmhotelpayment WHERE request_id = ANY($1)
+           GROUP BY request_id`,
+          [ids]
+        )
+      );
+      for (const row of (out && out.rows) || []) {
+        if (!(Number(row.paid) > 0)) continue;
+        const re = new RegExp(
+          `(<a[^>]*href="/jrm/hotels/${row.request_id}/"[^>]*>[\\s\\S]*?</a>)`,
+          "i"
+        );
+        html = html.replace(re, (m) => `${m} ${usdBadge(Number(row.paid), 0)}`);
+      }
+      return html;
+    }
+  } catch (e) {
+    console.error("paid badges failed", e.message);
+  }
+  return html;
 }
 
 export { buttonHtml, CSS, SCRIPT };

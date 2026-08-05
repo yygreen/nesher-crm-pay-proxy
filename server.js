@@ -2,7 +2,7 @@ import http from "node:http";
 import { URL } from "node:url";
 import httpProxy from "http-proxy";
 import { createOrReusePaymentRequest } from "./mercury.js";
-import { injectPayButtons } from "./inject.js";
+import { injectPayButtons, injectPaidBadges } from "./inject.js";
 import { injectWhatsAppUi } from "./whatsapp-ui.js";
 import {
   getPool,
@@ -489,21 +489,29 @@ function proxyWithInject(req, res) {
       delete headers["content-encoding"];
       delete headers["transfer-encoding"];
 
-      let body = Buffer.concat(chunks);
+      const body = Buffer.concat(chunks);
+      const finish = (buf) => {
+        headers["content-length"] = String(buf.length);
+        res.writeHead(this.statusCode || 200, headers);
+        res.end(buf);
+      };
       // If upstream gzipped, we asked without accepting gzip ideally
       if (isHtml(headers) && this.statusCode === 200) {
-        try {
-          const text = body.toString("utf8");
-          let injected = injectPayButtons(text, pathOnly);
-          injected = injectWhatsAppUi(injected, pathOnly);
-          body = Buffer.from(injected, "utf8");
-        } catch (e) {
-          console.error("inject failed", e.message);
-        }
+        (async () => {
+          try {
+            const text = body.toString("utf8");
+            let injected = injectPayButtons(text, pathOnly);
+            injected = injectWhatsAppUi(injected, pathOnly);
+            injected = await injectPaidBadges(injected, pathOnly, badgePool());
+            finish(Buffer.from(injected, "utf8"));
+          } catch (e) {
+            console.error("inject failed", e.message);
+            finish(body);
+          }
+        })();
+        return;
       }
-      headers["content-length"] = String(body.length);
-      res.writeHead(this.statusCode || 200, headers);
-      res.end(body);
+      finish(body);
     },
     on() {
       return this;
@@ -531,7 +539,7 @@ const server = http.createServer(async (req, res) => {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-08-05-paysync",
+      build: "2026-08-05-paysync2",
       upstream: UPSTREAM,
       paySync: lastPaySync
         ? {
@@ -689,12 +697,18 @@ async function runPaySync(trigger) {
   }
 }
 
+function badgePool() {
+  return process.env.DATABASE_URL || process.env.DATABASE_PUBLIC_URL
+    ? getPool()
+    : null;
+}
+
 if (
   (process.env.MERCURY_TOKEN_NESHER || process.env.MERCURY_TOKEN) &&
   (process.env.DATABASE_URL || process.env.DATABASE_PUBLIC_URL)
 ) {
-  setTimeout(() => runPaySync("boot"), 15 * 1000);
-  setInterval(() => runPaySync("interval"), 5 * 60 * 1000);
+  setTimeout(() => runPaySync("boot"), 10 * 1000);
+  setInterval(() => runPaySync("interval"), 60 * 1000);
 } else {
   console.warn("pay-sync disabled: MERCURY_TOKEN or DATABASE_URL missing");
 }
