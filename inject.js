@@ -7,14 +7,15 @@ export const BUTTON_MARKER = "data-nesher-mercury-pay";
 
 const CSS = `
 <style id="nesher-mercury-pay-css">
+  /* ── Row chrome: buttons injected next to CRM links ── */
   .nesher-mercury-btn {
     display: inline-flex;
     align-items: center;
-    gap: 6px;
+    gap: 7px;
     background: #0f766e;
     color: #fff !important;
     border: none;
-    border-radius: 6px;
+    border-radius: 7px;
     padding: 6px 12px;
     font-size: 13px;
     font-weight: 600;
@@ -22,17 +23,31 @@ const CSS = `
     text-decoration: none !important;
     margin: 2px 4px;
     line-height: 1.2;
+    box-shadow: inset 0 -1px 0 rgba(0,0,0,.15);
+    transition: background .12s ease;
   }
-  .nesher-mercury-btn:hover { background: #0d9488; color: #fff !important; }
+  .nesher-mercury-btn::before {
+    content: "";
+    width: 6px; height: 6px; border-radius: 50%;
+    background: #5eead4; flex: 0 0 auto;
+  }
+  .nesher-mercury-btn:hover { background: #0c5f58; color: #fff !important; }
   .nesher-mercury-btn[disabled] { opacity: 0.6; cursor: wait; }
   .nesher-mercury-link {
-    display: inline-block;
-    margin-left: 8px;
+    display: inline-flex;
+    align-items: center;
+    margin-left: 6px;
+    padding: 3px 9px;
+    border: 1px solid #99f6e4;
+    border-radius: 999px;
+    background: #f0fdfa;
     font-size: 12px;
-    color: #0f766e;
     font-weight: 600;
+    color: #0f766e !important;
+    text-decoration: none !important;
     word-break: break-all;
   }
+  .nesher-mercury-link:hover { background: #ccfbf1; }
   .nesher-mercury-wrap {
     display: inline-flex;
     flex-wrap: wrap;
@@ -46,89 +61,294 @@ const CSS = `
     width: 100%;
     margin-top: 4px;
     font-size: 12px;
-    color: #334155;
-    font-weight: 600;
+    color: #475569;
+    font-weight: 500;
   }
+
+  /* ── Modal shell ── */
   #nesher-pay-modal-root {
     position: fixed; inset: 0; z-index: 99999;
     display: none; align-items: flex-start; justify-content: center;
-    padding: 4vh 12px; overflow-y: auto;
+    padding: 4vh 16px; overflow-y: auto;
     background: rgba(15, 23, 42, 0.55);
-    font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    color: #0f172a;
+    -webkit-font-smoothing: antialiased;
   }
   #nesher-pay-modal-root.open { display: flex; }
   .nesher-pay-panel {
-    background: #fff; border-radius: 12px; width: 100%; max-width: 560px;
-    box-shadow: 0 20px 50px rgba(0,0,0,.25); overflow: hidden;
+    background: #fff; border-radius: 14px; width: 100%; max-width: 640px;
+    box-shadow: 0 24px 60px rgba(15, 23, 42, .3);
+    border-top: 3px solid #0f766e;
+    display: flex; flex-direction: column; overflow: hidden;
   }
-  .nesher-pay-head {
-    display: flex; align-items: center; justify-content: space-between;
-    padding: 14px 18px; background: #0f766e; color: #fff;
+  .nesher-pay-head { padding: 15px 20px 12px; border-bottom: 1px solid #e2e8f0; }
+  .nesher-pay-head-row {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
   }
-  .nesher-pay-head h2 { margin: 0; font-size: 16px; font-weight: 700; }
+  .nesher-pay-head h2 {
+    margin: 0; font-size: 16px; font-weight: 700;
+    letter-spacing: -0.01em; color: #0f172a;
+  }
   .nesher-pay-close {
-    background: transparent; border: 0; color: #fff; font-size: 22px;
-    cursor: pointer; line-height: 1; padding: 0 4px;
+    background: transparent; border: 0; color: #64748b; font-size: 22px;
+    cursor: pointer; line-height: 1; padding: 2px 7px; border-radius: 6px;
   }
-  .nesher-pay-body { padding: 16px 18px 8px; max-height: 70vh; overflow-y: auto; }
-  .nesher-pay-advice {
-    background: #ecfdf5; border: 1px solid #a7f3d0; color: #065f46;
-    border-radius: 8px; padding: 10px 12px; font-size: 13px; margin-bottom: 12px;
+  .nesher-pay-close:hover { background: #f1f5f9; color: #0f172a; }
+  .nesher-pay-sub {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+    margin-top: 6px; font-size: 13px; color: #475569; min-height: 20px;
   }
-  .nesher-pay-advice.warn {
-    background: #fffbeb; border-color: #fcd34d; color: #92400e;
+  .nesher-pay-sub b { color: #0f172a; font-weight: 600; overflow-wrap: anywhere; }
+  .nesher-pay-sub .sep { color: #cbd5e1; }
+  .nesher-chip {
+    display: inline-flex; align-items: center; padding: 2px 8px;
+    border-radius: 999px; font-size: 10.5px; font-weight: 700;
+    letter-spacing: .03em; text-transform: uppercase; line-height: 1.5;
   }
-  .nesher-pay-missing {
-    background: #fef2f2; border: 1px solid #fecaca; border-radius: 8px;
-    padding: 10px 12px; margin-bottom: 12px;
+  .nesher-chip.ok { background: #f0fdfa; color: #0f766e; border: 1px solid #99f6e4; }
+  .nesher-chip.warn { background: #fffbeb; color: #92400e; border: 1px solid #fde68a; }
+  .nesher-chip.mut { background: #f1f5f9; color: #475569; border: 1px solid #e2e8f0; }
+
+  .nesher-pay-body { padding: 16px 20px 4px; overflow-y: auto; max-height: 72vh; }
+
+  /* ── Single guidance banner ── */
+  .nesher-banner {
+    display: flex; gap: 10px; align-items: flex-start;
+    border-radius: 10px; padding: 10px 12px; margin-bottom: 14px;
+    font-size: 13px; line-height: 1.45;
   }
-  .nesher-pay-missing h3 {
-    margin: 0 0 8px; font-size: 13px; color: #991b1b; font-weight: 700;
+  .nesher-banner.warn { background: #fffbeb; border: 1px solid #fde68a; color: #92400e; }
+  .nesher-banner.info { background: #f0fdfa; border: 1px solid #99f6e4; color: #115e59; }
+  .nesher-banner .ic { flex: 0 0 auto; margin-top: 1px; }
+  .nesher-banner div div + div { margin-top: 3px; }
+
+  /* ── Hero amount ── */
+  .nesher-hero { margin-bottom: 16px; }
+  .nesher-sec-label {
+    display: block; font-size: 11px; font-weight: 700; letter-spacing: .06em;
+    text-transform: uppercase; color: #64748b; margin-bottom: 6px;
   }
-  .nesher-pay-missing ul { margin: 0; padding-left: 18px; font-size: 12px; color: #7f1d1d; }
-  .nesher-pay-missing li { margin-bottom: 4px; }
-  .nesher-pay-field { margin-bottom: 12px; }
-  .nesher-pay-field label {
-    display: block; font-size: 12px; font-weight: 600; color: #334155; margin-bottom: 4px;
+  .nesher-sec-label .req { color: #d97706; }
+  .nesher-amt {
+    display: flex; align-items: center; gap: 5px;
+    border: 1px solid #cbd5e1; border-radius: 10px; padding: 10px 14px;
+    background: #fff;
+    transition: border-color .12s ease, box-shadow .12s ease;
   }
-  .nesher-pay-field label .req { color: #b91c1c; }
-  .nesher-pay-field input, .nesher-pay-field textarea {
+  .nesher-amt:focus-within { border-color: #0f766e; box-shadow: 0 0 0 3px #ccfbf1; }
+  .nesher-amt .cur { font-size: 22px; font-weight: 600; color: #94a3b8; }
+  .nesher-amt input {
+    border: 0; outline: 0; flex: 1; min-width: 0; padding: 0;
+    font-size: 26px; font-weight: 650; color: #0f172a;
+    font-variant-numeric: tabular-nums; background: transparent;
+    font-family: inherit;
+  }
+  .nesher-amt input::placeholder { color: #cbd5e1; font-weight: 500; }
+  .nesher-amt input::-webkit-outer-spin-button,
+  .nesher-amt input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+  .nesher-amt input[type="number"] { -moz-appearance: textfield; appearance: textfield; }
+  .nesher-hero.miss .nesher-amt { border-color: #f59e0b; background: #fffdf5; }
+  .nesher-hero.miss .nesher-amt:focus-within { border-color: #d97706; box-shadow: 0 0 0 3px #fef3c7; }
+  .nesher-hint { font-size: 12px; color: #64748b; margin-top: 5px; line-height: 1.4; }
+  .nesher-hint.warn { color: #92400e; font-weight: 500; }
+
+  /* ── Sections / fields ── */
+  .nesher-sec { margin-bottom: 16px; }
+  .nesher-grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 12px; }
+  .nesher-field label {
+    display: flex; align-items: center; gap: 6px;
+    font-size: 12px; font-weight: 600; color: #334155; margin-bottom: 4px;
+  }
+  .nesher-field input, .nesher-field textarea {
     width: 100%; box-sizing: border-box; border: 1px solid #cbd5e1;
-    border-radius: 6px; padding: 8px 10px; font-size: 14px;
+    border-radius: 8px; padding: 8px 10px; font-size: 14px; color: #0f172a;
+    background: #fff; font-family: inherit;
+    transition: border-color .12s ease, box-shadow .12s ease;
   }
-  .nesher-pay-field input:focus, .nesher-pay-field textarea:focus {
-    outline: 2px solid #99f6e4; border-color: #0f766e;
+  .nesher-field input:focus, .nesher-field textarea:focus {
+    outline: none; border-color: #0f766e; box-shadow: 0 0 0 3px #ccfbf1;
   }
-  .nesher-pay-field .hint { font-size: 11px; color: #64748b; margin-top: 3px; }
-  .nesher-pay-preview {
-    background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px;
-    padding: 10px 12px; margin-bottom: 12px;
+  .nesher-field.miss input { border-color: #f59e0b; background: #fffdf5; }
+
+  /* ── Invoice preview card ── */
+  .nesher-card {
+    border: 1px solid #e2e8f0; border-radius: 12px; background: #fff;
+    margin-bottom: 16px; overflow: hidden;
   }
-  .nesher-pay-preview h3 {
-    margin: 0 0 6px; font-size: 12px; text-transform: uppercase;
-    letter-spacing: .04em; color: #64748b;
+  .nesher-inv-head {
+    display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
+    padding: 10px 14px; background: #f8fafc; border-bottom: 1px solid #e2e8f0;
   }
-  .nesher-pay-preview pre {
-    margin: 0; white-space: pre-wrap; word-break: break-word;
-    font-size: 12px; line-height: 1.45; color: #0f172a;
+  .nesher-inv-head .nesher-sec-label { margin: 0; }
+  .nesher-inv-num {
+    font-size: 12px; color: #475569; font-weight: 600;
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    max-height: 180px; overflow-y: auto;
+    overflow-wrap: anywhere; text-align: right;
   }
-  .nesher-pay-lines { font-size: 12px; color: #334155; margin: 6px 0 0; padding-left: 16px; }
+  .nesher-inv-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .nesher-inv-table td {
+    padding: 8px 14px; border-bottom: 1px solid #f1f5f9;
+    color: #0f172a; vertical-align: top;
+  }
+  .nesher-inv-table td.num {
+    text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums;
+  }
+  .nesher-inv-table .qty { color: #64748b; font-size: 12px; }
+  .nesher-inv-table tfoot td {
+    border-bottom: 0; font-weight: 700; background: #f0fdfa; color: #115e59;
+  }
+  .nesher-inv-empty { padding: 12px 14px; font-size: 12.5px; color: #94a3b8; font-style: italic; }
+  .nesher-inv-sec { padding: 10px 14px; border-top: 1px solid #f1f5f9; }
+  .nesher-inv-sec:first-of-type { border-top: 0; }
+  .nesher-inv-sec .nesher-sec-label { margin-bottom: 5px; }
+  .nesher-inv-row {
+    display: flex; justify-content: space-between; gap: 12px;
+    font-size: 13px; padding: 2px 0; color: #475569;
+  }
+  .nesher-inv-row b { color: #0f172a; font-weight: 600; text-align: right; overflow-wrap: anywhere; }
+  .nesher-inv-row .conf {
+    font-style: normal; font-size: 11px; color: #64748b;
+    background: #f1f5f9; border-radius: 4px; padding: 1px 5px;
+    margin-left: 4px; white-space: nowrap;
+  }
+  .nesher-inv-text { font-size: 13px; color: #0f172a; line-height: 1.5; }
+  .nesher-flight {
+    display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline;
+    font-size: 13px; padding: 3px 0; color: #475569;
+  }
+  .nesher-flight b { color: #0f172a; font-weight: 600; }
+  .nesher-flight .mut { color: #94a3b8; font-size: 12px; }
+  .nesher-inv-pay {
+    display: flex; gap: 14px; flex-wrap: wrap;
+    font-size: 12.5px; color: #64748b; background: #f8fafc;
+  }
+  .nesher-inv-pay .due { color: #115e59; font-weight: 700; }
+  .nesher-memo { border-top: 1px solid #f1f5f9; }
+  .nesher-memo summary {
+    display: flex; align-items: center; gap: 8px;
+    padding: 9px 14px; font-size: 12px; font-weight: 600; color: #64748b;
+    cursor: pointer; user-select: none; list-style: none;
+  }
+  .nesher-memo summary::-webkit-details-marker { display: none; }
+  .nesher-memo summary::before {
+    content: ""; width: 5px; height: 5px; flex: 0 0 auto;
+    border-right: 2px solid #94a3b8; border-bottom: 2px solid #94a3b8;
+    transform: rotate(-45deg); transition: transform .12s ease;
+  }
+  .nesher-memo[open] summary::before { transform: rotate(45deg); }
+  .nesher-memo pre {
+    margin: 0; padding: 0 14px 12px; white-space: pre-wrap; word-break: break-word;
+    font-size: 12px; line-height: 1.5; color: #334155;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    max-height: 220px; overflow-y: auto;
+  }
+
+  /* ── Advanced (collapsed) ── */
+  .nesher-adv { border: 1px solid #e2e8f0; border-radius: 12px; margin-bottom: 16px; }
+  .nesher-adv > summary {
+    display: flex; align-items: center; gap: 8px;
+    padding: 11px 14px; cursor: pointer; user-select: none; list-style: none;
+    font-size: 12.5px; font-weight: 700; color: #334155;
+  }
+  .nesher-adv > summary::-webkit-details-marker { display: none; }
+  .nesher-adv > summary::before {
+    content: ""; width: 5px; height: 5px; flex: 0 0 auto;
+    border-right: 2px solid #94a3b8; border-bottom: 2px solid #94a3b8;
+    transform: rotate(-45deg); transition: transform .12s ease;
+  }
+  .nesher-adv[open] > summary::before { transform: rotate(45deg); }
+  .nesher-adv > summary .mut {
+    color: #94a3b8; font-weight: 500; font-size: 12px; text-transform: none;
+  }
+  .nesher-adv[open] > summary { border-bottom: 1px solid #f1f5f9; }
+  .nesher-adv-body { padding: 12px 14px 14px; display: grid; gap: 12px; }
+  .nesher-tips { font-size: 12px; color: #94a3b8; margin: -6px 0 14px; line-height: 1.5; }
+
+  /* ── Status + footer ── */
+  .nesher-pay-status {
+    margin: 0 20px 10px; padding: 8px 12px; border-radius: 8px;
+    font-size: 13px; line-height: 1.4;
+    background: #fef2f2; border: 1px solid #fecaca; color: #b91c1c;
+  }
+  .nesher-pay-status.ok { background: #f0fdfa; border-color: #99f6e4; color: #0f766e; }
   .nesher-pay-foot {
-    display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end;
-    padding: 12px 18px 16px; border-top: 1px solid #e2e8f0;
+    display: flex; gap: 10px; justify-content: flex-end; align-items: center;
+    padding: 12px 20px; border-top: 1px solid #e2e8f0; background: #fff;
   }
   .nesher-pay-foot button {
-    border-radius: 6px; padding: 8px 14px; font-size: 13px; font-weight: 600;
-    cursor: pointer; border: 1px solid #cbd5e1; background: #fff; color: #0f172a;
+    border-radius: 8px; padding: 9px 16px; font-size: 13.5px; font-weight: 600;
+    cursor: pointer; border: 1px solid #cbd5e1; background: #fff; color: #334155;
+    font-family: inherit;
   }
+  .nesher-pay-foot button:hover { background: #f8fafc; }
   .nesher-pay-foot .primary {
-    background: #0f766e; color: #fff; border-color: #0f766e;
+    background: #0f766e; color: #fff; border-color: #0f766e; min-width: 170px;
   }
+  .nesher-pay-foot .primary:hover { background: #0c5f58; }
   .nesher-pay-foot .primary:disabled { opacity: .6; cursor: wait; }
-  .nesher-pay-status { font-size: 12px; color: #b91c1c; margin: 0 18px 10px; }
-  .nesher-pay-status.ok { color: #047857; }
+  .nesher-pay-panel.success .nesher-pay-cancel { display: none; }
+
+  /* ── Loading skeleton ── */
+  .nesher-skel {
+    height: 16px; border-radius: 6px; margin-bottom: 12px;
+    background: linear-gradient(90deg, #f1f5f9 25%, #e2e8f0 50%, #f1f5f9 75%);
+    background-size: 200% 100%;
+    animation: nesherShimmer 1.2s infinite linear;
+  }
+  .nesher-skel.lg { height: 52px; }
+  .nesher-skel.md { height: 34px; width: 60%; }
+  @keyframes nesherShimmer {
+    from { background-position: 200% 0; }
+    to { background-position: -200% 0; }
+  }
+
+  /* ── Success panel ── */
+  .nesher-success { text-align: center; padding: 18px 6px 12px; }
+  .nesher-success-check {
+    width: 52px; height: 52px; margin: 0 auto 12px; border-radius: 50%;
+    background: #f0fdfa; border: 1px solid #99f6e4; color: #0f766e;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .nesher-success-amt {
+    font-size: 30px; font-weight: 700; letter-spacing: -.02em;
+    font-variant-numeric: tabular-nums; color: #0f172a;
+  }
+  .nesher-success-meta { font-size: 13px; color: #64748b; margin-top: 4px; overflow-wrap: anywhere; }
+  .nesher-pill {
+    display: inline-flex; margin-top: 10px; padding: 3px 10px;
+    border-radius: 999px; background: #fffbeb; border: 1px solid #fde68a;
+    color: #92400e; font-size: 12px; font-weight: 600;
+  }
+  .nesher-url-box { display: flex; gap: 8px; margin: 16px 0 10px; }
+  .nesher-url-box input {
+    flex: 1; min-width: 0; border: 1px solid #cbd5e1; border-radius: 8px;
+    padding: 9px 12px; font-size: 13px; color: #115e59; background: #f8fafc;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  .nesher-url-box input:focus { outline: none; border-color: #0f766e; box-shadow: 0 0 0 3px #ccfbf1; }
+  .nesher-btn-sec {
+    display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+    border: 1px solid #cbd5e1; border-radius: 8px; background: #fff;
+    color: #334155 !important; padding: 8px 14px; font-size: 13px; font-weight: 600;
+    cursor: pointer; text-decoration: none !important; font-family: inherit;
+  }
+  .nesher-btn-sec:hover { background: #f8fafc; }
+  .nesher-success-actions { display: flex; justify-content: center; gap: 10px; }
+
+  /* ── Mobile: full-height sheet, sticky actions ── */
+  @media (max-width: 640px) {
+    #nesher-pay-modal-root { padding: 0; align-items: stretch; }
+    .nesher-pay-panel { max-width: none; border-radius: 0; min-height: 100dvh; }
+    .nesher-pay-body { max-height: none; flex: 1; }
+    .nesher-pay-foot {
+      position: sticky; bottom: 0;
+      padding-bottom: calc(12px + env(safe-area-inset-bottom));
+      box-shadow: 0 -4px 12px rgba(15, 23, 42, .06);
+    }
+    .nesher-pay-foot .primary { flex: 1; }
+    .nesher-grid2 { grid-template-columns: 1fr; }
+  }
 </style>
 `;
 
@@ -150,16 +370,23 @@ const SCRIPT = `
     return null;
   }
 
+  var ICON_WARN = '<svg class="ic" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>';
+  var ICON_INFO = '<svg class="ic" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>';
+  var ICON_CHECK = '<svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg>';
+
   function ensureModal() {
     var root = document.getElementById("nesher-pay-modal-root");
     if (root) return root;
     root = document.createElement("div");
     root.id = "nesher-pay-modal-root";
     root.innerHTML =
-      '<div class="nesher-pay-panel" role="dialog" aria-modal="true">' +
+      '<div class="nesher-pay-panel" role="dialog" aria-modal="true" aria-labelledby="nesher-pay-title">' +
         '<div class="nesher-pay-head">' +
-          '<h2 id="nesher-pay-title">Payment link / invoice</h2>' +
-          '<button type="button" class="nesher-pay-close" aria-label="Close">&times;</button>' +
+          '<div class="nesher-pay-head-row">' +
+            '<h2 id="nesher-pay-title">Create payment link</h2>' +
+            '<button type="button" class="nesher-pay-close" aria-label="Close">&times;</button>' +
+          '</div>' +
+          '<div class="nesher-pay-sub" id="nesher-pay-sub"></div>' +
         '</div>' +
         '<div class="nesher-pay-body" id="nesher-pay-body"></div>' +
         '<p class="nesher-pay-status" id="nesher-pay-status" hidden></p>' +
@@ -178,15 +405,50 @@ const SCRIPT = `
     document.addEventListener("keydown", function (ev) {
       if (ev.key === "Escape" && root.classList.contains("open")) closeModal();
     });
+    // Keep Tab inside the dialog while it is open
+    root.addEventListener("keydown", function (ev) {
+      if (ev.key !== "Tab") return;
+      var panel = root.querySelector(".nesher-pay-panel");
+      var sel = 'a[href], button:not([disabled]), input, textarea, select, summary, [tabindex]:not([tabindex="-1"])';
+      var list = Array.prototype.filter.call(panel.querySelectorAll(sel), function (el) {
+        return el.offsetParent !== null;
+      });
+      if (!list.length) return;
+      var first = list[0];
+      var last = list[list.length - 1];
+      if (ev.shiftKey && document.activeElement === first) { ev.preventDefault(); last.focus(); }
+      else if (!ev.shiftKey && document.activeElement === last) { ev.preventDefault(); first.focus(); }
+    });
+    // Enter in a text field submits
+    root.querySelector("#nesher-pay-body").addEventListener("keydown", function (ev) {
+      if (ev.key === "Enter" && ev.target && ev.target.tagName === "INPUT") {
+        ev.preventDefault();
+        submitCreate();
+      }
+    });
     return root;
   }
 
-  var modalState = { kind: null, id: null, btn: null, wrap: null, data: null };
+  var modalState = { kind: null, id: null, btn: null, wrap: null, data: null, success: null };
+
+  function lockScroll(on) {
+    try { document.documentElement.style.overflow = on ? "hidden" : ""; } catch (e) {}
+  }
+
+  function openRoot(root) {
+    root.classList.add("open");
+    lockScroll(true);
+  }
 
   function closeModal() {
     var root = document.getElementById("nesher-pay-modal-root");
-    if (root) root.classList.remove("open");
-    modalState = { kind: null, id: null, btn: null, wrap: null, data: null };
+    if (root) {
+      root.classList.remove("open");
+      var panel = root.querySelector(".nesher-pay-panel");
+      if (panel) panel.classList.remove("success");
+    }
+    lockScroll(false);
+    modalState = { kind: null, id: null, btn: null, wrap: null, data: null, success: null };
   }
 
   function setStatus(msg, ok) {
@@ -196,6 +458,11 @@ const SCRIPT = `
     el.hidden = false;
     el.textContent = msg;
     el.className = "nesher-pay-status" + (ok ? " ok" : "");
+  }
+
+  function setSub(html) {
+    var el = document.getElementById("nesher-pay-sub");
+    if (el) el.innerHTML = html;
   }
 
   function showQuote(wrap, data) {
@@ -231,87 +498,332 @@ const SCRIPT = `
       .replace(/"/g, "&quot;");
   }
 
-  function renderModal(data) {
+  function money(n) {
+    var v = Number(n);
+    if (!isFinite(v)) return "";
+    return "$" + v.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  }
+
+  function banner(kind, lines) {
+    var out = '<div class="nesher-banner ' + kind + '">' +
+      (kind === "warn" ? ICON_WARN : ICON_INFO) + "<div>";
+    lines.forEach(function (l) { out += "<div>" + esc(l) + "</div>"; });
+    out += "</div></div>";
+    return out;
+  }
+
+  function invRow(label, value) {
+    if (value == null || value === "") return "";
+    return '<div class="nesher-inv-row"><span>' + esc(label) + "</span><b>" + esc(value) + "</b></div>";
+  }
+
+  function plural(n, word) {
+    return n + " " + word + (Number(n) === 1 ? "" : "s");
+  }
+
+  // Booking reference for the summary strip
+  function bookingRef(data) {
+    var draft = data.draft || {};
+    var d = draft.details || {};
+    if (d.reservationCode) return d.reservationCode;
+    if (d.requestId) return "Request #" + d.requestId + (d.offerId ? " · Offer " + d.offerId : "");
+    return draft.invoiceNumber || "";
+  }
+
+  function subFor(data, statusChip) {
+    var draft = data.draft || {};
+    var kindLabel = data.kind === "hotel" ? "Hotel" : (data.kind === "reservation" ? "Reservation" : "");
+    var amt = Number(draft.amountUsd) > 0 ? money(draft.amountUsd) : "amount TBD";
+    var mid = [];
+    var ref = bookingRef(data);
+    if (ref) mid.push("<b>" + esc(ref) + "</b>");
+    var name = String(draft.customerName || "").trim();
+    if (name && name !== "Customer") mid.push("<span>" + esc(name) + "</span>");
+    mid.push("<b>" + esc(amt) + "</b>");
+    return (kindLabel ? '<span class="nesher-chip mut">' + esc(kindLabel) + "</span>" : "") +
+      mid.join('<span class="sep">·</span>') +
+      (statusChip || "");
+  }
+
+  // ── Invoice preview: structured like a real invoice, not a memo dump ──
+  function invoiceCard(draft) {
+    var d = draft.details || {};
+    var html = '<section class="nesher-card">';
+    html += '<div class="nesher-inv-head"><span class="nesher-sec-label">Invoice preview</span>' +
+      '<span class="nesher-inv-num">' + esc(draft.invoiceNumber || "") + "</span></div>";
+
+    var items = draft.lineItems || [];
+    if (items.length) {
+      var total = 0;
+      html += '<table class="nesher-inv-table"><tbody>';
+      items.forEach(function (li) {
+        var qty = Number(li.quantity) || 1;
+        var amt = Number(li.unitPrice) * qty;
+        total += amt;
+        html += "<tr><td>" + esc(li.name) +
+          (qty > 1 ? ' <span class="qty">&times; ' + qty + "</span>" : "") +
+          '</td><td class="num">' + money(amt) + "</td></tr>";
+      });
+      html += "</tbody><tfoot><tr><td>Total due</td><td class=\\"num\\">" + money(total) + "</td></tr></tfoot></table>";
+    } else {
+      html += '<div class="nesher-inv-empty">Line items appear once the amount is set.</div>';
+    }
+
+    // Quoted / paid / due strip (reservations with partial payment)
+    if (Number(d.amountPaid) > 0) {
+      html += '<div class="nesher-inv-sec nesher-inv-pay">' +
+        "<span>Quoted " + money(d.customerPrice) + "</span>" +
+        "<span>Paid " + money(d.amountPaid) + "</span>" +
+        '<span class="due">Due ' + money(d.balance) + "</span></div>";
+    }
+
+    // Booking facts
+    var facts = "";
+    if (d.hotelName || d.stay || d.checkIn) {
+      facts += invRow("Hotel", [d.hotelName, d.city].filter(Boolean).join(", "));
+      facts += invRow("Room", d.roomType);
+      facts += invRow("Stay", d.stay || [d.checkIn, d.checkOut].filter(Boolean).join(" \\u2192 "));
+      var guests = [];
+      if (d.adults) guests.push(plural(d.adults, "adult"));
+      if (d.children) guests.push(plural(d.children, "child").replace("childs", "children"));
+      if (d.rooms) guests.push(plural(d.rooms, "room"));
+      if (guests.length) facts += invRow("Guests", guests.join(" · "));
+      facts += invRow("VAT", d.vatStatus);
+      if (d.requestId) {
+        facts += invRow("CRM ref", "Request #" + d.requestId + (d.offerId ? " · Offer " + d.offerId : ""));
+      }
+    }
+    if (d.reservationCode) {
+      facts += invRow("Booking / PNR", d.reservationCode);
+      if (d.reservationId) facts += invRow("CRM ref", "#" + d.reservationId);
+      facts += invRow("Booked via", d.bookingMethod);
+      facts += invRow("Price source", d.priceSource);
+    }
+    if (d.phone) facts += invRow("Phone", d.phone);
+    if (facts) html += '<div class="nesher-inv-sec">' + facts + "</div>";
+
+    if (d.travelers && d.travelers.length) {
+      html += '<div class="nesher-inv-sec"><span class="nesher-sec-label">Travelers (' + d.travelers.length + ')</span>' +
+        '<div class="nesher-inv-text">' +
+        esc(d.travelers.map(function (t) { return t.full_name || "Traveler"; }).join(", ")) +
+        "</div></div>";
+    }
+
+    if (d.flights && d.flights.length) {
+      html += '<div class="nesher-inv-sec"><span class="nesher-sec-label">Flights</span>';
+      d.flights.slice(0, 12).forEach(function (f) {
+        var head = ((f.airline || "") + " " + (f.flight_number || "")).trim() || "Flight";
+        var when = ((f.departure_date || "") + " " + (f.departure_time || "")).trim();
+        html += '<div class="nesher-flight"><b>' + esc(head) + "</b>" +
+          "<span>" + esc((f.from_location || "?") + " \\u2192 " + (f.to_location || "?")) + "</span>" +
+          (when ? '<span class="mut">' + esc(when) + "</span>" : "") +
+          "</div>";
+      });
+      html += "</div>";
+    }
+
+    if (d.journeyLines && d.journeyLines.length) {
+      html += '<div class="nesher-inv-sec"><span class="nesher-sec-label">Services &amp; tickets</span>';
+      d.journeyLines.slice(0, 20).forEach(function (j) {
+        var price = Number(j.customer_price) > 0 ? money(j.customer_price) : "";
+        html += '<div class="nesher-inv-row"><span>' + esc(j.label || j.line_type || "Service") +
+          (j.confirmation_number ? ' <i class="conf">conf ' + esc(j.confirmation_number) + "</i>" : "") +
+          "</span><b>" + price + "</b></div>";
+      });
+      html += "</div>";
+    }
+
+    if (draft.payerMemo) {
+      html += '<details class="nesher-memo"><summary>Full memo (what the customer sees)</summary><pre>' +
+        esc(draft.payerMemo) + "</pre></details>";
+    }
+    html += "</section>";
+    return html;
+  }
+
+  function renderLoading(kind) {
     var root = ensureModal();
+    root.querySelector(".nesher-pay-panel").classList.remove("success");
+    modalState.success = null;
+    document.getElementById("nesher-pay-title").textContent = "Create payment link";
+    var kindLabel = kind === "reservation" ? "Reservation" : "Hotel";
+    setSub('<span class="nesher-chip mut">' + esc(kindLabel) + "</span><span>Loading booking details\\u2026</span>");
+    document.getElementById("nesher-pay-body").innerHTML =
+      '<div class="nesher-skel lg"></div><div class="nesher-skel md"></div>' +
+      '<div class="nesher-skel"></div><div class="nesher-skel"></div>' +
+      '<div class="nesher-skel" style="width:40%"></div>';
+    setStatus("");
+    var createBtn = document.getElementById("nesher-pay-create");
+    createBtn.disabled = true;
+    createBtn.textContent = "Create payment link";
+    openRoot(root);
+  }
+
+  function renderModal(data, keep) {
+    var root = ensureModal();
+    root.querySelector(".nesher-pay-panel").classList.remove("success");
+    modalState.success = null;
     var body = document.getElementById("nesher-pay-body");
     var draft = data.draft || {};
     var missing = data.missing || [];
     var advice = data.advice || [];
     var needs = data.needsInput || missing.some(function (m) { return m.required; });
+    var byField = {};
+    missing.forEach(function (m) { if (m && m.field) byField[m.field] = m; });
+    var formFields = { amountUsd: 1, customerEmail: 1, customerName: 1 };
 
     document.getElementById("nesher-pay-title").textContent =
-      needs ? "Complete invoice details" : "Review invoice & create pay link";
+      needs ? "Complete payment details" : "Create payment link";
+    setSub(subFor(data, needs
+      ? '<span class="nesher-chip warn">Needs input</span>'
+      : '<span class="nesher-chip ok">Ready</span>'));
 
     var html = "";
 
-    if (advice.length) {
-      html += '<div class="nesher-pay-advice' + (needs ? " warn" : "") + '">';
-      advice.forEach(function (a) {
-        html += "<div>" + esc(a) + "</div>";
-      });
-      html += "</div>";
+    // One calm banner, max. Field-level hints carry the specifics.
+    var extraReq = missing.filter(function (m) { return m.required && !formFields[m.field]; });
+    if (needs) {
+      var lines = [advice[0] || "Fill the highlighted fields, then create the payment link."];
+      advice.slice(1).forEach(function (a) { lines.push(a); });
+      extraReq.forEach(function (m) { lines.push(m.label + ": " + m.reason); });
+      html += banner("warn", lines);
+    } else if (advice.length > 1) {
+      html += banner("info", advice.slice(1));
     }
 
-    if (missing.length) {
-      html += '<div class="nesher-pay-missing"><h3>What still needs attention</h3><ul>';
-      missing.forEach(function (m) {
-        html += "<li><strong>" + esc(m.label) +
-          (m.required ? " (required)" : " (optional)") +
-          ":</strong> " + esc(m.reason) + "</li>";
-      });
-      html += "</ul></div>";
+    // Hero amount
+    var amtMiss = byField.amountUsd;
+    var amtEmpty = !(Number(draft.amountUsd) > 0);
+    var amtHint;
+    if (amtMiss) {
+      amtHint = '<div class="nesher-hint warn">' + esc(amtMiss.reason) + "</div>";
+    } else {
+      var srcNote = "";
+      if (Number(draft.sourceAmount) > 0 && draft.sourceCurrency && draft.sourceCurrency !== "USD") {
+        srcNote = " Converted from " + draft.sourceCurrency + " " +
+          Number(draft.sourceAmount).toLocaleString("en-US") + ".";
+      }
+      amtHint = '<div class="nesher-hint">Charged to the customer via Mercury.' + esc(srcNote) + "</div>";
     }
+    html += '<div class="nesher-hero' + (amtMiss && amtMiss.required && amtEmpty ? " miss" : "") + '">' +
+      '<label class="nesher-sec-label" for="nesher-f-amount">Amount due (USD)' +
+      (amtMiss && amtMiss.required ? ' <span class="req">*</span>' : "") + "</label>" +
+      '<div class="nesher-amt"><span class="cur">$</span>' +
+      '<input type="number" step="0.01" min="0" inputmode="decimal" id="nesher-f-amount" value="' +
+      esc(amtEmpty ? "" : draft.amountUsd) + '" placeholder="0.00" /></div>' +
+      amtHint + "</div>";
 
-    // Editable fields — always show amount, email, name so staff can override anything
-    html += '<div class="nesher-pay-field">' +
-      '<label>Amount due (USD) ' + (needs && !(Number(draft.amountUsd) > 0) ? '<span class="req">*</span>' : '') + '</label>' +
-      '<input type="number" step="0.01" min="0" id="nesher-f-amount" value="' +
-      esc(draft.amountUsd > 0 ? draft.amountUsd : "") + '" placeholder="e.g. 2604.00" />' +
-      '<div class="hint">Customer will be charged this amount. Pre-filled from CRM when available.</div></div>';
+    // Customer
+    var nameMiss = byField.customerName;
+    var emailMiss = byField.customerEmail;
+    html += '<div class="nesher-sec"><span class="nesher-sec-label">Customer</span><div class="nesher-grid2">';
+    html += '<div class="nesher-field">' +
+      '<label for="nesher-f-name">Name</label>' +
+      '<input type="text" id="nesher-f-name" value="' + esc(draft.customerName || "") + '" placeholder="Customer name" />' +
+      (nameMiss ? '<div class="nesher-hint warn">' + esc(nameMiss.reason) + "</div>" : "") +
+      "</div>";
+    html += '<div class="nesher-field' + (emailMiss && emailMiss.required ? " miss" : "") + '">' +
+      '<label for="nesher-f-email">Email' +
+      (draft.emailPlaceholder ? ' <span class="nesher-chip warn">placeholder</span>' : "") + "</label>" +
+      '<input type="email" id="nesher-f-email" value="' + esc(draft.customerEmail || "") + '" placeholder="customer@email.com" />' +
+      (emailMiss
+        ? '<div class="nesher-hint warn">' + esc(emailMiss.reason) + "</div>"
+        : (draft.emailPlaceholder
+          ? '<div class="nesher-hint warn">CRM has no email — this placeholder works, a real one is better.</div>'
+          : "")) +
+      "</div>";
+    html += "</div></div>";
 
-    html += '<div class="nesher-pay-field">' +
-      '<label>Customer email' + (draft.emailPlaceholder ? ' <span class="req">(placeholder — replace if you can)</span>' : '') + '</label>' +
-      '<input type="email" id="nesher-f-email" value="' + esc(draft.customerEmail || "") + '" />' +
-      '<div class="hint">Mercury needs an email. Placeholder booking+…@jrmhotels.com works if CRM has none.</div></div>';
+    // Invoice preview
+    html += invoiceCard(draft);
 
-    html += '<div class="nesher-pay-field">' +
-      '<label>Customer name</label>' +
-      '<input type="text" id="nesher-f-name" value="' + esc(draft.customerName || "") + '" /></div>';
-
-    html += '<div class="nesher-pay-field">' +
-      '<label>Invoice number</label>' +
+    // Advanced, collapsed by default (open if a staff note is carried over)
+    var memoVal = keep && keep.payerMemo ? keep.payerMemo : "";
+    html += '<details class="nesher-adv"' + (memoVal ? " open" : "") + ">" +
+      "<summary>Advanced <span class=\\"mut\\">invoice number · line item · staff note</span></summary>" +
+      '<div class="nesher-adv-body">' +
+      '<div class="nesher-field"><label for="nesher-f-inv">Invoice number</label>' +
       '<input type="text" id="nesher-f-inv" value="' + esc(draft.invoiceNumber || "") + '" />' +
-      '<div class="hint">Stable number for reuse if link already exists unpaid.</div></div>';
+      '<div class="nesher-hint">Stable number — an existing unpaid link with this number is reused.</div></div>' +
+      '<div class="nesher-field"><label for="nesher-f-line">Line item title</label>' +
+      '<input type="text" id="nesher-f-line" value="' + esc(draft.lineItemName || "") + '" /></div>' +
+      '<div class="nesher-field"><label for="nesher-f-memo">Staff note (added to the customer-visible memo)</label>' +
+      '<textarea id="nesher-f-memo" rows="2" placeholder="Optional note for this charge">' + esc(memoVal) + "</textarea></div>" +
+      "</div></details>";
 
-    html += '<div class="nesher-pay-field">' +
-      '<label>Line item title (shown on invoice)</label>' +
-      '<input type="text" id="nesher-f-line" value="' + esc(draft.lineItemName || "") + '" /></div>';
-
-    html += '<div class="nesher-pay-field">' +
-      '<label>Extra staff note (added to customer-visible memo)</label>' +
-      '<textarea id="nesher-f-memo" rows="2" placeholder="Optional note for this charge"></textarea></div>';
-
-    // Full invoice preview — every detail we packed
-    html += '<div class="nesher-pay-preview"><h3>Invoice preview (what the customer sees)</h3>';
-    if (draft.lineItems && draft.lineItems.length) {
-      html += '<ul class="nesher-pay-lines">';
-      draft.lineItems.forEach(function (li) {
-        html += "<li>" + esc(li.name) + " — $" + Number(li.unitPrice).toFixed(2) +
-          (li.quantity > 1 ? " × " + li.quantity : "") + "</li>";
-      });
-      html += "</ul>";
+    // Optional CRM housekeeping tips, out of the way
+    var tips = missing.filter(function (m) { return !m.required && !formFields[m.field]; });
+    if (tips.length) {
+      html += '<div class="nesher-tips">' +
+        tips.map(function (m) { return "Tip: " + esc(m.reason); }).join("<br/>") +
+        "</div>";
     }
-    html += "<pre>" + esc(draft.payerMemo || draft.summary || "(memo builds after amount is set)") + "</pre></div>";
 
     body.innerHTML = html;
     setStatus("");
     var createBtn = document.getElementById("nesher-pay-create");
     createBtn.disabled = false;
     createBtn.textContent = "Create payment link";
-    root.classList.add("open");
-    // Focus first empty required field
+    openRoot(root);
+
     var amt = document.getElementById("nesher-f-amount");
-    if (amt && !(Number(draft.amountUsd) > 0)) amt.focus();
+    if (amt && amtEmpty) amt.focus();
+    else createBtn.focus();
+  }
+
+  // ── Success: its own clean screen ──
+  function renderSuccess(data) {
+    var root = ensureModal();
+    var draft = data.draft || {};
+    modalState.success = { url: data.payUrl };
+    root.querySelector(".nesher-pay-panel").classList.add("success");
+
+    document.getElementById("nesher-pay-title").textContent = "Payment link ready";
+    setSub(subFor({ kind: data.kind || (modalState.kind === "reservation" ? "reservation" : "hotel"), draft: draft },
+      '<span class="nesher-chip ok">Link ready</span>'));
+
+    var amount = Number(data.amountUsd || draft.amountUsd);
+    var meta = [data.invoiceNumber || draft.invoiceNumber, draft.customerName, draft.customerEmail]
+      .filter(function (x) { return x && String(x).trim(); }).join(" · ");
+
+    var body = document.getElementById("nesher-pay-body");
+    body.innerHTML =
+      '<div class="nesher-success">' +
+        '<div class="nesher-success-check">' + ICON_CHECK + "</div>" +
+        '<div class="nesher-success-amt">' + money(amount) + "</div>" +
+        '<div class="nesher-success-meta">' + esc(meta) + "</div>" +
+        (data.reused ? '<div class="nesher-pill">Existing unpaid link reused — same URL as before</div>' : "") +
+        '<div class="nesher-url-box">' +
+          '<input id="nesher-success-url" readonly value="' + esc(data.payUrl) + '" aria-label="Payment link URL" />' +
+          '<button type="button" class="nesher-btn-sec" id="nesher-copy-url">Copy</button>' +
+        "</div>" +
+        '<div class="nesher-success-actions">' +
+          '<a class="nesher-btn-sec" href="' + esc(data.payUrl) + '" target="_blank" rel="noopener">Open in Mercury</a>' +
+        "</div>" +
+      "</div>";
+
+    var createBtn = document.getElementById("nesher-pay-create");
+    createBtn.disabled = false;
+    createBtn.textContent = "Done";
+
+    var urlInput = document.getElementById("nesher-success-url");
+    urlInput.addEventListener("focus", function () { urlInput.select(); });
+    document.getElementById("nesher-copy-url").addEventListener("click", function () {
+      var btn = this;
+      function done() {
+        btn.textContent = "Copied";
+        setTimeout(function () { btn.textContent = "Copy"; }, 1600);
+      }
+      function fallback() {
+        try { urlInput.select(); document.execCommand("copy"); done(); } catch (e) {}
+      }
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(data.payUrl).then(done, fallback);
+      } else fallback();
+    });
+
+    openRoot(root);
+    createBtn.focus();
   }
 
   function readFormOverrides() {
@@ -332,10 +844,12 @@ const SCRIPT = `
   }
 
   async function submitCreate() {
+    if (modalState.success) { closeModal(); return; }
     if (!modalState.kind || !modalState.id) return;
     var createBtn = document.getElementById("nesher-pay-create");
+    if (createBtn.disabled) return;
     createBtn.disabled = true;
-    createBtn.textContent = "Creating…";
+    createBtn.textContent = "Creating\\u2026";
     setStatus("");
     var url = pathFor(modalState.kind, modalState.id);
     var overrides = readFormOverrides();
@@ -352,12 +866,15 @@ const SCRIPT = `
       }, 30000);
       var data = out.data || {};
       modalState.data = data;
+      if (data.payUrl && !/^https:\\/\\//i.test(String(data.payUrl))) {
+        setStatus("Unexpected pay link format — not opening it. Contact dev.");
+        createBtn.disabled = false;
+        createBtn.textContent = "Create payment link";
+        return;
+      }
 
       if (data.payUrl) {
-        setStatus(
-          (data.reused ? "Existing unpaid link ready: " : "Pay link created: ") + data.payUrl,
-          true
-        );
+        // Update the row chrome behind the modal
         showQuote(modalState.wrap, data);
         var wrap = modalState.wrap;
         if (wrap) {
@@ -375,22 +892,18 @@ const SCRIPT = `
             modalState.btn.textContent = data.reused ? "Show pay link" : "Pay link ready";
           }
         }
-        try { await navigator.clipboard.writeText(data.payUrl); } catch (e) {}
-        createBtn.textContent = "Done";
-        createBtn.disabled = false;
-        // Refresh preview with final memo
-        if (data.draft) renderModal(data);
-        setStatus(
-          (data.reused ? "Existing unpaid link (copied): " : "Created & copied: ") + data.payUrl,
-          true
-        );
+        renderSuccess(data);
+        try {
+          await navigator.clipboard.writeText(data.payUrl);
+          setStatus("Link copied to clipboard.", true);
+        } catch (e) {}
         return;
       }
 
-      // Still missing fields — re-render form with server advice
+      // Still missing fields — re-render form with server guidance, keep the staff note
       if (data.needsInput || data.draft) {
-        renderModal(data);
-        setStatus(data.message || data.error || "Fill required fields above, then create again.");
+        renderModal(data, { payerMemo: overrides.payerMemo || "" });
+        setStatus(data.message || data.error || "Fill the highlighted fields, then create again.");
         return;
       }
 
@@ -407,6 +920,12 @@ const SCRIPT = `
     }
   }
 
+  function modalStillOn(kind, id) {
+    var root = document.getElementById("nesher-pay-modal-root");
+    return root && root.classList.contains("open") &&
+      modalState.kind === kind && String(modalState.id) === String(id);
+  }
+
   async function openPayFlow(kind, id, btn) {
     if (btn.getAttribute("data-busy") === "1") return;
     var wrap = btn.closest(".nesher-mercury-wrap") || btn.parentElement;
@@ -415,7 +934,6 @@ const SCRIPT = `
     btn.setAttribute("data-busy", "1");
     btn.disabled = true;
     var defaultLabel = btn.getAttribute("data-label") || "Mercury Pay Link";
-    btn.textContent = "Loading…";
     var url = pathFor(kind, id);
     if (!url) {
       btn.disabled = false;
@@ -423,6 +941,8 @@ const SCRIPT = `
       btn.textContent = defaultLabel;
       return;
     }
+    modalState = { kind: kind, id: id, btn: btn, wrap: wrap, data: null, success: null };
+    renderLoading(kind);
     try {
       // Always load flexible draft first — never hard-fail on missing price
       var out = await fetchJson(url, {
@@ -437,45 +957,47 @@ const SCRIPT = `
         // True failure (not found / auth) — still try to be useful
         throw new Error(data.error);
       }
-      modalState = { kind: kind, id: id, btn: btn, wrap: wrap, data: data };
+      if (!modalStillOn(kind, id)) return; // staff closed the modal while loading
+      modalState.data = data;
       renderModal(data);
       showQuote(wrap, data);
-      btn.textContent = defaultLabel;
     } catch (e) {
+      var msg = e && e.name === "AbortError"
+        ? "Timed out — try again"
+        : (e.message || String(e));
       if (!err) {
         err = document.createElement("span");
         err.className = "nesher-mercury-err";
         wrap.appendChild(err);
       }
-      var msg = e && e.name === "AbortError"
-        ? "Timed out — try again"
-        : (e.message || String(e));
       err.textContent = msg;
-      // Open empty modal so staff can still enter amount manually
-      modalState = { kind: kind, id: id, btn: btn, wrap: wrap, data: null };
-      renderModal({
-        needsInput: true,
-        advice: [
-          "Could not fully load CRM details (" + msg + "). Enter amount and email below to create a payment link anyway."
-        ],
-        missing: [
-          { field: "amountUsd", label: "Amount due (USD)", reason: "Enter manually.", required: true },
-          { field: "customerEmail", label: "Customer email", reason: "Enter customer email.", required: true }
-        ],
-        draft: {
-          customerName: "Customer",
-          customerEmail: "",
-          amountUsd: 0,
-          invoiceNumber: kind === "reservation" ? ("RES-ID" + id) : ("JRM-1" + id),
-          lineItemName: "Payment",
-          payerMemo: "",
-          lineItems: []
-        }
-      });
-      btn.textContent = defaultLabel;
+      if (modalStillOn(kind, id)) {
+        // Open a manual-entry form so staff can still create a link
+        renderModal({
+          kind: kind === "reservation" ? "reservation" : "hotel",
+          needsInput: true,
+          advice: [
+            "Could not fully load CRM details (" + msg + "). Enter amount and email below to create a payment link anyway."
+          ],
+          missing: [
+            { field: "amountUsd", label: "Amount due (USD)", reason: "Enter manually.", required: true },
+            { field: "customerEmail", label: "Customer email", reason: "Enter customer email.", required: true }
+          ],
+          draft: {
+            customerName: "Customer",
+            customerEmail: "",
+            amountUsd: 0,
+            invoiceNumber: kind === "reservation" ? ("RES-ID" + id) : ("JRM-1" + id),
+            lineItemName: "Payment",
+            payerMemo: "",
+            lineItems: []
+          }
+        });
+      }
     } finally {
       btn.disabled = false;
       btn.removeAttribute("data-busy");
+      btn.textContent = defaultLabel;
     }
   }
 
@@ -589,16 +1111,18 @@ export function injectPayButtons(html, path) {
     );
   }
 
+  // Replacer functions so "$"-sequences inside CSS/SCRIPT are never
+  // interpreted as String.replace substitution patterns.
   if (!out.includes("nesher-mercury-pay-css")) {
     if (/<\/head>/i.test(out)) {
-      out = out.replace(/<\/head>/i, `${CSS}</head>`);
+      out = out.replace(/<\/head>/i, () => `${CSS}</head>`);
     } else {
       out = CSS + out;
     }
   }
   if (!out.includes("nesher-mercury-pay-js")) {
     if (/<\/body>/i.test(out)) {
-      out = out.replace(/<\/body>/i, `${SCRIPT}</body>`);
+      out = out.replace(/<\/body>/i, () => `${SCRIPT}</body>`);
     } else {
       out = out + SCRIPT;
     }
