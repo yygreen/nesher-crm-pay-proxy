@@ -1414,11 +1414,17 @@ const SCRIPT = `
 
     /* recorder */
     var recorder = null, chunks = [], recStart = 0, recInterval = null, discard = false;
+    var recStarting = false, recAborted = false, recStopping = false;
     function stopTracks(stream) { stream.getTracks().forEach(function (t) { t.stop(); }); }
     function startRec() {
-      discard = false;
+      if (recorder || recStarting) return;
+      recStarting = true; recAborted = false; discard = false;
+      micBtn.disabled = true;
       navigator.mediaDevices.getUserMedia({ audio: true })
         .then(function (stream) {
+          recStarting = false;
+          micBtn.disabled = false;
+          if (recAborted) { stopTracks(stream); return; }
           var mime = "";
           var cands = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/mp4"];
           for (var i2 = 0; i2 < cands.length; i2++) {
@@ -1431,15 +1437,19 @@ const SCRIPT = `
             stopTracks(stream);
             composer.classList.remove("recording");
             micBtn.innerHTML = I.mic;
+            micBtn.title = "Record voice note";
             clearInterval(recInterval);
             var type = (recorder && recorder.mimeType) || mime || "audio/webm";
-            recorder = null;
+            var durMs = Date.now() - recStart;
+            recorder = null; recStopping = false;
             if (discard) return;
+            if (durMs < 700) { toast("Too short \\u2014 tap the mic, speak after the timer starts, then tap send.", "warn"); return; }
             var blob = new Blob(chunks, { type: type });
             if (!blob.size) { toast("Empty recording \\u2014 try again.", "warn"); return; }
             sendAudioBlob(blob, type, true);
           };
-          recorder.start();
+          /* timeslice so long notes flush chunks as they go */
+          recorder.start(1000);
           recStart = Date.now();
           recTimer.textContent = "0:00";
           recInterval = setInterval(function () {
@@ -1449,15 +1459,26 @@ const SCRIPT = `
           micBtn.innerHTML = I.send;
           micBtn.title = "Send voice note";
         })
-        .catch(function (e) { toast(e.message || "Microphone permission denied", "error"); });
+        .catch(function (e) {
+          recStarting = false;
+          micBtn.disabled = false;
+          toast(e.message || "Microphone permission denied", "error");
+        });
     }
     function stopRec(cancel) {
-      if (!recorder) return;
+      if (recStarting) { recAborted = true; discard = true; return; }
+      if (!recorder || recStopping) return;
+      recStopping = true;
       discard = Boolean(cancel);
-      try { recorder.stop(); } catch (e) {}
+      var r = recorder;
+      /* grace so the tail of the last word is captured, then flush + stop */
+      setTimeout(function () {
+        try { r.requestData(); } catch (e) {}
+        try { r.stop(); } catch (e) {}
+      }, cancel ? 0 : 350);
     }
     micBtn.addEventListener("click", function () {
-      if (recorder) stopRec(false);
+      if (recorder || recStarting) stopRec(false);
       else startRec();
     });
     recCancel.addEventListener("click", function () { stopRec(true); });
