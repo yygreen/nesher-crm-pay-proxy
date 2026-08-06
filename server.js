@@ -608,7 +608,7 @@ const server = http.createServer(async (req, res) => {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-08-06-wa-newchat-fix",
+      build: "2026-08-07-wa-images",
       upstream: UPSTREAM,
       paySync: lastPaySync
         ? {
