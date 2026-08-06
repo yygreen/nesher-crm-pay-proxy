@@ -518,43 +518,199 @@ export async function whatsappByCustomer(customerId) {
   };
 }
 
+/** Meta sample templates only work on Public Test Numbers — never usable in prod. */
+const SAMPLE_TEMPLATE_NAMES = new Set(["hello_world"]);
+
+function normalizePhoneDigits(phone) {
+  let digits = String(phone || "").replace(/\D/g, "");
+  // Israeli local: 05X… → 9725X…
+  if (digits.length === 10 && digits.startsWith("0")) {
+    digits = `972${digits.slice(1)}`;
+  }
+  // Bare Israeli mobile without country code: 5X… (9 digits)
+  if (digits.length === 9 && digits.startsWith("5")) {
+    digits = `972${digits}`;
+  }
+  return digits;
+}
+
+function mapTemplate(t) {
+  const body = (t.components || []).find((c) => c.type === "BODY");
+  const text = body?.text || "";
+  const varCount = (text.match(/\{\{\d+\}\}/g) || []).length;
+  return {
+    name: t.name,
+    language: t.language,
+    category: t.category,
+    status: t.status,
+    body: text,
+    varCount,
+    sample: SAMPLE_TEMPLATE_NAMES.has(t.name),
+  };
+}
+
 /**
- * Approved templates (needed to START a conversation — Meta requires a
- * pre-approved template for any business-initiated message).
+ * All non-rejected templates (for UI status: approved vs still pending Meta).
  */
-export async function listApprovedTemplates() {
+export async function listTemplates() {
   const { token } = waConfig();
   if (!token) throw new Error("WhatsApp not configured on proxy");
   const res = await fetch(
-    `${GRAPH}/${process.env.WHATSAPP_BUSINESS_ACCOUNT_ID || "1548491333738289"}/message_templates?fields=name,status,category,language,components&limit=50`,
+    `${GRAPH}/${process.env.WHATSAPP_BUSINESS_ACCOUNT_ID || "1548491333738289"}/message_templates?fields=name,status,category,language,components,rejected_reason&limit=50`,
     { headers: { Authorization: `Bearer ${token}` } }
   );
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data?.error?.message || `Templates HTTP ${res.status}`);
   return (data.data || [])
-    .filter((t) => t.status === "APPROVED")
-    .map((t) => {
-      const body = (t.components || []).find((c) => c.type === "BODY");
-      const text = body?.text || "";
-      const varCount = (text.match(/\{\{\d+\}\}/g) || []).length;
-      return { name: t.name, language: t.language, category: t.category, body: text, varCount };
-    });
+    .map(mapTemplate)
+    .filter((t) => t.status !== "REJECTED" && t.status !== "DISABLED");
+}
+
+/**
+ * Production-usable templates only: APPROVED and not Meta sample packs.
+ * Needed to START a conversation (business-initiated).
+ */
+export async function listApprovedTemplates() {
+  const all = await listTemplates();
+  return all.filter((t) => t.status === "APPROVED" && !t.sample);
+}
+
+/**
+ * Find an existing WhatsApp contact by phone (exact digits, then last-9 fallback).
+ */
+export async function findContactByPhone(phone) {
+  const digits = normalizePhoneDigits(phone);
+  if (digits.length < 9) return null;
+  const p = getPool();
+  const exact = await p.query(
+    `SELECT id, phone_number, display_name
+     FROM core_whatsappcontact
+     WHERE regexp_replace(phone_number, '\\D', '', 'g') = $1
+     LIMIT 1`,
+    [digits]
+  );
+  if (exact.rows.length) {
+    return {
+      contactId: Number(exact.rows[0].id),
+      phone: exact.rows[0].phone_number,
+      name: exact.rows[0].display_name,
+    };
+  }
+  const tail = digits.slice(-9);
+  const fuzzy = await p.query(
+    `SELECT id, phone_number, display_name
+     FROM core_whatsappcontact
+     WHERE length(regexp_replace(phone_number, '\\D', '', 'g')) >= 9
+       AND right(regexp_replace(phone_number, '\\D', '', 'g'), 9) = $1
+     ORDER BY last_message_at DESC NULLS LAST
+     LIMIT 1`,
+    [tail]
+  );
+  if (!fuzzy.rows.length) return null;
+  return {
+    contactId: Number(fuzzy.rows[0].id),
+    phone: fuzzy.rows[0].phone_number,
+    name: fuzzy.rows[0].display_name,
+  };
+}
+
+function humanizeMetaSendError(data, fallbackStatus) {
+  const err = data?.error || {};
+  const code = err.code;
+  const msg = String(err.message || fallbackStatus || "Template send failed");
+  if (
+    code === 131058 ||
+    /Hello World|Public Test Numbers/i.test(msg)
+  ) {
+    return (
+      "Meta blocked that send: the only approved template right now is Meta's sample " +
+      '"Hello World", which only works on Public Test Numbers. Our real booking templates ' +
+      "(nesher_open_chat / booking_followup) are still PENDING Meta approval — usually a few hours. " +
+      "Once approved, New chat works for any number."
+    );
+  }
+  if (code === 131026 || /not a valid whatsapp/i.test(msg)) {
+    return "That number is not on WhatsApp (or is invalid). Use full international digits, e.g. 972501234567.";
+  }
+  if (code === 131047 || /re-engagement|24 hour|outside/i.test(msg)) {
+    return "Free-form chat is closed. Send an approved template to re-open the conversation.";
+  }
+  if (code === 132000 || /parameter/i.test(msg)) {
+    return `Template parameter error from Meta: ${msg}`;
+  }
+  return code ? `(#${code}) ${msg}` : msg;
 }
 
 /**
  * Start a business-initiated conversation: send an approved template to a
  * phone that never messaged us, create/reuse the contact row, record the
  * rendered message, and auto-link to a customer by phone.
+ *
+ * If openExistingOnly is true (or templateName is empty and the contact already
+ * exists), just open the inbox thread without sending.
  */
-export async function startChat({ phone, name = "", templateName, params = [], sentById = null, agentTag = "" }) {
+export async function startChat({
+  phone,
+  name = "",
+  templateName,
+  params = [],
+  sentById = null,
+  agentTag = "",
+  openExistingOnly = false,
+}) {
   const { token, phoneNumberId } = waConfig();
   if (!token || !phoneNumberId) throw new Error("WhatsApp not configured on proxy");
-  const digits = String(phone || "").replace(/\D/g, "");
-  if (digits.length < 9) throw new Error("Phone must be international digits, e.g. 972539240985");
+  const digits = normalizePhoneDigits(phone);
+  if (digits.length < 9) {
+    throw new Error("Phone must be international digits, e.g. 972501234567 (or 0501234567)");
+  }
 
-  const templates = await listApprovedTemplates();
-  const tpl = templates.find((t) => t.name === templateName);
-  if (!tpl) throw new Error(`Template "${templateName}" is not approved yet`);
+  const existingHit = await findContactByPhone(digits);
+  if (openExistingOnly || (!templateName && existingHit)) {
+    if (!existingHit) {
+      throw new Error(
+        "No existing WhatsApp chat for that number. Pick an approved template to open a new conversation."
+      );
+    }
+    if (name) {
+      const p = getPool();
+      await p.query(
+        `UPDATE core_whatsappcontact
+         SET display_name = COALESCE(NULLIF(display_name, ''), $2), updated_at = now()
+         WHERE id = $1`,
+        [existingHit.contactId, name]
+      );
+    }
+    return { contactId: existingHit.contactId, existing: true, wamid: null };
+  }
+
+  if (SAMPLE_TEMPLATE_NAMES.has(String(templateName || ""))) {
+    throw new Error(
+      'Cannot use Meta\'s sample "hello_world" template on real numbers. Wait for nesher_open_chat / booking_followup to be approved.'
+    );
+  }
+
+  const all = await listTemplates();
+  const approved = all.filter((t) => t.status === "APPROVED" && !t.sample);
+  const pending = all.filter((t) => t.status === "PENDING" && !t.sample);
+
+  let tpl = approved.find((t) => t.name === templateName);
+  // Allow matching by name+language if UI sends "name (lang)" leftovers — UI sends name only.
+  if (!tpl && templateName) {
+    tpl = approved.find((t) => t.name === templateName && t.language);
+  }
+  if (!tpl) {
+    if (!approved.length) {
+      const pendingNames = pending.map((t) => `${t.name} (${t.language})`).join(", ") || "none yet";
+      throw new Error(
+        `No production WhatsApp templates are approved yet. Pending Meta review: ${pendingNames}. ` +
+          "Until then you can only open numbers that already messaged us (they appear in the inbox)."
+      );
+    }
+    throw new Error(
+      `Template "${templateName}" is not approved yet. Approved: ${approved.map((t) => t.name).join(", ") || "none"}.`
+    );
+  }
   if (params.length !== tpl.varCount) {
     throw new Error(`Template needs ${tpl.varCount} value(s), got ${params.length}`);
   }
@@ -584,7 +740,9 @@ export async function startChat({ phone, name = "", templateName, params = [], s
     body: JSON.stringify(payload),
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data?.error?.message || `Template send HTTP ${res.status}`);
+  if (!res.ok) {
+    throw new Error(humanizeMetaSendError(data, `Template send HTTP ${res.status}`));
+  }
   const wamid = data?.messages?.[0]?.id || "";
 
   const p = getPool();
@@ -616,7 +774,7 @@ export async function startChat({ phone, name = "", templateName, params = [], s
   params.forEach((v, i) => {
     rendered = rendered.split(`{{${i + 1}}}`).join(String(v));
   });
-  const raw = { type: "template", template: tpl.name, direction: "outbound" };
+  const raw = { type: "template", template: tpl.name, language: tpl.language, direction: "outbound" };
   const tag = String(agentTag || "").trim().slice(0, 40);
   if (tag) raw.agent_tag = tag;
   await p.query(
@@ -631,7 +789,7 @@ export async function startChat({ phone, name = "", templateName, params = [], s
     [now, contactId]
   );
   await autoLinkContacts().catch(() => {});
-  return { contactId, wamid };
+  return { contactId, wamid, existing: false, template: tpl.name };
 }
 
 /**

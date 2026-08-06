@@ -821,23 +821,46 @@ const SCRIPT = `
     function openNewChat() {
       var overlay = el("div", "wa-id-overlay");
       var card = el("div", "wa-id-card");
+      card.style.width = "min(420px, 94vw)";
       card.appendChild(el("h3", "", "New WhatsApp chat"));
-      card.appendChild(el("p", "", "WhatsApp requires an approved template for the FIRST message to someone who never wrote to us. Once they reply, the chat is free-form."));
+      card.appendChild(el("p", "", "To message someone who has NEVER written us, WhatsApp requires an approved template first. After they reply, free-form chat works. Numbers already in the inbox open immediately."));
       var phone = el("input", "wa-id-free");
-      phone.type = "text"; phone.placeholder = "Phone \\u2014 international digits, e.g. 972501234567"; phone.maxLength = 20;
+      phone.type = "tel"; phone.placeholder = "Phone \\u2014 972501234567 or 0501234567"; phone.maxLength = 22;
       var nameIn = el("input", "wa-id-free");
       nameIn.type = "text"; nameIn.placeholder = "Name (optional)"; nameIn.maxLength = 80;
       var tplSel = el("select", "wa-id-free");
       var bodyPrev = el("div", "wa-nc-body", "Loading templates\\u2026");
+      var pendingNote = el("div", "wa-nc-body", "");
+      pendingNote.style.display = "none";
+      pendingNote.style.background = "#fff7ed";
+      pendingNote.style.borderColor = "#fdba74";
+      pendingNote.style.color = "#9a3412";
       var varHost = el("div");
       var err = el("div", "wa-nc-err", "");
       var templates = [];
+      var pending = [];
+      function normalizeDigits(raw) {
+        var d = String(raw || "").replace(/\\D/g, "");
+        if (d.length === 10 && d.charAt(0) === "0") d = "972" + d.slice(1);
+        if (d.length === 9 && d.charAt(0) === "5") d = "972" + d;
+        return d;
+      }
       function renderTpl() {
         var t = templates[tplSel.selectedIndex];
         varHost.innerHTML = "";
-        if (!t) { bodyPrev.textContent = "No approved templates yet \\u2014 one is pending Meta approval; try again soon."; return; }
-        bodyPrev.textContent = t.body;
-        for (var i = 1; i <= t.varCount; i++) {
+        if (!t) {
+          bodyPrev.textContent = pending.length
+            ? ("No production template is APPROVED yet. Meta is still reviewing: " + pending.map(function (p) { return p.name + " (" + p.language + ")"; }).join(", ") + ". You can still open a number that already messaged us.")
+            : "No approved templates available.";
+          send.disabled = true;
+          send.textContent = "Waiting for Meta\\u2026";
+          openExisting.disabled = false;
+          return;
+        }
+        send.disabled = false;
+        send.textContent = "Send template";
+        bodyPrev.textContent = t.body || "(no body)";
+        for (var i = 1; i <= (t.varCount || 0); i++) {
           var vi = el("input", "wa-id-free");
           vi.type = "text"; vi.placeholder = "Value for {{" + i + "}}"; vi.maxLength = 500;
           vi.setAttribute("data-var", String(i));
@@ -845,45 +868,49 @@ const SCRIPT = `
         }
       }
       fetch("/__nesher_wa/templates/", { credentials: "same-origin", headers: { Accept: "application/json" } })
-        .then(function (r) { return r.json(); })
+        .then(function (r) { return r.json().then(function (d) { if (!r.ok) throw new Error(d.error || ("HTTP " + r.status)); return d; }); })
         .then(function (d) {
-          templates = d.templates || [];
+          templates = d.templates || d.approved || [];
+          pending = d.pending || [];
           tplSel.innerHTML = "";
-          templates.forEach(function (t) {
-            var o = el("option", "", t.name + " (" + t.language + ")");
-            tplSel.appendChild(o);
-          });
+          if (!templates.length) {
+            var empty = el("option", "", "\\u2014 no approved template yet \\u2014");
+            empty.disabled = true; empty.selected = true;
+            tplSel.appendChild(empty);
+          } else {
+            templates.forEach(function (t, idx) {
+              var o = document.createElement("option");
+              o.value = String(idx);
+              o.textContent = t.name + " (" + t.language + ")" + (t.varCount ? " \\u00B7 " + t.varCount + " field" + (t.varCount > 1 ? "s" : "") : "");
+              tplSel.appendChild(o);
+            });
+          }
+          if (pending.length) {
+            pendingNote.style.display = "block";
+            pendingNote.textContent = "Pending Meta approval: " + pending.map(function (p) { return p.name + " (" + p.language + ")"; }).join(", ") + ". Sample hello_world is hidden \\u2014 it only works on Meta test numbers.";
+          }
           renderTpl();
         })
-        .catch(function () { bodyPrev.textContent = "Could not load templates."; });
+        .catch(function (e) { bodyPrev.textContent = "Could not load templates: " + (e.message || e); });
       tplSel.addEventListener("change", renderTpl);
       var actions = el("div", "wa-id-actions");
       var cancel = el("button", "wa-id-cancel", "Cancel");
       cancel.type = "button";
       cancel.addEventListener("click", function () { overlay.remove(); });
-      var send = el("button", "wa-id-save", "Send");
+      var openExisting = el("button", "wa-id-cancel", "Open if exists");
+      openExisting.type = "button";
+      openExisting.title = "Open the chat if this number already wrote us \\u2014 no template needed";
+      var send = el("button", "wa-id-save", "Send template");
       send.type = "button";
-      send.addEventListener("click", function () {
+      function postNewChat(payload, busyLabel) {
         err.textContent = "";
-        var t = templates[tplSel.selectedIndex];
-        var digits = phone.value.replace(/\\D/g, "");
-        if (!t) { err.textContent = "No approved template available yet."; return; }
-        if (digits.length < 9) { err.textContent = "Enter the full international number (digits only)."; return; }
-        var params = [];
-        var ok = true;
-        qa("input[data-var]", varHost).forEach(function (vi) {
-          if (!vi.value.trim()) ok = false;
-          params.push(vi.value.trim());
-        });
-        if (!ok) { err.textContent = "Fill in every template value."; return; }
-        var who = "";
-        try { who = (localStorage.getItem("nesherWaAgentName") || "").trim(); } catch (e) {}
-        send.disabled = true; send.textContent = "Sending\\u2026";
-        fetch("/__nesher_wa/new-chat/", {
+        send.disabled = true; openExisting.disabled = true;
+        send.textContent = busyLabel || "Working\\u2026";
+        return fetch("/__nesher_wa/new-chat/", {
           method: "POST",
           credentials: "same-origin",
           headers: { "Content-Type": "application/json", "X-Requested-With": "XMLHttpRequest" },
-          body: JSON.stringify({ phone: digits, name: nameIn.value.trim(), templateName: t.name, params: params, agentTag: who })
+          body: JSON.stringify(payload)
         })
           .then(function (r) {
             return r.json().catch(function () { return {}; }).then(function (d) {
@@ -893,13 +920,39 @@ const SCRIPT = `
           })
           .then(function (d) { location.href = "/whatsapp/" + d.contactId + "/"; })
           .catch(function (e) {
-            send.disabled = false; send.textContent = "Send";
+            send.disabled = !templates.length;
+            openExisting.disabled = false;
+            send.textContent = templates.length ? "Send template" : "Waiting for Meta\\u2026";
             err.textContent = e.message || String(e);
           });
+      }
+      openExisting.addEventListener("click", function () {
+        var digits = normalizeDigits(phone.value);
+        if (digits.length < 9) { err.textContent = "Enter the full number (972\\u2026 or 05\\u2026)."; return; }
+        var who = "";
+        try { who = (localStorage.getItem("nesherWaAgentName") || "").trim(); } catch (e) {}
+        postNewChat({ phone: digits, name: nameIn.value.trim(), openExistingOnly: true, agentTag: who }, "Looking\\u2026");
       });
-      actions.appendChild(cancel); actions.appendChild(send);
+      send.addEventListener("click", function () {
+        err.textContent = "";
+        var t = templates[tplSel.selectedIndex];
+        var digits = normalizeDigits(phone.value);
+        if (!t) { err.textContent = "No approved production template yet \\u2014 Meta is still reviewing. Use Open if exists for numbers already in the inbox."; return; }
+        if (digits.length < 9) { err.textContent = "Enter the full number (972\\u2026 or 05\\u2026)."; return; }
+        var params = [];
+        var ok = true;
+        qa("input[data-var]", varHost).forEach(function (vi) {
+          if (!vi.value.trim()) ok = false;
+          params.push(vi.value.trim());
+        });
+        if (!ok) { err.textContent = "Fill in every template value."; return; }
+        var who = "";
+        try { who = (localStorage.getItem("nesherWaAgentName") || "").trim(); } catch (e) {}
+        postNewChat({ phone: digits, name: nameIn.value.trim(), templateName: t.name, params: params, agentTag: who }, "Sending\\u2026");
+      });
+      actions.appendChild(cancel); actions.appendChild(openExisting); actions.appendChild(send);
       card.appendChild(phone); card.appendChild(nameIn); card.appendChild(tplSel);
-      card.appendChild(bodyPrev); card.appendChild(varHost); card.appendChild(err); card.appendChild(actions);
+      card.appendChild(bodyPrev); card.appendChild(pendingNote); card.appendChild(varHost); card.appendChild(err); card.appendChild(actions);
       overlay.appendChild(card);
       overlay.addEventListener("click", function (ev) { if (ev.target === overlay) overlay.remove(); });
       document.body.appendChild(overlay);

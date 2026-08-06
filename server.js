@@ -33,6 +33,8 @@ import {
   listAgents,
   transcribeMessage,
   listApprovedTemplates,
+  listTemplates,
+  findContactByPhone,
   startChat,
   whatsappByCustomer,
 } from "./whatsapp-media.js";
@@ -606,7 +608,7 @@ const server = http.createServer(async (req, res) => {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-08-05-mercury-relay-2",
+      build: "2026-08-06-wa-newchat-fix",
       upstream: UPSTREAM,
       paySync: lastPaySync
         ? {
@@ -681,7 +683,27 @@ const server = http.createServer(async (req, res) => {
   if (/^\/__nesher_wa\/templates\/?$/.test(url.pathname)) {
     if (!(await requireStaff(req, res))) return;
     try {
-      sendJson(res, 200, { ok: true, templates: await listApprovedTemplates() });
+      const all = await listTemplates();
+      const templates = all.filter((t) => t.status === "APPROVED" && !t.sample);
+      const pending = all.filter((t) => t.status === "PENDING" && !t.sample);
+      sendJson(res, 200, {
+        ok: true,
+        templates,
+        pending,
+        // keep approved-only helper for older UI clients
+        approved: await listApprovedTemplates(),
+      });
+    } catch (e) {
+      sendJson(res, 500, { error: e.message });
+    }
+    return;
+  }
+  if (/^\/__nesher_wa\/find-contact\/?$/.test(url.pathname)) {
+    if (!(await requireStaff(req, res))) return;
+    try {
+      const phone = url.searchParams.get("phone") || "";
+      const hit = await findContactByPhone(phone);
+      sendJson(res, 200, { ok: true, contact: hit });
     } catch (e) {
       sendJson(res, 500, { error: e.message });
     }
@@ -705,6 +727,7 @@ const server = http.createServer(async (req, res) => {
         params: Array.isArray(body.params) ? body.params : [],
         sentById,
         agentTag: typeof body.agentTag === "string" ? body.agentTag : "",
+        openExistingOnly: Boolean(body.openExistingOnly),
       });
       sendJson(res, 200, { ok: true, ...out });
     } catch (e) {
