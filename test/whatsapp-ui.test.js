@@ -54,3 +54,21 @@ test("template-literal escaping kept regexes intact in the emitted script", () =
     assert.ok(body.includes(probe), "missing regex: " + probe);
   }
 });
+
+test("injected script can render image / media bubbles", () => {
+  const out = injectWhatsAppUi(sample, "/whatsapp/4/");
+  const m = out.match(/<script id="nesher-wa-ui-js">([\s\S]*?)<\/script>/);
+  assert.ok(m, "script block present");
+  const body = m[1];
+  for (const probe of [
+    "isImageMsg",
+    "mediaBubbleBody",
+    "wa-has-media",
+    "openLightbox",
+    "__nesher_wa/media/",
+    "image message received",
+  ]) {
+    assert.ok(body.includes(probe), "missing image UI piece: " + probe);
+  }
+  assert.match(out, /wa-media|wa-lightbox/);
+});

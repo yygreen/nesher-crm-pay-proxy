@@ -453,6 +453,69 @@ const CSS = `
   }
   .wa-voice-tag svg { width: 13px; height: 13px; }
 
+  /* Image / video / sticker / document media */
+  .wa-bubble.wa-has-media { padding: 4px 4px 5px; max-width: min(78%, 420px); }
+  .wa-media { position: relative; border-radius: 7px; overflow: hidden; background: rgba(11,20,26,0.06); }
+  .wa-media img, .wa-media video {
+    display: block; width: 100%; max-height: 360px; object-fit: contain;
+    background: #0b141a0a; cursor: zoom-in; vertical-align: middle;
+  }
+  .wa-media.wa-sticker {
+    background: transparent; max-width: 180px;
+  }
+  .wa-media.wa-sticker img {
+    max-height: 180px; width: auto; max-width: 180px; cursor: default;
+    background: transparent;
+  }
+  .wa-media-fallback {
+    padding: 28px 18px; text-align: center; color: var(--wa-faint);
+    font-size: 13px; min-width: 160px;
+  }
+  .wa-media-caption {
+    white-space: pre-wrap; unicode-bidi: plaintext;
+    padding: 6px 6px 2px; font-size: 14.5px; line-height: 1.42;
+  }
+  .wa-doc {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 10px; min-width: 200px; max-width: 320px;
+    border-radius: 8px; background: rgba(11,20,26,0.05);
+    text-decoration: none; color: inherit;
+  }
+  .wa-doc:hover { background: rgba(11,20,26,0.09); }
+  .wa-doc-icon {
+    width: 40px; height: 40px; border-radius: 10px; flex-shrink: 0;
+    background: var(--wa-green); color: #fff;
+    display: grid; place-items: center; font-size: 11px; font-weight: 800;
+    letter-spacing: .02em;
+  }
+  .wa-doc-meta { min-width: 0; flex: 1; }
+  .wa-doc-name {
+    font-size: 13.5px; font-weight: 600; color: var(--wa-ink);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .wa-doc-sub { font-size: 11.5px; color: var(--wa-faint); margin-top: 2px; }
+
+  /* Fullscreen image lightbox */
+  .wa-lightbox {
+    position: fixed; inset: 0; z-index: 10050;
+    background: rgba(11,20,26,0.88);
+    display: flex; align-items: center; justify-content: center;
+    padding: 24px; cursor: zoom-out;
+  }
+  .wa-lightbox img {
+    max-width: min(96vw, 1200px); max-height: 92vh;
+    object-fit: contain; border-radius: 6px;
+    box-shadow: 0 12px 48px rgba(0,0,0,0.45);
+    cursor: default;
+  }
+  .wa-lightbox-close {
+    position: absolute; top: 16px; right: 18px;
+    border: none; background: rgba(255,255,255,0.12); color: #fff;
+    width: 40px; height: 40px; border-radius: 50%; cursor: pointer;
+    display: grid; place-items: center; font-size: 22px; line-height: 1;
+  }
+  .wa-lightbox-close:hover { background: rgba(255,255,255,0.22); }
+
   /* Jump-to-latest */
   .wa-jump {
     position: absolute; right: 22px; bottom: 86px; z-index: 5;
@@ -782,12 +845,69 @@ const SCRIPT = `
     return span;
   }
   function isAudioMsg(m) {
-    return m.messageType === "audio" || /^\\[(voice note|audio)/i.test(String(m.body || ""));
+    return m.messageType === "audio" || m.mediaKind === "audio" ||
+      /^\\[(voice note|audio)/i.test(String(m.body || ""));
+  }
+  function isImageMsg(m) {
+    return m.messageType === "image" || m.mediaKind === "image" ||
+      /^\\[image/i.test(String(m.body || ""));
+  }
+  function isVideoMsg(m) {
+    return m.messageType === "video" || m.mediaKind === "video" ||
+      /^\\[video/i.test(String(m.body || ""));
+  }
+  function isStickerMsg(m) {
+    return m.messageType === "sticker" || m.mediaKind === "sticker" ||
+      /^\\[sticker/i.test(String(m.body || ""));
+  }
+  function isDocMsg(m) {
+    return m.messageType === "document" || m.mediaKind === "document" ||
+      /^\\[document/i.test(String(m.body || ""));
+  }
+  function mediaUrl(mediaId) {
+    return "/__nesher_wa/media/" + encodeURIComponent(mediaId) + "/";
+  }
+  function captionOf(m) {
+    var c = String(m.caption || "").trim();
+    if (c) return c;
+    var b = String(m.body || "").trim();
+    // Django stores placeholders like "[image message received]" — never show those as caption
+    if (!b || /^\\[(image|video|sticker|document|voice note|audio)/i.test(b)) return "";
+    return b;
+  }
+  function openLightbox(src) {
+    var existing = q(".wa-lightbox");
+    if (existing) existing.remove();
+    var lb = el("div", "wa-lightbox");
+    var img = document.createElement("img");
+    img.src = src;
+    img.alt = "Photo";
+    var close = el("button", "wa-lightbox-close", "\\u00D7");
+    close.type = "button";
+    close.setAttribute("aria-label", "Close");
+    function dismiss() { lb.remove(); document.removeEventListener("keydown", onKey); }
+    function onKey(ev) { if (ev.key === "Escape") dismiss(); }
+    close.addEventListener("click", function (ev) { ev.stopPropagation(); dismiss(); });
+    lb.addEventListener("click", dismiss);
+    img.addEventListener("click", function (ev) { ev.stopPropagation(); });
+    lb.appendChild(img);
+    lb.appendChild(close);
+    document.body.appendChild(lb);
+    document.addEventListener("keydown", onKey);
   }
   function previewFor(m) {
     if (!m) return { text: "No messages yet", voice: false };
     if (isAudioMsg(m)) return { text: m.voice !== false ? "Voice note" : "Audio", voice: true };
-    return { text: String(m.body || "").replace(/\\s+/g, " ").trim(), voice: false };
+    if (isImageMsg(m)) {
+      var ic = captionOf(m);
+      return { text: ic ? ("Photo \\u00B7 " + ic) : "Photo", voice: false };
+    }
+    if (isVideoMsg(m)) return { text: captionOf(m) ? ("Video \\u00B7 " + captionOf(m)) : "Video", voice: false };
+    if (isStickerMsg(m)) return { text: "Sticker", voice: false };
+    if (isDocMsg(m)) return { text: m.filename || "Document", voice: false };
+    var plain = String(m.body || "").replace(/\\s+/g, " ").trim();
+    if (/^\\[image message received\\]/i.test(plain)) return { text: "Photo", voice: false };
+    return { text: plain, voice: false };
   }
 
   /* ══════════ INBOX ══════════ */
@@ -1442,6 +1562,75 @@ const SCRIPT = `
       return wrap;
     }
 
+    function mediaBubbleBody(mUi, kind) {
+      var wrap = el("div");
+      var cap = captionOf(mUi);
+      if (!mUi.mediaId) {
+        wrap.appendChild(el("div", "wa-media-fallback",
+          kind === "video" ? "Video unavailable" :
+          kind === "sticker" ? "Sticker unavailable" :
+          kind === "document" ? (mUi.filename || "Document unavailable") :
+          "Photo unavailable"));
+        if (cap) {
+          var c0 = el("div", "wa-media-caption");
+          c0.appendChild(linkify(cap));
+          wrap.appendChild(c0);
+        }
+        return wrap;
+      }
+      var src = mediaUrl(mUi.mediaId);
+      if (kind === "document") {
+        var a = el("a", "wa-doc");
+        a.href = src;
+        a.target = "_blank";
+        a.rel = "noopener";
+        a.download = mUi.filename || "document";
+        var ext = String(mUi.filename || mUi.mimeType || "FILE").split(/[./]/).pop().slice(0, 4).toUpperCase() || "FILE";
+        a.appendChild(el("div", "wa-doc-icon", ext));
+        var meta = el("div", "wa-doc-meta");
+        meta.appendChild(el("div", "wa-doc-name", mUi.filename || "Document"));
+        meta.appendChild(el("div", "wa-doc-sub", "Tap to download"));
+        a.appendChild(meta);
+        wrap.appendChild(a);
+        if (cap) {
+          var cDoc = el("div", "wa-media-caption");
+          cDoc.appendChild(linkify(cap));
+          wrap.appendChild(cDoc);
+        }
+        return wrap;
+      }
+      var box = el("div", "wa-media" + (kind === "sticker" ? " wa-sticker" : ""));
+      if (kind === "video") {
+        var vid = document.createElement("video");
+        vid.src = src;
+        vid.controls = true;
+        vid.preload = "metadata";
+        vid.playsInline = true;
+        box.appendChild(vid);
+      } else {
+        var img = document.createElement("img");
+        img.src = src;
+        img.alt = kind === "sticker" ? "Sticker" : "Photo";
+        img.loading = "lazy";
+        img.addEventListener("error", function () {
+          box.innerHTML = "";
+          box.appendChild(el("div", "wa-media-fallback",
+            kind === "sticker" ? "Sticker expired or unavailable" : "Photo expired or unavailable"));
+        });
+        if (kind !== "sticker") {
+          img.addEventListener("click", function () { openLightbox(src); });
+        }
+        box.appendChild(img);
+      }
+      wrap.appendChild(box);
+      if (cap) {
+        var c1 = el("div", "wa-media-caption");
+        c1.appendChild(linkify(cap));
+        wrap.appendChild(c1);
+      }
+      return wrap;
+    }
+
     /* thread rendering — append-only diff so audio playback survives polls */
     var rendered = {};       // id -> {node, status, tickEl}
     var lastDayK = null;
@@ -1474,6 +1663,18 @@ const SCRIPT = `
       if (dir === "out") lastOutSender = who || lastOutSender;
       if (isAudioMsg(mUi)) {
         bub.appendChild(audioBubbleBody(mUi));
+      } else if (isImageMsg(mUi)) {
+        bub.classList.add("wa-has-media");
+        bub.appendChild(mediaBubbleBody(mUi, "image"));
+      } else if (isVideoMsg(mUi)) {
+        bub.classList.add("wa-has-media");
+        bub.appendChild(mediaBubbleBody(mUi, "video"));
+      } else if (isStickerMsg(mUi)) {
+        bub.classList.add("wa-has-media");
+        bub.appendChild(mediaBubbleBody(mUi, "sticker"));
+      } else if (isDocMsg(mUi)) {
+        bub.classList.add("wa-has-media");
+        bub.appendChild(mediaBubbleBody(mUi, "document"));
       } else {
         var txt = el("div", "wa-text");
         txt.appendChild(linkify(mUi.body || ""));

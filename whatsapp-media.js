@@ -254,6 +254,53 @@ export async function markContactRead(contactId) {
 }
 
 /**
+ * Pull media metadata out of a WhatsApp Cloud API message raw_payload.
+ * Handles the common CRM shapes: top-level { image|audio|…: { id } }, nested
+ * under message / messages[0] / entry…value.messages[0], and message_type alone.
+ * Returns null when no media id is present.
+ */
+export function extractWaMedia(raw, messageType) {
+  const root = raw && typeof raw === "object" ? raw : {};
+  const candidates = [root];
+  if (root.message && typeof root.message === "object") candidates.push(root.message);
+  if (Array.isArray(root.messages) && root.messages[0]) candidates.push(root.messages[0]);
+  // Full webhook envelope occasionally stored whole
+  try {
+    const msgs = root.entry?.[0]?.changes?.[0]?.value?.messages;
+    if (Array.isArray(msgs) && msgs[0]) candidates.push(msgs[0]);
+  } catch {
+    /* ignore */
+  }
+
+  const kinds = ["image", "video", "sticker", "document", "audio"];
+  const prefer = String(messageType || root.type || "")
+    .toLowerCase()
+    .replace(/[^a-z]/g, "");
+  if (prefer && kinds.includes(prefer)) {
+    kinds.splice(kinds.indexOf(prefer), 1);
+    kinds.unshift(prefer);
+  }
+
+  for (const obj of candidates) {
+    if (!obj || typeof obj !== "object") continue;
+    for (const kind of kinds) {
+      const m = obj[kind];
+      if (m && typeof m === "object" && (m.id || m.link)) {
+        return {
+          mediaId: m.id ? String(m.id) : null,
+          mediaKind: kind,
+          voice: Boolean(m.voice),
+          mimeType: m.mime_type || null,
+          caption: m.caption ? String(m.caption) : null,
+          filename: m.filename ? String(m.filename) : null,
+        };
+      }
+    }
+  }
+  return null;
+}
+
+/**
  * List messages for a contact (newest last for chat UI).
  */
 export async function listContactMessages(contactId, limit = 100) {
@@ -273,7 +320,7 @@ export async function listContactMessages(contactId, limit = 100) {
   );
   return r.rows.map((row) => {
     const raw = row.raw_payload || {};
-    const audio = raw.audio || {};
+    const media = extractWaMedia(raw, row.message_type);
     return {
       id: Number(row.id),
       direction: row.direction,
@@ -283,9 +330,12 @@ export async function listContactMessages(contactId, limit = 100) {
       wamid: row.whatsapp_message_id,
       messageAt: row.message_at,
       error: row.error_message || "",
-      mediaId: audio.id || null,
-      voice: Boolean(audio.voice),
-      mimeType: audio.mime_type || null,
+      mediaId: media?.mediaId || null,
+      mediaKind: media?.mediaKind || null,
+      voice: media?.mediaKind === "audio" ? Boolean(media.voice) : false,
+      mimeType: media?.mimeType || null,
+      caption: media?.caption || null,
+      filename: media?.filename || null,
       sentBy: row.sender || null,
       agentTag: (raw.agent_tag || "").trim() || null,
       transcriptEn: String(raw.transcript_en || "").trim() || null,
