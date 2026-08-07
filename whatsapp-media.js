@@ -556,44 +556,8 @@ function bodyFromPayload(rowBody, raw, messageType) {
   return body;
 }
 
-/**
- * List messages for a contact (newest last for chat UI).
- * Returns { messages, meta }. Reactions fold onto their target bubble when possible.
- * CRITICAL: take the newest N rows, then sort ASC for chat display (old LIMIT ASC
- * silently hid new messages once a thread grew past the cap).
- */
-export async function listContactMessages(contactId, limit = 200) {
-  const p = getPool();
-  const id = Number(contactId);
-  const lim = Math.min(Math.max(Number(limit) || 200, 1), 500);
-  const r = await p.query(
-    `SELECT * FROM (
-       SELECT m.id, m.direction, m.status, m.message_type, m.body, m.whatsapp_message_id,
-              m.raw_payload, m.error_message, m.message_at, m.created_at, m.sent_by_id,
-              COALESCE(NULLIF(TRIM(u.first_name || ' ' || u.last_name), ''), u.username) AS sender
-       FROM core_whatsappmessage m
-       LEFT JOIN auth_user u ON u.id = m.sent_by_id
-       WHERE m.contact_id = $1
-       ORDER BY m.message_at DESC, m.id DESC
-       LIMIT $2
-     ) recent
-     ORDER BY message_at ASC, id ASC`,
-    [id, lim]
-  );
-  const totalR = await p.query(
-    `SELECT count(*)::int AS n,
-            max(message_at) FILTER (WHERE direction = 'inbound') AS last_inbound_at
-     FROM core_whatsappmessage WHERE contact_id = $1`,
-    [id]
-  );
-  const total = totalR.rows[0]?.n || 0;
-  const lastInboundAt = totalR.rows[0]?.last_inbound_at || null;
-  const freeFormOpenUntil = lastInboundAt
-    ? new Date(new Date(lastInboundAt).getTime() + 24 * 60 * 60 * 1000)
-    : null;
-  const freeFormOpen = freeFormOpenUntil ? freeFormOpenUntil.getTime() > Date.now() : false;
-
-  const mapped = r.rows.map((row) => {
+function mapMessageRows(rows) {
+  const mapped = rows.map((row) => {
     const raw = row.raw_payload || {};
     const media = extractWaMedia(raw, row.message_type);
     const structured = extractWaStructured(raw, row.message_type);
@@ -641,12 +605,11 @@ export async function listContactMessages(contactId, limit = 200) {
           direction: m.direction,
           id: m.id,
         });
-        continue; // fold into target bubble — no standalone row
+        continue;
       }
     }
     out.push(m);
   }
-  // Attach reply-quote previews once the final list is known
   for (const m of out) {
     if (!m.contextWamid) continue;
     const t = byWamid.get(String(m.contextWamid));
@@ -672,17 +635,124 @@ export async function listContactMessages(contactId, limit = 200) {
       id: t.id,
     };
   }
+  return out;
+}
+
+/**
+ * List messages for a contact (newest last for chat UI).
+ * opts: { limit, beforeId } — beforeId loads older page (cursor = that message id).
+ * Returns { messages, meta }.
+ */
+export async function listContactMessages(contactId, limitOrOpts = 200) {
+  const opts =
+    typeof limitOrOpts === "object" && limitOrOpts
+      ? limitOrOpts
+      : { limit: limitOrOpts };
+  const p = getPool();
+  const id = Number(contactId);
+  const lim = Math.min(Math.max(Number(opts.limit) || 200, 1), 500);
+  const beforeId = opts.beforeId != null ? Number(opts.beforeId) : null;
+
+  let r;
+  if (beforeId && Number.isFinite(beforeId)) {
+    // Older page: messages strictly before the cursor row (by time, then id).
+    r = await p.query(
+      `SELECT * FROM (
+         SELECT m.id, m.direction, m.status, m.message_type, m.body, m.whatsapp_message_id,
+                m.raw_payload, m.error_message, m.message_at, m.created_at, m.sent_by_id,
+                COALESCE(NULLIF(TRIM(u.first_name || ' ' || u.last_name), ''), u.username) AS sender
+         FROM core_whatsappmessage m
+         LEFT JOIN auth_user u ON u.id = m.sent_by_id
+         WHERE m.contact_id = $1
+           AND (m.message_at, m.id) < (
+             SELECT message_at, id FROM core_whatsappmessage WHERE id = $2 AND contact_id = $1
+           )
+         ORDER BY m.message_at DESC, m.id DESC
+         LIMIT $3
+       ) older
+       ORDER BY message_at ASC, id ASC`,
+      [id, beforeId, lim]
+    );
+  } else {
+    r = await p.query(
+      `SELECT * FROM (
+         SELECT m.id, m.direction, m.status, m.message_type, m.body, m.whatsapp_message_id,
+                m.raw_payload, m.error_message, m.message_at, m.created_at, m.sent_by_id,
+                COALESCE(NULLIF(TRIM(u.first_name || ' ' || u.last_name), ''), u.username) AS sender
+         FROM core_whatsappmessage m
+         LEFT JOIN auth_user u ON u.id = m.sent_by_id
+         WHERE m.contact_id = $1
+         ORDER BY m.message_at DESC, m.id DESC
+         LIMIT $2
+       ) recent
+       ORDER BY message_at ASC, id ASC`,
+      [id, lim]
+    );
+  }
+
+  const totalR = await p.query(
+    `SELECT count(*)::int AS n,
+            max(message_at) FILTER (WHERE direction = 'inbound') AS last_inbound_at,
+            min(id) AS min_id
+     FROM core_whatsappmessage WHERE contact_id = $1`,
+    [id]
+  );
+  const total = totalR.rows[0]?.n || 0;
+  const lastInboundAt = totalR.rows[0]?.last_inbound_at || null;
+  const freeFormOpenUntil = lastInboundAt
+    ? new Date(new Date(lastInboundAt).getTime() + 24 * 60 * 60 * 1000)
+    : null;
+  const freeFormOpen = freeFormOpenUntil ? freeFormOpenUntil.getTime() > Date.now() : false;
+
+  const out = mapMessageRows(r.rows);
+  const oldestId = out.length ? out[0].id : null;
+  const newestId = out.length ? out[out.length - 1].id : null;
+  const minId = totalR.rows[0]?.min_id != null ? Number(totalR.rows[0].min_id) : null;
+  // More history exists if the oldest row we returned is not the thread's first row.
+  const hasMoreOlder = oldestId != null && minId != null && Number(oldestId) !== Number(minId);
 
   return {
     messages: out,
     meta: {
       total,
       returned: out.length,
-      truncated: total > lim,
+      truncated: total > out.length,
+      hasMoreOlder: Boolean(hasMoreOlder && oldestId),
+      oldestId,
+      newestId,
+      beforeId: beforeId || null,
       lastInboundAt,
       freeFormOpenUntil: freeFormOpenUntil ? freeFormOpenUntil.toISOString() : null,
       freeFormOpen,
     },
+  };
+}
+
+/**
+ * Send an approved template into an existing contact thread (re-open 24h window).
+ */
+export async function sendContactTemplate({
+  contactId,
+  templateName,
+  params = [],
+  sentById = null,
+  agentTag = "",
+}) {
+  const contact = await getContact(contactId);
+  const out = await startChat({
+    phone: contact.phone_number,
+    name: contact.display_name || "",
+    templateName,
+    params,
+    sentById,
+    agentTag,
+    openExistingOnly: false,
+  });
+  return {
+    ok: true,
+    contactId: Number(contact.id),
+    wamid: out.wamid,
+    template: out.template,
   };
 }
 

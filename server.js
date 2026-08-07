@@ -29,6 +29,7 @@ import {
   markContactRead,
   sendContactAudio,
   sendContactMedia,
+  sendContactTemplate,
   sessionUserId,
   stampAgentTag,
   listAgents,
@@ -39,6 +40,12 @@ import {
   startChat,
   whatsappByCustomer,
 } from "./whatsapp-media.js";
+import {
+  verifyWebhookChallenge,
+  verifyWebhookSignature,
+  processWhatsAppWebhook,
+  webhookVerifyToken,
+} from "./whatsapp-webhook.js";
 
 const PORT = Number(process.env.PORT || 8080);
 const UPSTREAM =
@@ -406,12 +413,16 @@ async function handleWaMessages(req, res, contactId, query) {
   if (!(await requireStaff(req, res))) return;
   try {
     const contact = await getContact(contactId);
-    const lim = Number(query?.get("limit") || 200);
-    const pack = await listContactMessages(contactId, lim);
-    // Backward-compatible: listContactMessages returns {messages, meta}
+    const lim = Number(query?.get("limit") || 80);
+    const beforeRaw = query?.get("before_id") || query?.get("beforeId");
+    const beforeId = beforeRaw ? Number(beforeRaw) : null;
+    const pack = await listContactMessages(contactId, {
+      limit: lim,
+      beforeId: Number.isFinite(beforeId) ? beforeId : null,
+    });
     const messages = Array.isArray(pack) ? pack : pack.messages || [];
     const meta = Array.isArray(pack) ? {} : pack.meta || {};
-    if (query && query.get("read") === "1") {
+    if (query && query.get("read") === "1" && !beforeId) {
       markContactRead(contactId).catch((e) =>
         console.warn("mark read failed", e.message)
       );
@@ -430,6 +441,82 @@ async function handleWaMessages(req, res, contactId, query) {
   } catch (e) {
     console.error("wa messages", e.message);
     sendJson(res, 400, { error: e.message || String(e) });
+  }
+}
+
+async function handleWaSendTemplate(req, res, contactId) {
+  if (req.method !== "POST") {
+    sendJson(res, 405, { error: "POST only" });
+    return;
+  }
+  if (!(await requireStaff(req, res))) return;
+  try {
+    const body = await readJson(req);
+    const sentById = await sessionUserId(
+      extractSessionId(String(req.headers.cookie || ""))
+    );
+    const out = await sendContactTemplate({
+      contactId,
+      templateName: String(body.templateName || body.template || ""),
+      params: Array.isArray(body.params) ? body.params : [],
+      sentById,
+      agentTag: typeof body.agentTag === "string" ? body.agentTag : "",
+    });
+    sendJson(res, 200, out);
+  } catch (e) {
+    console.error("wa send-template", e.message);
+    sendJson(res, 400, { error: e.message || String(e) });
+  }
+}
+
+async function handleWaWebhook(req, res, url) {
+  // Public Meta endpoint — no staff session.
+  if (req.method === "GET") {
+    const result = verifyWebhookChallenge(url.searchParams);
+    if (!result.ok) {
+      sendJson(res, result.status || 403, { error: result.error });
+      return;
+    }
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end(result.challenge);
+    return;
+  }
+  if (req.method !== "POST") {
+    sendJson(res, 405, { error: "GET (verify) or POST (events) only" });
+    return;
+  }
+  try {
+    const rawBuf = await readBodyBuffer(req, 5 * 1024 * 1024);
+    const sig = req.headers["x-hub-signature-256"] || req.headers["X-Hub-Signature-256"];
+    const sigCheck = verifyWebhookSignature(rawBuf, sig);
+    if (!sigCheck.ok) {
+      console.warn("wa webhook signature", sigCheck.error);
+      sendJson(res, 403, { error: sigCheck.error || "bad signature" });
+      return;
+    }
+    let body = {};
+    try {
+      body = JSON.parse(rawBuf.toString("utf8") || "{}");
+    } catch {
+      sendJson(res, 400, { error: "invalid JSON" });
+      return;
+    }
+    // Respond 200 quickly; Meta retries on slow/non-200.
+    const summary = await processWhatsAppWebhook(body);
+    if (summary.errors.length) console.warn("wa webhook errors", summary.errors);
+    else if (summary.statuses.updated || summary.messages.inserted) {
+      console.log(
+        "wa webhook",
+        `status+${summary.statuses.updated}`,
+        `msg+${summary.messages.inserted}`,
+        `media warm queued`
+      );
+    }
+    sendJson(res, 200, { ok: true, ...summary });
+  } catch (e) {
+    console.error("wa webhook", e.message);
+    // Still 200 when possible so Meta doesn't storm — but parse failures already handled.
+    sendJson(res, 200, { ok: false, error: e.message || String(e) });
   }
 }
 
@@ -669,7 +756,7 @@ const server = http.createServer(async (req, res) => {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-08-07-wa-40-hardens",
+      build: "2026-08-07-wa-webhook-page",
       upstream: UPSTREAM,
       paySync: lastPaySync
         ? {
@@ -686,7 +773,17 @@ const server = http.createServer(async (req, res) => {
       hasDb: Boolean(process.env.DATABASE_URL || process.env.DATABASE_PUBLIC_URL),
       hasWhatsApp: wa.configured,
       hasMercuryRelay: (process.env.MERCURY_RELAY_KEY || "").length >= 24,
+      whatsappWebhook: {
+        path: "/__nesher_wa/webhook/",
+        verifyTokenConfigured: Boolean(webhookVerifyToken()),
+      },
     });
+    return;
+  }
+
+  // ── Meta WhatsApp webhook (public — no staff session) ───────────────
+  if (/^\/__nesher_wa\/webhook\/?$/.test(url.pathname)) {
+    await handleWaWebhook(req, res, url);
     return;
   }
 
@@ -721,6 +818,13 @@ const server = http.createServer(async (req, res) => {
   );
   if (waSendMediaMatch) {
     await handleWaSendMedia(req, res, waSendMediaMatch[1]);
+    return;
+  }
+  const waSendTplMatch = url.pathname.match(
+    /^\/__nesher_wa\/contact\/(\d+)\/send-template\/?$/
+  );
+  if (waSendTplMatch) {
+    await handleWaSendTemplate(req, res, waSendTplMatch[1]);
     return;
   }
 

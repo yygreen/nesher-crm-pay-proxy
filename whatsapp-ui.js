@@ -636,11 +636,28 @@ const CSS = `
     background: #e8f8ef;
   }
 
-  /* Truncation notice */
+  /* Truncation notice / load older */
   .wa-trunc {
     text-align: center; font-size: 12px; color: var(--wa-faint);
     padding: 6px 10px; margin: 4px 0 8px;
   }
+  .wa-load-older {
+    display: flex; justify-content: center;
+    padding: 8px 10px 4px;
+  }
+  .wa-load-older button {
+    border: 1px solid var(--wa-divider); background: #fff;
+    color: var(--wa-green); font-weight: 700; font-size: 12.5px;
+    border-radius: 999px; padding: 7px 16px; cursor: pointer;
+  }
+  .wa-load-older button:hover { background: #f0faf6; }
+  .wa-load-older button:disabled { opacity: .55; cursor: wait; }
+  .wa-tpl-btn {
+    border: none; background: var(--wa-green); color: #fff;
+    font-weight: 700; font-size: 12.5px; border-radius: 999px;
+    padding: 6px 12px; cursor: pointer; white-space: nowrap;
+  }
+  .wa-tpl-btn:hover { background: var(--wa-green-deep); }
 
   /* Jump-to-latest */
   .wa-jump {
@@ -2138,48 +2155,193 @@ const SCRIPT = `
 
     var loading = el("div", "wa-empty", "Loading conversation\\u2026");
     msgs.appendChild(loading);
-    var truncNote = null;
+    var loadOlderHost = el("div", "wa-load-older");
+    loadOlderHost.style.display = "none";
+    var loadOlderBtn = el("button", "", "Load older messages");
+    loadOlderBtn.type = "button";
+    loadOlderHost.appendChild(loadOlderBtn);
     var windowBanner = el("div", "wa-window-banner");
     pane.appendChild(windowBanner);
     var freeFormOpen = true;
     var sending = false;
+    var threadMeta = null;
+    var allMessages = [];
+    var loadingOlder = false;
+
+    function openTemplatePicker() {
+      var who = agentName();
+      if (!who) { openIdentityPicker(function () { openTemplatePicker(); }); return; }
+      var overlay = el("div", "wa-id-overlay");
+      var card = el("div", "wa-id-card");
+      card.style.maxWidth = "420px";
+      card.appendChild(el("h3", "", "Send template to re-open"));
+      card.appendChild(el("p", "", "Free-form is closed after 24h. An approved template re-opens the chat so you can text/send media again."));
+      var tplSel = el("select");
+      tplSel.style.cssText = "width:100%;margin:8px 0;padding:8px;border-radius:8px;border:1px solid #dfe5e7";
+      var varHost = el("div");
+      var err = el("div", "");
+      err.style.cssText = "color:#b91c1c;font-size:13px;margin:6px 0;min-height:1.2em";
+      var actions = el("div");
+      actions.style.cssText = "display:flex;gap:8px;justify-content:flex-end;margin-top:12px";
+      var cancel = el("button", "wa-id-cancel", "Cancel");
+      cancel.type = "button";
+      var send = el("button", "wa-id-save", "Send template");
+      send.type = "button";
+      send.disabled = true;
+      var templates = [];
+      function renderVars() {
+        varHost.innerHTML = "";
+        var t = templates[tplSel.selectedIndex];
+        if (!t || !t.varCount) return;
+        for (var i = 0; i < t.varCount; i++) {
+          var lab = el("label", "", "Value {{" + (i + 1) + "}}");
+          lab.style.cssText = "display:block;font-size:12px;font-weight:600;margin:8px 0 4px";
+          var inp = el("input");
+          inp.type = "text";
+          inp.setAttribute("data-var", String(i));
+          inp.style.cssText = "width:100%;box-sizing:border-box;padding:8px;border-radius:8px;border:1px solid #dfe5e7";
+          varHost.appendChild(lab);
+          varHost.appendChild(inp);
+        }
+      }
+      fetch("/__nesher_wa/templates/", { credentials: "same-origin", headers: { Accept: "application/json" } })
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+          templates = d.templates || [];
+          tplSel.innerHTML = "";
+          if (!templates.length) {
+            err.textContent = "No approved production templates yet.";
+            return;
+          }
+          templates.forEach(function (t) {
+            var o = document.createElement("option");
+            o.value = t.name;
+            o.textContent = t.name + " (" + (t.language || "?") + ")";
+            tplSel.appendChild(o);
+          });
+          send.disabled = false;
+          renderVars();
+        })
+        .catch(function (e) { err.textContent = e.message || String(e); });
+      tplSel.addEventListener("change", renderVars);
+      cancel.addEventListener("click", function () { overlay.remove(); });
+      send.addEventListener("click", function () {
+        var t = templates[tplSel.selectedIndex];
+        if (!t) return;
+        var params = [];
+        var ok = true;
+        qa("input[data-var]", varHost).forEach(function (vi) {
+          if (!vi.value.trim()) ok = false;
+          params.push(vi.value.trim());
+        });
+        if (!ok) { err.textContent = "Fill every template value."; return; }
+        send.disabled = true;
+        send.textContent = "Sending\\u2026";
+        fetch("/__nesher_wa/contact/" + contactId + "/send-template/", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json", "X-Requested-With": "XMLHttpRequest" },
+          body: JSON.stringify({ templateName: t.name, params: params, agentTag: who })
+        })
+          .then(function (r) {
+            return r.json().catch(function () { return {}; }).then(function (d) {
+              if (!r.ok) throw new Error(d.error || ("HTTP " + r.status));
+              return d;
+            });
+          })
+          .then(function () {
+            overlay.remove();
+            toast("Template sent \\u2014 free-form should open when they reply (or immediately if within rules).", "");
+            hardReloadThread();
+          })
+          .catch(function (e) {
+            send.disabled = false;
+            send.textContent = "Send template";
+            err.textContent = e.message || String(e);
+          });
+      });
+      actions.appendChild(cancel);
+      actions.appendChild(send);
+      card.appendChild(tplSel);
+      card.appendChild(varHost);
+      card.appendChild(err);
+      card.appendChild(actions);
+      overlay.appendChild(card);
+      overlay.addEventListener("click", function (ev) { if (ev.target === overlay) overlay.remove(); });
+      document.body.appendChild(overlay);
+    }
 
     function updateWindowBanner(meta) {
       if (!meta) return;
+      threadMeta = meta;
       freeFormOpen = meta.freeFormOpen !== false;
       windowBanner.classList.add("show");
+      windowBanner.innerHTML = "";
       if (meta.freeFormOpen) {
         windowBanner.classList.add("open");
-        windowBanner.classList.remove("closed");
         var until = meta.freeFormOpenUntil ? new Date(meta.freeFormOpenUntil) : null;
         var left = until ? Math.max(0, until.getTime() - Date.now()) : 0;
         var hrs = Math.floor(left / 3600000);
         var mins = Math.floor((left % 3600000) / 60000);
-        windowBanner.innerHTML = "<strong>Free-form open</strong> \\u00B7 closes in " +
-          (hrs > 0 ? hrs + "h " : "") + mins + "m (Israel time, 24h after their last message)";
+        windowBanner.appendChild(el("span", "", ""));
+        windowBanner.lastChild.innerHTML = "<strong>Free-form open</strong> \\u00B7 closes in " +
+          (hrs > 0 ? hrs + "h " : "") + mins + "m (Israel time)";
       } else {
         windowBanner.classList.remove("open");
-        windowBanner.innerHTML =
-          "<strong>24h window closed</strong> \\u00B7 free-form text/media will fail. " +
-          '<a href="/whatsapp/" id="wa-window-cta">New chat \\u2192 send template</a>';
+        var sp = el("span", "");
+        sp.innerHTML = "<strong>24h window closed</strong> \\u00B7 free-form will fail until a template re-opens it.";
+        windowBanner.appendChild(sp);
+        var btn = el("button", "wa-tpl-btn", "Send template");
+        btn.type = "button";
+        btn.addEventListener("click", openTemplatePicker);
+        windowBanner.appendChild(btn);
       }
-      // Soft-disable free-form when closed (still allow try so Meta error is visible)
       if (input) {
         input.placeholder = freeFormOpen
           ? "Type a message"
-          : "Window closed \\u2014 send a template from New chat to re-open";
+          : "Window closed \\u2014 use Send template to re-open";
+      }
+      updateLoadOlder();
+    }
+
+    function updateLoadOlder() {
+      if (threadMeta && threadMeta.hasMoreOlder) {
+        loadOlderHost.style.display = "flex";
+        loadOlderBtn.disabled = loadingOlder;
+        loadOlderBtn.textContent = loadingOlder
+          ? "Loading\\u2026"
+          : ("Load older messages" + (threadMeta.total ? " (" + allMessages.length + " / " + threadMeta.total + ")" : ""));
+      } else {
+        loadOlderHost.style.display = "none";
       }
     }
 
-    var failedOnce = false;
-    function refresh(removeNodes) {
-      var url = "/__nesher_wa/contact/" + contactId + "/messages/?limit=300" +
+    function rebuildThreadFromAll(preserveScroll) {
+      var oldH = msgs.scrollHeight;
+      var oldT = msgs.scrollTop;
+      rendered = {};
+      lastDayK = null;
+      lastDir = null;
+      lastOutSender = null;
+      firstLoad = true;
+      msgs.innerHTML = "";
+      msgs.appendChild(loadOlderHost);
+      applyMessages(allMessages, []);
+      updateLoadOlder();
+      if (preserveScroll) {
+        msgs.scrollTop = msgs.scrollHeight - oldH + oldT;
+      } else {
+        scrollBottom();
+      }
+      firstLoad = false;
+    }
+
+    function hardReloadThread(removeNodes) {
+      var url = "/__nesher_wa/contact/" + contactId + "/messages/?limit=80" +
         (document.visibilityState === "visible" ? "&read=1" : "");
       return fetch(url, { credentials: "same-origin", headers: { Accept: "application/json" } })
         .then(function (r) {
-          if (r.status === 401 || r.status === 403) {
-            throw new Error("SESSION_EXPIRED");
-          }
+          if (r.status === 401 || r.status === 403) throw new Error("SESSION_EXPIRED");
           return r.json().catch(function () { return {}; }).then(function (data) {
             if (!r.ok) throw new Error(data.error || ("HTTP " + r.status));
             return data;
@@ -2195,25 +2357,76 @@ const SCRIPT = `
             toast("WhatsApp token not configured on the proxy \\u2014 sending is disabled.", "warn");
           }
           if (data.meta) updateWindowBanner(data.meta);
-          if (data.meta && data.meta.truncated) {
-            if (!truncNote) {
-              truncNote = el("div", "wa-trunc",
-                "Showing latest " + (data.meta.returned || "") + " of " + (data.meta.total || "") + " messages");
-              msgs.insertBefore(truncNote, msgs.firstChild);
+          allMessages = data.messages || [];
+          if (removeNodes && removeNodes.length) {
+            removeNodes.forEach(function (n) { if (n && n.parentNode) n.remove(); });
+          }
+          rebuildThreadFromAll(false);
+          (allMessages || []).slice(-15).forEach(function (m) {
+            if (!m.mediaId) return;
+            fetch(mediaUrl(m.mediaId), { credentials: "same-origin", method: "GET" }).catch(function () {});
+          });
+          failedOnce = false;
+        });
+    }
+
+    var failedOnce = false;
+    function refresh(removeNodes) {
+      /* Incremental poll: only newest page, merge status into allMessages */
+      var url = "/__nesher_wa/contact/" + contactId + "/messages/?limit=80" +
+        (document.visibilityState === "visible" ? "&read=1" : "");
+      return fetch(url, { credentials: "same-origin", headers: { Accept: "application/json" } })
+        .then(function (r) {
+          if (r.status === 401 || r.status === 403) throw new Error("SESSION_EXPIRED");
+          return r.json().catch(function () { return {}; }).then(function (data) {
+            if (!r.ok) throw new Error(data.error || ("HTTP " + r.status));
+            return data;
+          });
+        })
+        .then(function (data) {
+          if (loading) { loading.remove(); loading = null; }
+          if (data.contact) {
+            if (data.contact.name) { hName.textContent = data.contact.name; av.textContent = initials(data.contact.name, data.contact.phone); }
+            if (data.contact.phone) hPhone.textContent = fmtPhone(data.contact.phone);
+          }
+          if (data.whatsappConfigured === false) {
+            toast("WhatsApp token not configured on the proxy \\u2014 sending is disabled.", "warn");
+          }
+          if (data.meta) updateWindowBanner(data.meta);
+          var fresh = data.messages || [];
+          if (!allMessages.length) {
+            allMessages = fresh;
+            if (removeNodes && removeNodes.length) {
+              removeNodes.forEach(function (n) { if (n && n.parentNode) n.remove(); });
+            }
+            rebuildThreadFromAll(false);
+          } else {
+            var byId = {};
+            allMessages.forEach(function (m) { byId[m.id] = m; });
+            var added = [];
+            fresh.forEach(function (m) {
+              if (byId[m.id]) {
+                Object.assign(byId[m.id], m);
+              } else {
+                allMessages.push(m);
+                added.push(m);
+              }
+            });
+            allMessages.sort(function (a, b) {
+              var ta = new Date(a.messageAt).getTime();
+              var tb = new Date(b.messageAt).getTime();
+              if (ta !== tb) return ta - tb;
+              return a.id - b.id;
+            });
+            if (removeNodes && removeNodes.length) {
+              removeNodes.forEach(function (n) { if (n && n.parentNode) n.remove(); });
+            }
+            if (added.length) {
+              applyMessages(added, []);
+            } else {
+              applyMessages(allMessages, []);
             }
           }
-          applyMessages(data.messages || [], removeNodes);
-          /* warm-cache recent media via fetch (Image() cannot warm audio/docs) */
-          (data.messages || []).slice(-15).forEach(function (m) {
-            if (!m.mediaId) return;
-            if (m.mediaKind === "image" || m.messageType === "image" ||
-                m.mediaKind === "audio" || m.messageType === "audio" ||
-                m.mediaKind === "document" || m.messageType === "document" ||
-                m.mediaKind === "video" || m.messageType === "video" ||
-                m.mediaKind === "sticker" || m.messageType === "sticker") {
-              fetch(mediaUrl(m.mediaId), { credentials: "same-origin", method: "GET" }).catch(function () {});
-            }
-          });
           failedOnce = false;
         })
         .catch(function (e) {
@@ -2232,6 +2445,54 @@ const SCRIPT = `
           }
         });
     }
+
+    loadOlderBtn.addEventListener("click", function () {
+      if (loadingOlder || !threadMeta || !threadMeta.hasMoreOlder || !threadMeta.oldestId) return;
+      loadingOlder = true;
+      updateLoadOlder();
+      fetch("/__nesher_wa/contact/" + contactId + "/messages/?limit=80&before_id=" + encodeURIComponent(threadMeta.oldestId), {
+        credentials: "same-origin",
+        headers: { Accept: "application/json" }
+      })
+        .then(function (r) {
+          return r.json().catch(function () { return {}; }).then(function (d) {
+            if (!r.ok) throw new Error(d.error || ("HTTP " + r.status));
+            return d;
+          });
+        })
+        .then(function (data) {
+          var older = data.messages || [];
+          if (data.meta) {
+            // preserve free-form from previous; only update pagination fields
+            threadMeta = Object.assign({}, threadMeta, data.meta, {
+              freeFormOpen: threadMeta.freeFormOpen,
+              freeFormOpenUntil: threadMeta.freeFormOpenUntil,
+              lastInboundAt: threadMeta.lastInboundAt
+            });
+            // oldestId for next page is the oldest of the batch we just loaded
+            if (older.length) threadMeta.oldestId = older[0].id;
+            threadMeta.hasMoreOlder = Boolean(data.meta.hasMoreOlder);
+            threadMeta.total = data.meta.total || threadMeta.total;
+          }
+          if (older.length) {
+            var seen = {};
+            allMessages.forEach(function (m) { seen[m.id] = true; });
+            var merged = [];
+            older.forEach(function (m) { if (!seen[m.id]) merged.push(m); });
+            allMessages = merged.concat(allMessages);
+            rebuildThreadFromAll(true);
+          } else {
+            updateLoadOlder();
+          }
+        })
+        .catch(function (e) {
+          toast("Could not load older: " + (e.message || e), "error");
+        })
+        .then(function () {
+          loadingOlder = false;
+          updateLoadOlder();
+        });
+    });
 
     /* pending (optimistic) bubbles */
     function addPending(bodyText, kind) {

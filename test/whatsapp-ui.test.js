@@ -132,3 +132,20 @@ test("round-2 hardens: IL time, linkify phones, live status patch, copy", () => 
     assert.ok(body.includes(probe), "missing round-2 piece: " + probe);
   }
 });
+
+test("pagination + in-chat template UI present", () => {
+  const out = injectWhatsAppUi(sample, "/whatsapp/4/");
+  const m = out.match(/<script id="nesher-wa-ui-js">([\s\S]*?)<\/script>/);
+  assert.ok(m);
+  const body = m[1];
+  for (const probe of [
+    "before_id",
+    "Load older messages",
+    "openTemplatePicker",
+    "send-template",
+    "hasMoreOlder",
+    "hardReloadThread",
+  ]) {
+    assert.ok(body.includes(probe), "missing page/template piece: " + probe);
+  }
+});
