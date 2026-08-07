@@ -669,7 +669,7 @@ const server = http.createServer(async (req, res) => {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-08-07-wa-20-hardens",
+      build: "2026-08-07-wa-40-hardens",
       upstream: UPSTREAM,
       paySync: lastPaySync
         ? {

@@ -581,6 +581,16 @@ const CSS = `
   .wa-reaction-solo {
     font-size: 28px; line-height: 1; padding: 4px 8px;
   }
+  .wa-react-host { display: contents; }
+  .wa-copy-btn {
+    align-self: flex-end;
+    border: none; background: transparent;
+    color: var(--wa-faint); font-size: 11px; font-weight: 600;
+    cursor: pointer; padding: 0 2px; margin-top: 2px;
+    opacity: 0; transition: opacity .12s ease;
+  }
+  .wa-bubble:hover .wa-copy-btn, .wa-copy-btn:focus { opacity: 1; }
+  .wa-copy-btn:hover { color: var(--wa-green); }
 
   /* Quoted reply strip */
   .wa-quote {
@@ -897,8 +907,44 @@ const SCRIPT = `
     return "+" + p;
   }
   function pad2(n) { return (n < 10 ? "0" : "") + n; }
-  function hm(d) { return d.getHours() + ":" + pad2(d.getMinutes()); }
-  function dayKey(d) { return d.getFullYear() + "-" + (d.getMonth() + 1) + "-" + d.getDate(); }
+  /* Israel-local parts for day separators + list times (Nesher is IL-based). */
+  function ilParts(d) {
+    try {
+      var fmt = new Intl.DateTimeFormat("en-GB", {
+        timeZone: "Asia/Jerusalem",
+        year: "numeric", month: "numeric", day: "numeric",
+        hour: "numeric", minute: "numeric", hour12: false,
+        weekday: "short"
+      });
+      var parts = fmt.formatToParts(d);
+      var get = function (t) {
+        for (var i = 0; i < parts.length; i++) if (parts[i].type === t) return parts[i].value;
+        return "";
+      };
+      return {
+        y: Number(get("year")),
+        m: Number(get("month")),
+        day: Number(get("day")),
+        h: Number(get("hour") === "24" ? "0" : get("hour")),
+        min: Number(get("minute")),
+        wd: get("weekday")
+      };
+    } catch (e) {
+      return {
+        y: d.getFullYear(), m: d.getMonth() + 1, day: d.getDate(),
+        h: d.getHours(), min: d.getMinutes(),
+        wd: ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][d.getDay()]
+      };
+    }
+  }
+  function hm(d) {
+    var p = ilParts(d);
+    return pad2(p.h) + ":" + pad2(p.min);
+  }
+  function dayKey(d) {
+    var p = ilParts(d);
+    return p.y + "-" + p.m + "-" + p.day;
+  }
   var MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
   var DAYS = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
   function dayLabel(d) {
@@ -908,8 +954,9 @@ const SCRIPT = `
     var k = dayKey(d);
     if (k === today) return "Today";
     if (k === yest) return "Yesterday";
-    var lbl = DAYS[d.getDay()] + ", " + MONTHS[d.getMonth()] + " " + d.getDate();
-    if (d.getFullYear() !== now.getFullYear()) lbl += ", " + d.getFullYear();
+    var p = ilParts(d);
+    var lbl = (p.wd || DAYS[d.getDay()]) + ", " + MONTHS[p.m - 1] + " " + p.day;
+    if (p.y !== ilParts(now).y) lbl += ", " + p.y;
     return lbl;
   }
   function listTime(d) {
@@ -918,9 +965,10 @@ const SCRIPT = `
     var k = dayKey(d);
     if (k === dayKey(now)) return hm(d);
     if (k === dayKey(new Date(now.getTime() - 864e5))) return "Yesterday";
-    if (now.getTime() - d.getTime() < 6 * 864e5) return DAYS[d.getDay()];
-    var lbl = MONTHS[d.getMonth()] + " " + d.getDate();
-    if (d.getFullYear() !== now.getFullYear()) lbl += ", " + d.getFullYear();
+    if (now.getTime() - d.getTime() < 6 * 864e5) return ilParts(d).wd || DAYS[d.getDay()];
+    var p = ilParts(d);
+    var lbl = MONTHS[p.m - 1] + " " + p.day;
+    if (p.y !== ilParts(now).y) lbl += ", " + p.y;
     return lbl;
   }
   function parseDt(iso) {
@@ -934,20 +982,48 @@ const SCRIPT = `
   }
   function linkify(text) {
     var frag = document.createDocumentFragment();
-    var re = /(https?:\\/\\/[^\\s<>"]+)/g;
+    // URLs (with/without scheme), emails, intl phone numbers
+    var re = /(https?:\\/\\/[^\\s<>"]+|www\\.[^\\s<>"]+|[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}|\\+?\\d[\\d\\s().-]{7,}\\d)/g;
     var last = 0, m;
     text = String(text == null ? "" : text);
     while ((m = re.exec(text))) {
       if (m.index > last) frag.appendChild(document.createTextNode(text.slice(last, m.index)));
-      var a = el("a", "", m[1]);
-      a.href = m[1];
-      a.target = "_blank";
-      a.rel = "noopener noreferrer";
-      frag.appendChild(a);
-      last = m.index + m[1].length;
+      var raw = m[1];
+      var a = el("a", "", raw);
+      var href = raw;
+      if (/^www\\./i.test(raw)) href = "https://" + raw;
+      else if (raw.indexOf("@") > 0 && !/^https?:/i.test(raw) && !/^\\+?\\d/.test(raw)) href = "mailto:" + raw;
+      else if (/^\\+?\\d[\\d\\s().-]{7,}\\d$/.test(raw) && raw.indexOf("@") < 0 && !/^https?:/i.test(raw)) {
+        href = "tel:" + raw.replace(/[^\\d+]/g, "");
+      }
+      // block javascript: and data: schemes that somehow slip through
+      if (/^(javascript|data|vbscript):/i.test(href)) {
+        frag.appendChild(document.createTextNode(raw));
+      } else {
+        a.href = href;
+        a.target = "_blank";
+        a.rel = "noopener noreferrer";
+        frag.appendChild(a);
+      }
+      last = m.index + raw.length;
     }
     if (last < text.length) frag.appendChild(document.createTextNode(text.slice(last)));
     return frag;
+  }
+  function copyText(str) {
+    str = String(str || "");
+    if (!str) return Promise.resolve(false);
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      return navigator.clipboard.writeText(str).then(function () { return true; }).catch(function () { return false; });
+    }
+    try {
+      var ta = document.createElement("textarea");
+      ta.value = str; ta.style.position = "fixed"; ta.style.left = "-9999px";
+      document.body.appendChild(ta); ta.select();
+      var ok = document.execCommand("copy");
+      document.body.removeChild(ta);
+      return Promise.resolve(ok);
+    } catch (e) { return Promise.resolve(false); }
   }
   function ticksFor(status) {
     var s = String(status || "").toLowerCase();
@@ -1230,6 +1306,13 @@ const SCRIPT = `
       card.appendChild(bodyPrev); card.appendChild(pendingNote); card.appendChild(varHost); card.appendChild(err); card.appendChild(actions);
       overlay.appendChild(card);
       overlay.addEventListener("click", function (ev) { if (ev.target === overlay) overlay.remove(); });
+      function onEsc(ev) {
+        if (ev.key === "Escape") {
+          overlay.remove();
+          document.removeEventListener("keydown", onEsc);
+        }
+      }
+      document.addEventListener("keydown", onEsc);
       document.body.appendChild(overlay);
       phone.focus();
     }
@@ -1306,8 +1389,12 @@ const SCRIPT = `
     function matches(chat, f) {
       if (!f) return true;
       f = f.toLowerCase();
-      return [chat.name, chat.phone, chat.customerName, chat.lastMessage && chat.lastMessage.body]
-        .some(function (v) { return v && String(v).toLowerCase().indexOf(f) >= 0; });
+      var lm = chat.lastMessage;
+      var hay = [
+        chat.name, chat.phone, chat.customerName,
+        lm && lm.body, lm && lm.caption, lm && lm.filename, lm && lm.agentTag, lm && lm.sentBy
+      ];
+      return hay.some(function (v) { return v && String(v).toLowerCase().indexOf(f) >= 0; });
     }
     function render() {
       listHost.innerHTML = "";
@@ -1364,7 +1451,10 @@ const SCRIPT = `
 
     function refreshInbox() {
       fetch("/__nesher_wa/inbox/", { credentials: "same-origin", headers: { Accept: "application/json" } })
-        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (r) {
+          if (r.status === 401 || r.status === 403) throw new Error("SESSION_EXPIRED");
+          return r.ok ? r.json() : null;
+        })
         .then(function (data) {
           if (!data || !data.ok || !data.chats) return;
           chats = data.chats;
@@ -1372,9 +1462,17 @@ const SCRIPT = `
             pill.classList.add("warn");
             pill.lastChild.textContent = "API not configured";
           }
+          var unreadTotal = chats.reduce(function (s, c) { return s + (c.unread || 0); }, 0);
+          try {
+            document.title = (unreadTotal ? "(" + unreadTotal + ") " : "") + "WhatsApp \\u00B7 Nesher CRM";
+          } catch (e) {}
           render();
         })
-        .catch(function () {});
+        .catch(function (e) {
+          if (e && e.message === "SESSION_EXPIRED") {
+            toast("CRM session expired \\u2014 refresh and log in again.", "error");
+          }
+        });
     }
     refreshInbox();
     setInterval(function () { if (!document.hidden) refreshInbox(); }, 15000);
@@ -1542,6 +1640,12 @@ const SCRIPT = `
 
     infoBtn.addEventListener("click", function () { setDetails(!app.classList.contains("details-open")); });
     dClose.addEventListener("click", function () { setDetails(false); });
+    document.addEventListener("keydown", function (ev) {
+      if (ev.key === "Escape") {
+        if (q(".wa-lightbox")) return; /* lightbox has its own Escape */
+        if (app.classList.contains("details-open")) setDetails(false);
+      }
+    });
     try { if (localStorage.getItem(DETAILS_KEY) === "1") setDetails(true); } catch (e) {}
 
     /* toasts */
@@ -1846,14 +1950,15 @@ const SCRIPT = `
       return wrap;
     }
 
-    function appendReactions(bub, mUi) {
+    function appendReactions(host, mUi) {
+      if (!host) return;
       var rs = Array.isArray(mUi.reactions) ? mUi.reactions : [];
       if (!rs.length) return;
       var bar = el("div", "wa-reactions");
       rs.forEach(function (r) {
         bar.appendChild(document.createTextNode(r.emoji || "\\uD83D\\uDC4D"));
       });
-      bub.appendChild(bar);
+      host.appendChild(bar);
     }
 
     /* thread rendering — append-only diff so audio playback survives polls */
@@ -1952,13 +2057,39 @@ const SCRIPT = `
         meta.appendChild(tickEl);
       }
       bub.appendChild(meta);
-      appendReactions(bub, mUi);
+      /* copy — long GDS / PNR pastes are common */
+      var copyBody = captionOf(mUi) || mUi.body || "";
+      if (copyBody && !/^\\[/.test(String(copyBody).trim())) {
+        var copyBtn = el("button", "wa-copy-btn", "Copy");
+        copyBtn.type = "button";
+        copyBtn.title = "Copy message text";
+        copyBtn.addEventListener("click", function (ev) {
+          ev.stopPropagation();
+          copyText(copyBody).then(function (ok) {
+            toast(ok ? "Copied" : "Could not copy", ok ? "" : "error");
+          });
+        });
+        bub.appendChild(copyBtn);
+      }
+      var reactHost = el("div", "wa-react-host");
+      bub.appendChild(reactHost);
+      appendReactions(reactHost, mUi);
+      var errEl = null;
       if (String(mUi.status).toLowerCase() === "failed" && mUi.error) {
-        bub.appendChild(el("div", "wa-msg-error", "Not delivered: " + mUi.error));
+        errEl = el("div", "wa-msg-error", "Not delivered: " + mUi.error);
+        bub.appendChild(errEl);
       }
       row.appendChild(bub);
       msgs.appendChild(row);
-      return { node: row, status: mUi.status, tickEl: tickEl };
+      return {
+        node: row,
+        status: mUi.status,
+        tickEl: tickEl,
+        reactHost: reactHost,
+        errEl: errEl,
+        bub: bub,
+        reactionKey: (mUi.reactions || []).map(function (x) { return x.emoji; }).join("")
+      };
     }
 
     function applyMessages(list, removeNodes) {
@@ -1968,11 +2099,24 @@ const SCRIPT = `
         var key = String(mUi.id);
         var r = rendered[key];
         if (r) {
+          /* live-patch status ticks (sent → delivered → read / failed) */
           if (r.status !== mUi.status && r.tickEl) {
             var fresh = ticksFor(mUi.status);
             r.tickEl.replaceWith(fresh);
             r.tickEl = fresh;
             r.status = mUi.status;
+          }
+          /* late-arriving reactions */
+          var rk = (mUi.reactions || []).map(function (x) { return x.emoji; }).join("");
+          if (rk !== r.reactionKey && r.reactHost) {
+            r.reactHost.innerHTML = "";
+            appendReactions(r.reactHost, mUi);
+            r.reactionKey = rk;
+          }
+          /* failed error text */
+          if (String(mUi.status).toLowerCase() === "failed" && mUi.error && r.bub && !r.errEl) {
+            r.errEl = el("div", "wa-msg-error", "Not delivered: " + mUi.error);
+            r.bub.appendChild(r.errEl);
           }
           return;
         }
@@ -2012,12 +2156,12 @@ const SCRIPT = `
         var hrs = Math.floor(left / 3600000);
         var mins = Math.floor((left % 3600000) / 60000);
         windowBanner.innerHTML = "<strong>Free-form open</strong> \\u00B7 closes in " +
-          (hrs > 0 ? hrs + "h " : "") + mins + "m (24h after their last message)";
+          (hrs > 0 ? hrs + "h " : "") + mins + "m (Israel time, 24h after their last message)";
       } else {
         windowBanner.classList.remove("open");
         windowBanner.innerHTML =
           "<strong>24h window closed</strong> \\u00B7 free-form text/media will fail. " +
-          "Use <a href=\\"/whatsapp/\\">New chat \\u2192 template</a> to re-open this number.";
+          '<a href="/whatsapp/" id="wa-window-cta">New chat \\u2192 send template</a>';
       }
       // Soft-disable free-form when closed (still allow try so Meta error is visible)
       if (input) {
@@ -2059,12 +2203,15 @@ const SCRIPT = `
             }
           }
           applyMessages(data.messages || [], removeNodes);
-          /* warm-cache first few media items so open is instant later */
-          (data.messages || []).slice(-12).forEach(function (m) {
-            if (m.mediaId && (m.mediaKind === "image" || m.messageType === "image" ||
-                m.mediaKind === "audio" || m.messageType === "audio")) {
-              var img = new Image();
-              img.src = mediaUrl(m.mediaId);
+          /* warm-cache recent media via fetch (Image() cannot warm audio/docs) */
+          (data.messages || []).slice(-15).forEach(function (m) {
+            if (!m.mediaId) return;
+            if (m.mediaKind === "image" || m.messageType === "image" ||
+                m.mediaKind === "audio" || m.messageType === "audio" ||
+                m.mediaKind === "document" || m.messageType === "document" ||
+                m.mediaKind === "video" || m.messageType === "video" ||
+                m.mediaKind === "sticker" || m.messageType === "sticker") {
+              fetch(mediaUrl(m.mediaId), { credentials: "same-origin", method: "GET" }).catch(function () {});
             }
           });
           failedOnce = false;

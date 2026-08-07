@@ -50,12 +50,22 @@ export async function cacheMediaBlob(mediaId, buffer, mimeType) {
   if (!id || !buffer?.length || buffer.length > MEDIA_CACHE_MAX) return false;
   try {
     await ensureMediaCache();
-    await getPool().query(
+    const p = getPool();
+    await p.query(
       `INSERT INTO nesher_wa_media_cache (media_id, mime_type, bytes, byte_size)
        VALUES ($1, $2, $3, $4)
        ON CONFLICT (media_id) DO NOTHING`,
       [id, mimeType || "application/octet-stream", buffer, buffer.length]
     );
+    // Cap cache so Railway Postgres doesn't grow forever (keep ~200 newest).
+    await p.query(`
+      DELETE FROM nesher_wa_media_cache
+      WHERE media_id IN (
+        SELECT media_id FROM nesher_wa_media_cache
+        ORDER BY created_at DESC
+        OFFSET 200
+      )
+    `).catch(() => {});
     return true;
   } catch (e) {
     console.warn("wa media cache write", e.message);
@@ -188,10 +198,21 @@ export async function toAacM4a(input, inputExt = ".webm") {
     ff.stderr.on("data", (d) => {
       err += d.toString();
     });
-    ff.on("error", (e) => reject(new Error(`ffmpeg missing: ${e.message}`)));
+    ff.on("error", (e) =>
+      reject(
+        new Error(
+          `Voice conversion failed — ffmpeg is not available on this server (${e.message}). Send an MP3/M4A file instead, or install ffmpeg on the Railway image.`
+        )
+      )
+    );
     ff.on("close", (code) => {
       if (code === 0) resolve();
-      else reject(new Error(`ffmpeg failed (${code}): ${err.slice(-400)}`));
+      else
+        reject(
+          new Error(
+            `Voice conversion failed (ffmpeg exit ${code}). Try a shorter note or upload an MP3. ${err.slice(-200)}`
+          )
+        );
     });
   });
 
@@ -226,7 +247,7 @@ export async function uploadWhatsAppMedia(buffer, mimeType, filename = "voice.og
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok || !data.id) {
-    throw new Error(data?.error?.message || `Media upload HTTP ${res.status}`);
+    throw new Error(humanizeMetaSendError(data, `Media upload HTTP ${res.status}`));
   }
   return String(data.id);
 }
@@ -260,7 +281,7 @@ export async function sendWhatsAppAudio({ to, mediaId, isVoice = true }) {
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    throw new Error(data?.error?.message || `Send audio HTTP ${res.status}`);
+    throw new Error(humanizeMetaSendError(data, `Send audio HTTP ${res.status}`));
   }
   const wamid = data?.messages?.[0]?.id || "";
   return { wamid, data };
@@ -316,16 +337,22 @@ export async function listInboxSummaries() {
     customerId: row.customer_id ? Number(row.customer_id) : null,
     customerName: row.customer_name || null,
     lastMessage: row.lm_at
-      ? {
-          direction: row.lm_direction,
-          status: row.lm_status,
-          messageType: row.lm_type,
-          body: row.lm_body,
-          messageAt: row.lm_at,
-          voice: Boolean(row.lm_raw?.audio?.voice),
-          sentBy: row.lm_sender || null,
-          agentTag: String(row.lm_raw?.agent_tag || "").trim() || null,
-        }
+      ? (() => {
+          const media = extractWaMedia(row.lm_raw || {}, row.lm_type);
+          return {
+            direction: row.lm_direction,
+            status: row.lm_status,
+            messageType: row.lm_type,
+            body: row.lm_body,
+            messageAt: row.lm_at,
+            voice: media?.mediaKind === "audio" ? Boolean(media.voice) : Boolean(row.lm_raw?.audio?.voice),
+            mediaKind: media?.mediaKind || null,
+            caption: media?.caption || null,
+            filename: media?.filename || null,
+            sentBy: row.lm_sender || null,
+            agentTag: String(row.lm_raw?.agent_tag || "").trim() || null,
+          };
+        })()
       : null,
   }));
 }
@@ -801,13 +828,15 @@ export async function stampAgentTag(contactId, tag) {
   const clean = String(tag || "").trim().slice(0, 40);
   if (!clean) return false;
   const p = getPool();
+  // Tag the newest untagged outbound in the last 5 minutes (text OR media).
+  // Previous 90s text-only window missed slow CRM writes and voice/media rows.
   const r = await p.query(
     `UPDATE core_whatsappmessage
      SET raw_payload = COALESCE(raw_payload, '{}'::jsonb) || jsonb_build_object('agent_tag', $2::text)
      WHERE id = (
        SELECT id FROM core_whatsappmessage
-       WHERE contact_id = $1 AND direction = 'outbound' AND message_type = 'text'
-         AND created_at > now() - interval '90 seconds'
+       WHERE contact_id = $1 AND direction = 'outbound'
+         AND created_at > now() - interval '5 minutes'
          AND COALESCE(raw_payload->>'agent_tag', '') = ''
        ORDER BY id DESC LIMIT 1
      )`,
@@ -1237,6 +1266,11 @@ export async function sendContactAudio({
   sentById = null,
   agentTag = "",
 }) {
+  if (!buffer?.length) throw new Error("Empty audio");
+  if (buffer.length < 200) throw new Error("Recording too short — hold the mic longer.");
+  if (buffer.length > 16 * 1024 * 1024) {
+    throw new Error("Voice note too large (max 16 MB). Keep it under ~3 minutes.");
+  }
   const contact = await getContact(contactId);
   let uploadBuf = buffer;
   let uploadMime = mimeType || "application/octet-stream";
