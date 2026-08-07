@@ -582,6 +582,56 @@ const CSS = `
     font-size: 28px; line-height: 1; padding: 4px 8px;
   }
 
+  /* Quoted reply strip */
+  .wa-quote {
+    border-left: 3px solid var(--wa-green);
+    background: rgba(11,20,26,0.05);
+    border-radius: 0 6px 6px 0;
+    padding: 5px 8px; margin-bottom: 5px;
+    font-size: 12.5px; color: #54656f;
+    max-height: 52px; overflow: hidden;
+  }
+  .wa-quote-label {
+    font-size: 11px; font-weight: 700; color: var(--wa-green);
+    margin-bottom: 1px;
+  }
+  .wa-quote-body {
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+
+  /* 24h free-form window banner */
+  .wa-window-banner {
+    flex-shrink: 0;
+    display: none;
+    align-items: center; gap: 8px;
+    padding: 8px 14px;
+    background: #fff8e6;
+    border-top: 1px solid #f0e0b0;
+    color: #7a5b00;
+    font-size: 12.5px; line-height: 1.35;
+  }
+  .wa-window-banner.show { display: flex; }
+  .wa-window-banner strong { font-weight: 700; }
+  .wa-window-banner a {
+    color: #075e54; font-weight: 700; margin-left: auto; white-space: nowrap;
+  }
+  .wa-window-banner.open {
+    background: #e8f8ef; border-color: #b7e4c7; color: #0b5c36;
+  }
+
+  /* Drag-drop overlay */
+  .wa-drop-active .wa-composer {
+    outline: 2px dashed var(--wa-green);
+    outline-offset: -4px;
+    background: #e8f8ef;
+  }
+
+  /* Truncation notice */
+  .wa-trunc {
+    text-align: center; font-size: 12px; color: var(--wa-faint);
+    padding: 6px 10px; margin: 4px 0 8px;
+  }
+
   /* Jump-to-latest */
   .wa-jump {
     position: absolute; right: 22px; bottom: 86px; z-index: 5;
@@ -1689,6 +1739,7 @@ const SCRIPT = `
         a.href = src;
         a.target = "_blank";
         a.rel = "noopener";
+        if (mUi.filename) a.href += (a.href.indexOf("?") >= 0 ? "&" : "?") + "filename=" + encodeURIComponent(mUi.filename);
         a.download = mUi.filename || "document";
         var ext = String(mUi.filename || mUi.mimeType || "FILE").split(/[./]/).pop().slice(0, 4).toUpperCase() || "FILE";
         a.appendChild(el("div", "wa-doc-icon", ext));
@@ -1838,6 +1889,13 @@ const SCRIPT = `
       if (mUi.forwarded) {
         bub.appendChild(el("div", "wa-fwd", "Forwarded"));
       }
+      if (mUi.quote && mUi.quote.body) {
+        var q = el("div", "wa-quote");
+        q.appendChild(el("div", "wa-quote-label",
+          mUi.quote.direction === "outbound" ? "You" : "Customer"));
+        q.appendChild(el("div", "wa-quote-body", mUi.quote.body));
+        bub.appendChild(q);
+      }
       if (isAudioMsg(mUi)) {
         bub.appendChild(audioBubbleBody(mUi));
       } else if (isImageMsg(mUi)) {
@@ -1863,6 +1921,20 @@ const SCRIPT = `
         var re = (mUi.reaction && mUi.reaction.emoji) || "\\uD83D\\uDC4D";
         bub.appendChild(el("div", "wa-reaction-solo", re));
         bub.appendChild(el("div", "wa-text", "Reacted to a message"));
+      } else if (
+        mUi.messageType === "unsupported" ||
+        mUi.messageType === "ephemeral" ||
+        mUi.messageType === "system" ||
+        mUi.messageType === "unknown" ||
+        /^\\[(unsupported|unknown|ephemeral)/i.test(String(mUi.body || ""))
+      ) {
+        bub.appendChild(el("div", "wa-text",
+          mUi.messageType === "ephemeral"
+            ? "View-once media \\u2014 open it in WhatsApp on the phone (not available via the API)."
+            : mUi.messageType === "system"
+              ? (mUi.body || "System message")
+              : "Unsupported message type \\u2014 ask the customer to resend as text or a regular photo."
+        ));
       } else {
         var bodyText = mUi.body || "";
         if (/^\\[.+ message (received|sent)\\]$/i.test(String(bodyText).trim())) {
@@ -1922,13 +1994,48 @@ const SCRIPT = `
 
     var loading = el("div", "wa-empty", "Loading conversation\\u2026");
     msgs.appendChild(loading);
+    var truncNote = null;
+    var windowBanner = el("div", "wa-window-banner");
+    pane.appendChild(windowBanner);
+    var freeFormOpen = true;
+    var sending = false;
+
+    function updateWindowBanner(meta) {
+      if (!meta) return;
+      freeFormOpen = meta.freeFormOpen !== false;
+      windowBanner.classList.add("show");
+      if (meta.freeFormOpen) {
+        windowBanner.classList.add("open");
+        windowBanner.classList.remove("closed");
+        var until = meta.freeFormOpenUntil ? new Date(meta.freeFormOpenUntil) : null;
+        var left = until ? Math.max(0, until.getTime() - Date.now()) : 0;
+        var hrs = Math.floor(left / 3600000);
+        var mins = Math.floor((left % 3600000) / 60000);
+        windowBanner.innerHTML = "<strong>Free-form open</strong> \\u00B7 closes in " +
+          (hrs > 0 ? hrs + "h " : "") + mins + "m (24h after their last message)";
+      } else {
+        windowBanner.classList.remove("open");
+        windowBanner.innerHTML =
+          "<strong>24h window closed</strong> \\u00B7 free-form text/media will fail. " +
+          "Use <a href=\\"/whatsapp/\\">New chat \\u2192 template</a> to re-open this number.";
+      }
+      // Soft-disable free-form when closed (still allow try so Meta error is visible)
+      if (input) {
+        input.placeholder = freeFormOpen
+          ? "Type a message"
+          : "Window closed \\u2014 send a template from New chat to re-open";
+      }
+    }
 
     var failedOnce = false;
     function refresh(removeNodes) {
-      var url = "/__nesher_wa/contact/" + contactId + "/messages/" +
-        (document.visibilityState === "visible" ? "?read=1" : "");
+      var url = "/__nesher_wa/contact/" + contactId + "/messages/?limit=300" +
+        (document.visibilityState === "visible" ? "&read=1" : "");
       return fetch(url, { credentials: "same-origin", headers: { Accept: "application/json" } })
         .then(function (r) {
+          if (r.status === 401 || r.status === 403) {
+            throw new Error("SESSION_EXPIRED");
+          }
           return r.json().catch(function () { return {}; }).then(function (data) {
             if (!r.ok) throw new Error(data.error || ("HTTP " + r.status));
             return data;
@@ -1943,10 +2050,34 @@ const SCRIPT = `
           if (data.whatsappConfigured === false) {
             toast("WhatsApp token not configured on the proxy \\u2014 sending is disabled.", "warn");
           }
+          if (data.meta) updateWindowBanner(data.meta);
+          if (data.meta && data.meta.truncated) {
+            if (!truncNote) {
+              truncNote = el("div", "wa-trunc",
+                "Showing latest " + (data.meta.returned || "") + " of " + (data.meta.total || "") + " messages");
+              msgs.insertBefore(truncNote, msgs.firstChild);
+            }
+          }
           applyMessages(data.messages || [], removeNodes);
+          /* warm-cache first few media items so open is instant later */
+          (data.messages || []).slice(-12).forEach(function (m) {
+            if (m.mediaId && (m.mediaKind === "image" || m.messageType === "image" ||
+                m.mediaKind === "audio" || m.messageType === "audio")) {
+              var img = new Image();
+              img.src = mediaUrl(m.mediaId);
+            }
+          });
           failedOnce = false;
         })
         .catch(function (e) {
+          if (e && e.message === "SESSION_EXPIRED") {
+            if (loading) loading.textContent = "Session expired \\u2014 refresh the page and log in again.";
+            if (!failedOnce) {
+              failedOnce = true;
+              toast("CRM session expired \\u2014 refresh and log in again.", "error");
+            }
+            return;
+          }
           if (loading) { loading.textContent = "Could not load messages \\u2014 " + (e.message || e); }
           if (!failedOnce) {
             failedOnce = true;
@@ -2071,9 +2202,14 @@ const SCRIPT = `
 
     function sendText() {
       var text = input.value.trim();
-      if (!text) return;
+      if (!text || sending) return;
+      if (!freeFormOpen) {
+        toast("24h window is closed \\u2014 free-form text will likely fail. Open via New chat + approved template.", "warn");
+      }
       var who = agentName();
       if (!who) { openIdentityPicker(function () { sendText(); }); return; }
+      sending = true;
+      sendBtn.disabled = true;
       input.value = "";
       syncButtons(); autoGrow();
       input.focus();
@@ -2089,6 +2225,7 @@ const SCRIPT = `
         headers: { "X-Requested-With": "XMLHttpRequest", "X-Agent-Tag": encodeURIComponent(who) }
       })
         .then(function (r) {
+          if (r.status === 401 || r.status === 403) throw new Error("SESSION_EXPIRED");
           return r.text().then(function (html) {
             if (!r.ok && r.status !== 302) throw new Error("HTTP " + r.status);
             var em = html.match(/class="message error"[^>]*>([\\s\\S]*?)<\\/div>/);
@@ -2100,13 +2237,16 @@ const SCRIPT = `
           });
         })
         .catch(function (e) {
-          toast(e.message || "Send failed", "error");
-          markFailed(row, e.message, function () {
+          var msg = e.message || "Send failed";
+          if (msg === "SESSION_EXPIRED") msg = "Session expired \\u2014 refresh and log in again";
+          toast(msg, "error");
+          markFailed(row, msg, function () {
             input.value = text;
             syncButtons(); autoGrow();
             sendText();
           });
-        });
+        })
+        .then(function () { sending = false; sendBtn.disabled = false; });
     }
     sendBtn.addEventListener("click", sendText);
 
@@ -2157,9 +2297,56 @@ const SCRIPT = `
       if (t.startsWith("audio/") || /\\.(ogg|mp3|m4a|aac|opus|wav|webm)$/i.test(n)) return "audio";
       return "document";
     }
+    function compressImageIfNeeded(file) {
+      return new Promise(function (resolve) {
+        var kind = guessKind(file);
+        if (kind !== "image") { resolve(file); return; }
+        if (/heic|heif/i.test(file.type || file.name || "")) {
+          resolve(file); // server will reject with a clear message
+          return;
+        }
+        // Always re-encode large phone photos so Meta's 5 MB image limit doesn't trip
+        if (file.size < 900 * 1024) { resolve(file); return; }
+        var url = URL.createObjectURL(file);
+        var img = new Image();
+        img.onload = function () {
+          try {
+            var max = 1600;
+            var w = img.naturalWidth || img.width;
+            var h = img.naturalHeight || img.height;
+            var scale = Math.min(1, max / Math.max(w, h));
+            var cw = Math.max(1, Math.round(w * scale));
+            var ch = Math.max(1, Math.round(h * scale));
+            var canvas = document.createElement("canvas");
+            canvas.width = cw; canvas.height = ch;
+            var ctx = canvas.getContext("2d");
+            ctx.drawImage(img, 0, 0, cw, ch);
+            canvas.toBlob(function (blob) {
+              URL.revokeObjectURL(url);
+              if (!blob || blob.size >= file.size) { resolve(file); return; }
+              var name = String(file.name || "photo.jpg").replace(/\\.[^.]+$/, "") + ".jpg";
+              resolve(new File([blob], name, { type: "image/jpeg" }));
+            }, "image/jpeg", 0.82);
+          } catch (e) {
+            URL.revokeObjectURL(url);
+            resolve(file);
+          }
+        };
+        img.onerror = function () { URL.revokeObjectURL(url); resolve(file); };
+        img.src = url;
+      });
+    }
     function sendMediaFile(file) {
+      if (sending) return Promise.resolve();
       var who = agentName();
       if (!who) { openIdentityPicker(function () { sendMediaFile(file); }); return Promise.resolve(); }
+      if (!freeFormOpen) {
+        toast("24h window is closed \\u2014 media may fail until a template re-opens the chat.", "warn");
+      }
+      if (/heic|heif/i.test(file.type || file.name || "")) {
+        toast("iPhone HEIC photos aren't accepted. Export as JPEG first.", "error");
+        return Promise.resolve();
+      }
       var kind = guessKind(file);
       if (kind === "audio") {
         return sendAudioBlob(file, file.type || "audio/mpeg", /ogg|opus|webm/i.test(file.type || file.name));
@@ -2168,33 +2355,41 @@ const SCRIPT = `
         toast("File too large (max 64 MB)", "error");
         return Promise.resolve();
       }
-      var row = addPending("", kind);
+      sending = true;
       micBtn.disabled = true; attach.disabled = true;
-      return blobToBase64(file)
-        .then(function (b64) {
-          return fetch("/__nesher_wa/contact/" + contactId + "/send-media/", {
-            method: "POST",
-            credentials: "same-origin",
-            headers: { "Content-Type": "application/json", "X-Requested-With": "XMLHttpRequest" },
-            body: JSON.stringify({
-              fileBase64: b64,
-              mimeType: file.type || "application/octet-stream",
-              filename: file.name || "file.bin",
-              agentTag: who
+      return compressImageIfNeeded(file)
+        .then(function (ready) {
+          kind = guessKind(ready);
+          var row = addPending("", kind);
+          return blobToBase64(ready)
+            .then(function (b64) {
+              return fetch("/__nesher_wa/contact/" + contactId + "/send-media/", {
+                method: "POST",
+                credentials: "same-origin",
+                headers: { "Content-Type": "application/json", "X-Requested-With": "XMLHttpRequest" },
+                body: JSON.stringify({
+                  fileBase64: b64,
+                  mimeType: ready.type || "application/octet-stream",
+                  filename: ready.name || "file.bin",
+                  agentTag: who
+                })
+              });
             })
-          });
+            .then(function (r) {
+              if (r.status === 401 || r.status === 403) throw new Error("SESSION_EXPIRED");
+              return r.json().catch(function () { return {}; }).then(function (data) {
+                if (!r.ok) throw new Error(data.error || ("HTTP " + r.status));
+                return refresh([row]);
+              });
+            })
+            .catch(function (e) {
+              var msg = e.message || String(e);
+              if (msg === "SESSION_EXPIRED") msg = "Session expired \\u2014 refresh and log in again";
+              toast("Send failed: " + msg, "error");
+              markFailed(row, msg, function () { sendMediaFile(file); });
+            });
         })
-        .then(function (r) {
-          return r.json().catch(function () { return {}; }).then(function (data) {
-            if (!r.ok) throw new Error(data.error || ("HTTP " + r.status));
-            return refresh([row]);
-          });
-        })
-        .catch(function (e) {
-          toast("Send failed: " + (e.message || e), "error");
-          markFailed(row, e.message, function () { sendMediaFile(file); });
-        })
-        .then(function () { micBtn.disabled = false; attach.disabled = false; });
+        .then(function () { sending = false; micBtn.disabled = false; attach.disabled = false; });
     }
     attach.addEventListener("click", function () { fileInput.click(); });
     fileInput.addEventListener("change", function () {
@@ -2202,6 +2397,40 @@ const SCRIPT = `
       fileInput.value = "";
       if (!f) return;
       sendMediaFile(f);
+    });
+
+    /* Paste image from clipboard (screenshot / Ctrl+V) */
+    input.addEventListener("paste", function (ev) {
+      var items = ev.clipboardData && ev.clipboardData.items;
+      if (!items) return;
+      for (var i = 0; i < items.length; i++) {
+        if (items[i].type && items[i].type.indexOf("image/") === 0) {
+          ev.preventDefault();
+          var blob = items[i].getAsFile();
+          if (!blob) return;
+          var f = new File([blob], "pasted-" + Date.now() + ".png", { type: blob.type || "image/png" });
+          sendMediaFile(f);
+          return;
+        }
+      }
+    });
+
+    /* Drag & drop files onto the chat pane */
+    ["dragenter", "dragover"].forEach(function (evName) {
+      pane.addEventListener(evName, function (ev) {
+        ev.preventDefault();
+        pane.classList.add("wa-drop-active");
+      });
+    });
+    ["dragleave", "drop"].forEach(function (evName) {
+      pane.addEventListener(evName, function (ev) {
+        ev.preventDefault();
+        pane.classList.remove("wa-drop-active");
+      });
+    });
+    pane.addEventListener("drop", function (ev) {
+      var f = ev.dataTransfer && ev.dataTransfer.files && ev.dataTransfer.files[0];
+      if (f) sendMediaFile(f);
     });
 
     /* recorder */
@@ -2245,7 +2474,13 @@ const SCRIPT = `
           recStart = Date.now();
           recTimer.textContent = "0:00";
           recInterval = setInterval(function () {
-            recTimer.textContent = fmtClock((Date.now() - recStart) / 1000);
+            var sec = (Date.now() - recStart) / 1000;
+            recTimer.textContent = fmtClock(sec);
+            /* Meta audio max ~16 MB; stop at 3 minutes to stay safe + keep UX sane */
+            if (sec >= 180 && recorder && !recStopping) {
+              toast("Voice note auto-stopped at 3 minutes.", "warn");
+              stopRec(false);
+            }
           }, 250);
           composer.classList.add("recording");
           micBtn.innerHTML = I.send;
@@ -2275,11 +2510,26 @@ const SCRIPT = `
     });
     recCancel.addEventListener("click", function () { stopRec(true); });
 
-    /* boot + poll */
+    /* boot + poll (faster when focused, pause when hidden, resume on focus) */
     refresh().then(function () { scrollBottom(); });
-    setInterval(function () { if (!document.hidden && !recorder) refresh(); }, 5000);
+    var pollMs = 5000;
+    var pollTimer = setInterval(function () {
+      if (!document.hidden && !recorder && !sending) refresh();
+    }, pollMs);
     document.addEventListener("visibilitychange", function () {
-      if (!document.hidden) refresh();
+      if (!document.hidden) {
+        pollMs = 4000;
+        refresh();
+      } else {
+        pollMs = 20000;
+      }
+    });
+    window.addEventListener("online", function () {
+      toast("Back online \\u2014 refreshing chat\\u2026", "");
+      refresh();
+    });
+    window.addEventListener("offline", function () {
+      toast("You are offline \\u2014 sends will fail until the connection returns.", "warn");
     });
     if (window.matchMedia && window.matchMedia("(min-width: 641px)").matches) {
       input.focus();

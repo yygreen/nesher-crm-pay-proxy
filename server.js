@@ -348,16 +348,34 @@ async function handleWaMedia(req, res, mediaId) {
     // Cached blobs are durable — allow long browser cache. Fresh Meta pulls
     // still cache for a day so refresh storms don't re-download.
     const maxAge = file.cached ? 86400 * 30 : 86400;
-    res.writeHead(200, {
+    const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+    const wantName = url.searchParams.get("filename") || "";
+    const safeName = String(wantName || "")
+      .replace(/[^\w.\- ()[\]]+/g, "_")
+      .slice(0, 180);
+    const isDoc =
+      /pdf|msword|officedocument|zip|csv|text\/plain/i.test(file.mimeType || "") ||
+      /\.(pdf|docx?|xlsx?|pptx?|zip|csv|txt)$/i.test(safeName);
+    const headers = {
       "Content-Type": file.mimeType || "application/octet-stream",
       "Content-Length": String(file.buffer.length),
       "Cache-Control": `private, max-age=${maxAge}`,
       "X-WA-Media-Cache": file.cached ? "hit" : "miss",
-    });
+      "X-Content-Type-Options": "nosniff",
+    };
+    if (safeName) {
+      const disp = isDoc ? "attachment" : "inline";
+      headers["Content-Disposition"] = `${disp}; filename="${safeName}"`;
+    }
+    res.writeHead(200, headers);
     res.end(file.buffer);
   } catch (e) {
     console.error("wa media", e.message);
-    sendJson(res, 400, { error: e.message || String(e) });
+    const status = e.expired ? 410 : 400;
+    sendJson(res, status, {
+      error: e.message || String(e),
+      expired: Boolean(e.expired),
+    });
   }
 }
 
@@ -388,7 +406,11 @@ async function handleWaMessages(req, res, contactId, query) {
   if (!(await requireStaff(req, res))) return;
   try {
     const contact = await getContact(contactId);
-    const messages = await listContactMessages(contactId);
+    const lim = Number(query?.get("limit") || 200);
+    const pack = await listContactMessages(contactId, lim);
+    // Backward-compatible: listContactMessages returns {messages, meta}
+    const messages = Array.isArray(pack) ? pack : pack.messages || [];
+    const meta = Array.isArray(pack) ? {} : pack.meta || {};
     if (query && query.get("read") === "1") {
       markContactRead(contactId).catch((e) =>
         console.warn("mark read failed", e.message)
@@ -402,6 +424,7 @@ async function handleWaMessages(req, res, contactId, query) {
         name: contact.display_name,
       },
       messages,
+      meta,
       whatsappConfigured: waConfig().configured,
     });
   } catch (e) {
@@ -646,7 +669,7 @@ const server = http.createServer(async (req, res) => {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-08-07-wa-media-complete",
+      build: "2026-08-07-wa-20-hardens",
       upstream: UPSTREAM,
       paySync: lastPaySync
         ? {

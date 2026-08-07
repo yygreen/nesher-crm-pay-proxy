@@ -93,3 +93,23 @@ test("injected script covers reactions, contacts, location, and media send", () 
   }
   assert.match(out, /wa-contact-card|wa-loc|wa-reactions/);
 });
+
+test("injected script hardens: 24h window, paste, drop, compress, session", () => {
+  const out = injectWhatsAppUi(sample, "/whatsapp/4/");
+  const m = out.match(/<script id="nesher-wa-ui-js">([\s\S]*?)<\/script>/);
+  assert.ok(m);
+  const body = m[1];
+  for (const probe of [
+    "updateWindowBanner",
+    "freeFormOpen",
+    "compressImageIfNeeded",
+    "SESSION_EXPIRED",
+    "wa-drop-active",
+    "paste",
+    "View-once media",
+    "auto-stopped at 3 minutes",
+  ]) {
+    assert.ok(body.includes(probe), "missing harden piece: " + probe);
+  }
+  assert.match(out, /wa-window-banner|wa-quote/);
+});

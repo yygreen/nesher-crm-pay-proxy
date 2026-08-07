@@ -87,6 +87,9 @@ async function readMediaCache(mediaId) {
   }
 }
 
+/** Coalesce concurrent downloads of the same media id (poll storms). */
+const mediaInflight = new Map();
+
 /**
  * Resolve Meta media metadata + binary (with durable Postgres cache).
  * @param {string} mediaId
@@ -98,32 +101,51 @@ export async function downloadWhatsAppMedia(mediaId) {
   const hit = await readMediaCache(id);
   if (hit) return hit;
 
-  const { token } = waConfig();
-  if (!token) throw new Error("WHATSAPP_ACCESS_TOKEN not configured on proxy");
+  if (mediaInflight.has(id)) return mediaInflight.get(id);
 
-  const metaRes = await fetch(`${GRAPH}/${id}`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  const meta = await metaRes.json().catch(() => ({}));
-  if (!metaRes.ok) {
-    throw new Error(meta?.error?.message || `Meta media meta HTTP ${metaRes.status}`);
+  const job = (async () => {
+    const { token } = waConfig();
+    if (!token) throw new Error("WHATSAPP_ACCESS_TOKEN not configured on proxy");
+
+    const metaRes = await fetch(`${GRAPH}/${id}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const meta = await metaRes.json().catch(() => ({}));
+    if (!metaRes.ok) {
+      const human = humanizeMetaSendError(meta, `Meta media meta HTTP ${metaRes.status}`);
+      const err = new Error(human);
+      err.code = meta?.error?.code;
+      err.expired = metaRes.status === 404 || /not found|expired|unsupported/i.test(human);
+      throw err;
+    }
+    if (!meta.url) throw new Error("Meta media has no download URL (may have expired)");
+
+    const binRes = await fetch(meta.url, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!binRes.ok) {
+      const err = new Error(`Meta media download HTTP ${binRes.status}`);
+      err.expired = binRes.status === 404 || binRes.status === 410;
+      throw err;
+    }
+    const buf = Buffer.from(await binRes.arrayBuffer());
+    const out = {
+      buffer: buf,
+      mimeType: meta.mime_type || binRes.headers.get("content-type") || "application/octet-stream",
+      fileSize: meta.file_size || buf.length,
+      id: meta.id || id,
+      cached: false,
+    };
+    await cacheMediaBlob(out.id, out.buffer, out.mimeType);
+    return out;
+  })();
+
+  mediaInflight.set(id, job);
+  try {
+    return await job;
+  } finally {
+    mediaInflight.delete(id);
   }
-  if (!meta.url) throw new Error("Meta media has no download URL");
-
-  const binRes = await fetch(meta.url, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  if (!binRes.ok) throw new Error(`Meta media download HTTP ${binRes.status}`);
-  const buf = Buffer.from(await binRes.arrayBuffer());
-  const out = {
-    buffer: buf,
-    mimeType: meta.mime_type || binRes.headers.get("content-type") || "application/octet-stream",
-    fileSize: meta.file_size || buf.length,
-    id: meta.id || id,
-    cached: false,
-  };
-  cacheMediaBlob(out.id, out.buffer, out.mimeType).catch(() => {});
-  return out;
 }
 
 /**
@@ -474,38 +496,90 @@ export function extractWaStructured(raw, messageType) {
   return out;
 }
 
+/** Parse Django-stored Meta error_message (JSON blob or plain text) into staff English. */
+export function humanizeStoredError(raw) {
+  if (!raw) return "";
+  const s = String(raw).trim();
+  if (!s) return "";
+  try {
+    const j = JSON.parse(s);
+    if (j?.error || j?.message) return humanizeMetaSendError(j, s);
+  } catch {
+    /* plain text */
+  }
+  if (/Authentication Error|code.?190|OAuthException/i.test(s)) {
+    return "WhatsApp token expired or invalid — reconnect Meta / refresh WHATSAPP_ACCESS_TOKEN.";
+  }
+  if (/131047|24 hour|re-engagement|outside the allowed window/i.test(s)) {
+    return "Free-form chat is closed (24h window). Send an approved template to re-open.";
+  }
+  return s.length > 240 ? s.slice(0, 240) + "…" : s;
+}
+
+function bodyFromPayload(rowBody, raw, messageType) {
+  const body = String(rowBody || "").trim();
+  if (body && !/^\[.+ message (received|sent)\]$/i.test(body)) return body;
+  const candidates = waPayloadCandidates(raw);
+  for (const obj of candidates) {
+    if (obj?.text?.body) return String(obj.text.body);
+    if (obj?.button?.text) return String(obj.button.text);
+    if (obj?.interactive?.button_reply?.title) return String(obj.interactive.button_reply.title);
+    if (obj?.interactive?.list_reply?.title) return String(obj.interactive.list_reply.title);
+  }
+  return body;
+}
+
 /**
  * List messages for a contact (newest last for chat UI).
- * Reactions are attached onto their target bubble when the target is in-thread.
+ * Returns { messages, meta }. Reactions fold onto their target bubble when possible.
+ * CRITICAL: take the newest N rows, then sort ASC for chat display (old LIMIT ASC
+ * silently hid new messages once a thread grew past the cap).
  */
-export async function listContactMessages(contactId, limit = 100) {
+export async function listContactMessages(contactId, limit = 200) {
   const p = getPool();
   const id = Number(contactId);
-  const lim = Math.min(Math.max(Number(limit) || 100, 1), 300);
+  const lim = Math.min(Math.max(Number(limit) || 200, 1), 500);
   const r = await p.query(
-    `SELECT m.id, m.direction, m.status, m.message_type, m.body, m.whatsapp_message_id,
-            m.raw_payload, m.error_message, m.message_at, m.created_at, m.sent_by_id,
-            COALESCE(NULLIF(TRIM(u.first_name || ' ' || u.last_name), ''), u.username) AS sender
-     FROM core_whatsappmessage m
-     LEFT JOIN auth_user u ON u.id = m.sent_by_id
-     WHERE m.contact_id = $1
-     ORDER BY m.message_at ASC, m.id ASC
-     LIMIT $2`,
+    `SELECT * FROM (
+       SELECT m.id, m.direction, m.status, m.message_type, m.body, m.whatsapp_message_id,
+              m.raw_payload, m.error_message, m.message_at, m.created_at, m.sent_by_id,
+              COALESCE(NULLIF(TRIM(u.first_name || ' ' || u.last_name), ''), u.username) AS sender
+       FROM core_whatsappmessage m
+       LEFT JOIN auth_user u ON u.id = m.sent_by_id
+       WHERE m.contact_id = $1
+       ORDER BY m.message_at DESC, m.id DESC
+       LIMIT $2
+     ) recent
+     ORDER BY message_at ASC, id ASC`,
     [id, lim]
   );
+  const totalR = await p.query(
+    `SELECT count(*)::int AS n,
+            max(message_at) FILTER (WHERE direction = 'inbound') AS last_inbound_at
+     FROM core_whatsappmessage WHERE contact_id = $1`,
+    [id]
+  );
+  const total = totalR.rows[0]?.n || 0;
+  const lastInboundAt = totalR.rows[0]?.last_inbound_at || null;
+  const freeFormOpenUntil = lastInboundAt
+    ? new Date(new Date(lastInboundAt).getTime() + 24 * 60 * 60 * 1000)
+    : null;
+  const freeFormOpen = freeFormOpenUntil ? freeFormOpenUntil.getTime() > Date.now() : false;
+
   const mapped = r.rows.map((row) => {
     const raw = row.raw_payload || {};
     const media = extractWaMedia(raw, row.message_type);
     const structured = extractWaStructured(raw, row.message_type);
+    const body = bodyFromPayload(row.body, raw, row.message_type);
     return {
       id: Number(row.id),
       direction: row.direction,
       status: row.status,
       messageType: row.message_type,
-      body: row.body,
+      body,
       wamid: row.whatsapp_message_id,
       messageAt: row.message_at,
-      error: row.error_message || "",
+      error: humanizeStoredError(row.error_message),
       mediaId: media?.mediaId || null,
       mediaKind: media?.mediaKind || null,
       voice: media?.mediaKind === "audio" ? Boolean(media.voice) : false,
@@ -518,6 +592,7 @@ export async function listContactMessages(contactId, limit = 100) {
       interactive: structured.interactive,
       forwarded: structured.forwarded,
       contextWamid: structured.contextWamid,
+      quote: null,
       reactions: [],
       sentBy: row.sender || null,
       agentTag: (raw.agent_tag || "").trim() || null,
@@ -544,7 +619,44 @@ export async function listContactMessages(contactId, limit = 100) {
     }
     out.push(m);
   }
-  return out;
+  // Attach reply-quote previews once the final list is known
+  for (const m of out) {
+    if (!m.contextWamid) continue;
+    const t = byWamid.get(String(m.contextWamid));
+    if (!t) continue;
+    const qBody =
+      t.caption ||
+      (t.body && !/^\[/.test(t.body) ? t.body : null) ||
+      (t.mediaKind === "image" || t.messageType === "image"
+        ? "Photo"
+        : t.mediaKind === "audio" || t.messageType === "audio"
+          ? "Voice note"
+          : t.messageType === "document"
+            ? t.filename || "Document"
+            : t.messageType === "location"
+              ? "Location"
+              : t.messageType === "contacts"
+                ? "Contact"
+                : "Message");
+    m.quote = {
+      body: String(qBody).slice(0, 160),
+      messageType: t.messageType,
+      direction: t.direction,
+      id: t.id,
+    };
+  }
+
+  return {
+    messages: out,
+    meta: {
+      total,
+      returned: out.length,
+      truncated: total > lim,
+      lastInboundAt,
+      freeFormOpenUntil: freeFormOpenUntil ? freeFormOpenUntil.toISOString() : null,
+      freeFormOpen,
+    },
+  };
 }
 
 /**
@@ -868,10 +980,13 @@ export async function findContactByPhone(phone) {
   };
 }
 
-function humanizeMetaSendError(data, fallbackStatus) {
-  const err = data?.error || {};
+export function humanizeMetaSendError(data, fallbackStatus) {
+  const err = data?.error || data || {};
   const code = err.code;
-  const msg = String(err.message || fallbackStatus || "Template send failed");
+  const msg = String(err.message || fallbackStatus || "WhatsApp send failed");
+  if (code === 190 || /Authentication Error|OAuthException|access token/i.test(msg)) {
+    return "WhatsApp token expired or invalid — reconnect Meta / refresh WHATSAPP_ACCESS_TOKEN on Railway.";
+  }
   if (
     code === 131058 ||
     /Hello World|Public Test Numbers/i.test(msg)
@@ -887,10 +1002,25 @@ function humanizeMetaSendError(data, fallbackStatus) {
     return "That number is not on WhatsApp (or is invalid). Use full international digits, e.g. 972501234567.";
   }
   if (code === 131047 || /re-engagement|24 hour|outside/i.test(msg)) {
-    return "Free-form chat is closed. Send an approved template to re-open the conversation.";
+    return "Free-form chat is closed (24h window). Send an approved template to re-open the conversation.";
+  }
+  if (code === 131051 || /unsupported message type/i.test(msg)) {
+    return "That message type is not supported on this WhatsApp number.";
+  }
+  if (code === 131052 || /media download error|media.*not available/i.test(msg)) {
+    return "Media is no longer available on Meta (expired). Ask the customer to resend.";
+  }
+  if (code === 131053 || /media upload error/i.test(msg)) {
+    return "Media upload failed at Meta. Try a smaller JPEG/PDF (images max 5 MB).";
   }
   if (code === 132000 || /parameter/i.test(msg)) {
     return `Template parameter error from Meta: ${msg}`;
+  }
+  if (code === 130472 || /user.?s number is part of an experiment/i.test(msg)) {
+    return "This number can't receive business messages right now (Meta experiment restriction).";
+  }
+  if (code === 368 || /temporarily blocked/i.test(msg)) {
+    return "This WhatsApp Business account is temporarily restricted by Meta.";
   }
   return code ? `(#${code}) ${msg}` : msg;
 }
@@ -1297,6 +1427,18 @@ export async function sendContactMedia({
 }) {
   if (!buffer?.length) throw new Error("Empty file");
   if (buffer.length > 64 * 1024 * 1024) throw new Error("File too large (max 64 MB)");
+
+  const lowerName = String(filename || "").toLowerCase();
+  const lowerMime = String(mimeType || "").toLowerCase();
+  if (
+    lowerMime.includes("heic") ||
+    lowerMime.includes("heif") ||
+    /\.heic$|\.heif$/i.test(lowerName)
+  ) {
+    throw new Error(
+      "iPhone HEIC photos aren't accepted by WhatsApp Cloud API. Export as JPEG (or use the phone's \"Most Compatible\" camera setting) and try again."
+    );
+  }
 
   const contact = await getContact(contactId);
   let kind = inferMediaKind(mimeType, filename);

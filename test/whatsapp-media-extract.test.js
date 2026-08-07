@@ -4,6 +4,8 @@ import {
   extractWaMedia,
   extractWaStructured,
   inferMediaKind,
+  humanizeStoredError,
+  humanizeMetaSendError,
 } from "../whatsapp-media.js";
 
 test("extractWaMedia finds top-level image id + caption", () => {
@@ -151,4 +153,19 @@ test("inferMediaKind classifies common files", () => {
   assert.equal(inferMediaKind("video/mp4", "clip.mp4"), "video");
   assert.equal(inferMediaKind("application/pdf", "quote.pdf"), "document");
   assert.equal(inferMediaKind("audio/ogg", "note.ogg"), "audio");
+});
+
+test("humanizeStoredError parses Meta JSON auth failures", () => {
+  const raw = JSON.stringify({
+    error: { message: "Authentication Error", code: 190, type: "OAuthException" },
+  });
+  const h = humanizeStoredError(raw);
+  assert.match(h, /token expired|invalid/i);
+});
+
+test("humanizeMetaSendError maps 24h window code", () => {
+  const h = humanizeMetaSendError({
+    error: { code: 131047, message: "Re-engagement message" },
+  });
+  assert.match(h, /24h|template/i);
 });
