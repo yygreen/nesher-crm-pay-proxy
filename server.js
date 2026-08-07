@@ -782,7 +782,11 @@ const server = http.createServer(async (req, res) => {
   }
 
   // ── Meta WhatsApp webhook (public — no staff session) ───────────────
-  if (/^\/__nesher_wa\/webhook\/?$/.test(url.pathname)) {
+  // Primary path + legacy Django path (Meta app dashboard may still list it).
+  if (
+    /^\/__nesher_wa\/webhook\/?$/.test(url.pathname) ||
+    /^\/whatsapp\/webhook\/?$/.test(url.pathname)
+  ) {
     await handleWaWebhook(req, res, url);
     return;
   }
