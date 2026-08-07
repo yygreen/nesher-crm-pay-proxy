@@ -72,3 +72,24 @@ test("injected script can render image / media bubbles", () => {
   }
   assert.match(out, /wa-media|wa-lightbox/);
 });
+
+test("injected script covers reactions, contacts, location, and media send", () => {
+  const out = injectWhatsAppUi(sample, "/whatsapp/4/");
+  const m = out.match(/<script id="nesher-wa-ui-js">([\s\S]*?)<\/script>/);
+  assert.ok(m);
+  const body = m[1];
+  for (const probe of [
+    "isReactionMsg",
+    "isContactsMsg",
+    "isLocationMsg",
+    "contactsBubbleBody",
+    "locationBubbleBody",
+    "appendReactions",
+    "send-media",
+    "sendMediaFile",
+    "guessKind",
+  ]) {
+    assert.ok(body.includes(probe), "missing complete-media piece: " + probe);
+  }
+  assert.match(out, /wa-contact-card|wa-loc|wa-reactions/);
+});

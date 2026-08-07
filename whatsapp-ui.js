@@ -516,6 +516,72 @@ const CSS = `
   }
   .wa-lightbox-close:hover { background: rgba(255,255,255,0.22); }
 
+  /* Contacts card */
+  .wa-contact-card {
+    display: flex; align-items: flex-start; gap: 10px;
+    padding: 8px 6px 4px; min-width: 200px;
+  }
+  .wa-contact-av {
+    width: 42px; height: 42px; border-radius: 50%; flex-shrink: 0;
+    background: var(--wa-green); color: #fff;
+    display: grid; place-items: center; font-weight: 700; font-size: 14px;
+  }
+  .wa-contact-meta { min-width: 0; flex: 1; }
+  .wa-contact-name { font-weight: 700; font-size: 14.5px; color: var(--wa-ink); }
+  .wa-contact-phone {
+    font-size: 13px; color: #027eb5; margin-top: 2px;
+    text-decoration: none; display: block;
+  }
+  .wa-contact-phone:hover { text-decoration: underline; }
+
+  /* Location card */
+  .wa-loc {
+    display: block; text-decoration: none; color: inherit;
+    border-radius: 8px; overflow: hidden; min-width: 210px;
+    background: rgba(11,20,26,0.05);
+  }
+  .wa-loc:hover { background: rgba(11,20,26,0.09); }
+  .wa-loc-map {
+    height: 96px; background:
+      linear-gradient(135deg, #c8e6c9 0%, #a5d6a7 40%, #81c784 100%);
+    display: grid; place-items: center; font-size: 28px;
+  }
+  .wa-loc-body { padding: 8px 10px 6px; }
+  .wa-loc-name { font-weight: 700; font-size: 13.5px; }
+  .wa-loc-addr { font-size: 12px; color: var(--wa-faint); margin-top: 2px; }
+  .wa-loc-link { font-size: 12px; color: #027eb5; margin-top: 4px; font-weight: 600; }
+
+  /* Interactive / button reply */
+  .wa-interactive {
+    border-left: 3px solid var(--wa-green);
+    padding: 4px 0 4px 10px; margin-bottom: 2px;
+  }
+  .wa-interactive-label {
+    font-size: 11px; font-weight: 700; color: var(--wa-faint);
+    text-transform: uppercase; letter-spacing: .04em; margin-bottom: 2px;
+  }
+  .wa-interactive-title { font-size: 14.5px; font-weight: 600; }
+
+  /* Forwarded badge */
+  .wa-fwd {
+    font-size: 11.5px; color: var(--wa-faint); font-style: italic;
+    margin-bottom: 3px;
+  }
+
+  /* Reactions pinned on a bubble */
+  .wa-reactions {
+    display: inline-flex; gap: 2px; align-items: center;
+    margin-top: 4px; padding: 2px 6px;
+    background: #fff; border-radius: 999px;
+    box-shadow: 0 1px 2px rgba(11,20,26,0.12);
+    font-size: 14px; line-height: 1.2;
+    align-self: flex-start;
+  }
+  .wa-msg.out .wa-reactions { align-self: flex-end; }
+  .wa-reaction-solo {
+    font-size: 28px; line-height: 1; padding: 4px 8px;
+  }
+
   /* Jump-to-latest */
   .wa-jump {
     position: absolute; right: 22px; bottom: 86px; z-index: 5;
@@ -864,6 +930,23 @@ const SCRIPT = `
     return m.messageType === "document" || m.mediaKind === "document" ||
       /^\\[document/i.test(String(m.body || ""));
   }
+  function isLocationMsg(m) {
+    return m.messageType === "location" || !!m.location ||
+      /^\\[location/i.test(String(m.body || ""));
+  }
+  function isContactsMsg(m) {
+    return m.messageType === "contacts" || m.messageType === "contact" ||
+      (Array.isArray(m.contacts) && m.contacts.length > 0) ||
+      /^\\[contacts?/i.test(String(m.body || ""));
+  }
+  function isReactionMsg(m) {
+    return m.messageType === "reaction" || !!m.reaction ||
+      /^\\[reaction/i.test(String(m.body || ""));
+  }
+  function isInteractiveMsg(m) {
+    return !!m.interactive || m.messageType === "interactive" || m.messageType === "button" ||
+      /^\\[(button|interactive)/i.test(String(m.body || ""));
+  }
   function mediaUrl(mediaId) {
     return "/__nesher_wa/media/" + encodeURIComponent(mediaId) + "/";
   }
@@ -872,7 +955,7 @@ const SCRIPT = `
     if (c) return c;
     var b = String(m.body || "").trim();
     // Django stores placeholders like "[image message received]" — never show those as caption
-    if (!b || /^\\[(image|video|sticker|document|voice note|audio)/i.test(b)) return "";
+    if (!b || /^\\[(image|video|sticker|document|voice note|audio|location|contacts?|reaction|button|interactive|unknown|unsupported)/i.test(b)) return "";
     return b;
   }
   function openLightbox(src) {
@@ -902,11 +985,33 @@ const SCRIPT = `
       var ic = captionOf(m);
       return { text: ic ? ("Photo \\u00B7 " + ic) : "Photo", voice: false };
     }
-    if (isVideoMsg(m)) return { text: captionOf(m) ? ("Video \\u00B7 " + captionOf(m)) : "Video", voice: false };
+    if (isVideoMsg(m)) {
+      var vc = captionOf(m);
+      return { text: vc ? ("Video \\u00B7 " + vc) : "Video", voice: false };
+    }
     if (isStickerMsg(m)) return { text: "Sticker", voice: false };
     if (isDocMsg(m)) return { text: m.filename || "Document", voice: false };
+    if (isLocationMsg(m)) {
+      var ln = (m.location && (m.location.name || m.location.address)) || "Location";
+      return { text: "Location \\u00B7 " + ln, voice: false };
+    }
+    if (isContactsMsg(m)) {
+      var cn = (m.contacts && m.contacts[0] && m.contacts[0].name) || "Contact";
+      return { text: "Contact \\u00B7 " + cn, voice: false };
+    }
+    if (isReactionMsg(m)) {
+      var em = (m.reaction && m.reaction.emoji) || "\\uD83D\\uDC4D";
+      return { text: "Reacted " + em, voice: false };
+    }
+    if (isInteractiveMsg(m)) {
+      return { text: (m.interactive && m.interactive.title) || "Reply", voice: false };
+    }
     var plain = String(m.body || "").replace(/\\s+/g, " ").trim();
     if (/^\\[image message received\\]/i.test(plain)) return { text: "Photo", voice: false };
+    if (/^\\[contacts? message received\\]/i.test(plain)) return { text: "Contact", voice: false };
+    if (/^\\[reaction message received\\]/i.test(plain)) return { text: "Reaction", voice: false };
+    if (/^\\[location message received\\]/i.test(plain)) return { text: "Location", voice: false };
+    if (/^\\[.+ message received\\]/i.test(plain)) return { text: plain.replace(/^\\[| message received\\]$/gi, ""), voice: false };
     return { text: plain, voice: false };
   }
 
@@ -1631,6 +1736,75 @@ const SCRIPT = `
       return wrap;
     }
 
+    function locationBubbleBody(mUi) {
+      var loc = mUi.location || {};
+      var wrap = el("div");
+      var lat = loc.lat != null ? loc.lat : loc.latitude;
+      var lng = loc.lng != null ? loc.lng : loc.longitude;
+      var maps = (lat != null && lng != null)
+        ? ("https://www.google.com/maps?q=" + encodeURIComponent(lat + "," + lng))
+        : null;
+      var a = el(maps ? "a" : "div", "wa-loc");
+      if (maps) { a.href = maps; a.target = "_blank"; a.rel = "noopener"; }
+      a.appendChild(el("div", "wa-loc-map", "\\uD83D\\uDCCD"));
+      var body = el("div", "wa-loc-body");
+      body.appendChild(el("div", "wa-loc-name", loc.name || "Shared location"));
+      if (loc.address) body.appendChild(el("div", "wa-loc-addr", loc.address));
+      if (maps) body.appendChild(el("div", "wa-loc-link", "Open in Maps"));
+      a.appendChild(body);
+      wrap.appendChild(a);
+      return wrap;
+    }
+
+    function contactsBubbleBody(mUi) {
+      var list = Array.isArray(mUi.contacts) ? mUi.contacts : [];
+      var wrap = el("div");
+      if (!list.length) {
+        wrap.appendChild(el("div", "wa-text", "Shared contact"));
+        return wrap;
+      }
+      list.forEach(function (c) {
+        var card = el("div", "wa-contact-card");
+        var name = c.name || "Contact";
+        card.appendChild(el("div", "wa-contact-av", initials(name, (c.phones && c.phones[0]) || "")));
+        var meta = el("div", "wa-contact-meta");
+        meta.appendChild(el("div", "wa-contact-name", name));
+        (c.phones || []).forEach(function (ph) {
+          var digits = String(ph).replace(/\\D/g, "");
+          var link = el("a", "wa-contact-phone", ph);
+          if (digits) {
+            link.href = "https://wa.me/" + digits;
+            link.target = "_blank";
+            link.rel = "noopener";
+          }
+          meta.appendChild(link);
+        });
+        card.appendChild(meta);
+        wrap.appendChild(card);
+      });
+      return wrap;
+    }
+
+    function interactiveBubbleBody(mUi) {
+      var it = mUi.interactive || {};
+      var wrap = el("div", "wa-interactive");
+      wrap.appendChild(el("div", "wa-interactive-label",
+        it.kind === "list_reply" ? "List reply" : "Button reply"));
+      wrap.appendChild(el("div", "wa-interactive-title", it.title || "Reply"));
+      if (it.description) wrap.appendChild(el("div", "wa-text", it.description));
+      return wrap;
+    }
+
+    function appendReactions(bub, mUi) {
+      var rs = Array.isArray(mUi.reactions) ? mUi.reactions : [];
+      if (!rs.length) return;
+      var bar = el("div", "wa-reactions");
+      rs.forEach(function (r) {
+        bar.appendChild(document.createTextNode(r.emoji || "\\uD83D\\uDC4D"));
+      });
+      bub.appendChild(bar);
+    }
+
     /* thread rendering — append-only diff so audio playback survives polls */
     var rendered = {};       // id -> {node, status, tickEl}
     var lastDayK = null;
@@ -1661,6 +1835,9 @@ const SCRIPT = `
         bub.appendChild(sender);
       }
       if (dir === "out") lastOutSender = who || lastOutSender;
+      if (mUi.forwarded) {
+        bub.appendChild(el("div", "wa-fwd", "Forwarded"));
+      }
       if (isAudioMsg(mUi)) {
         bub.appendChild(audioBubbleBody(mUi));
       } else if (isImageMsg(mUi)) {
@@ -1675,9 +1852,24 @@ const SCRIPT = `
       } else if (isDocMsg(mUi)) {
         bub.classList.add("wa-has-media");
         bub.appendChild(mediaBubbleBody(mUi, "document"));
+      } else if (isLocationMsg(mUi)) {
+        bub.appendChild(locationBubbleBody(mUi));
+      } else if (isContactsMsg(mUi)) {
+        bub.appendChild(contactsBubbleBody(mUi));
+      } else if (isInteractiveMsg(mUi)) {
+        bub.appendChild(interactiveBubbleBody(mUi));
+      } else if (isReactionMsg(mUi)) {
+        /* orphan reaction (target not in loaded thread) */
+        var re = (mUi.reaction && mUi.reaction.emoji) || "\\uD83D\\uDC4D";
+        bub.appendChild(el("div", "wa-reaction-solo", re));
+        bub.appendChild(el("div", "wa-text", "Reacted to a message"));
       } else {
+        var bodyText = mUi.body || "";
+        if (/^\\[.+ message (received|sent)\\]$/i.test(String(bodyText).trim())) {
+          bodyText = previewFor(mUi).text || bodyText;
+        }
         var txt = el("div", "wa-text");
-        txt.appendChild(linkify(mUi.body || ""));
+        txt.appendChild(linkify(bodyText));
         bub.appendChild(txt);
       }
       var meta = el("span", "wa-msg-meta");
@@ -1688,6 +1880,7 @@ const SCRIPT = `
         meta.appendChild(tickEl);
       }
       bub.appendChild(meta);
+      appendReactions(bub, mUi);
       if (String(mUi.status).toLowerCase() === "failed" && mUi.error) {
         bub.appendChild(el("div", "wa-msg-error", "Not delivered: " + mUi.error));
       }
@@ -1763,7 +1956,7 @@ const SCRIPT = `
     }
 
     /* pending (optimistic) bubbles */
-    function addPending(bodyText, isVoice) {
+    function addPending(bodyText, kind) {
       var now = new Date();
       var k = dayKey(now);
       if (k !== lastDayK) {
@@ -1776,14 +1969,22 @@ const SCRIPT = `
       var row = el("div", "wa-msg out pending" + (lastDir !== "out" ? " first" : ""));
       lastDir = "out";
       var bub = el("div", "wa-bubble");
-      if (isVoice) {
+      if (kind === "voice" || kind === true) {
         var tag = el("div", "wa-voice-tag");
         tag.appendChild(icon("micSm"));
         tag.appendChild(document.createTextNode("Voice note \\u2014 sending\\u2026"));
         bub.appendChild(tag);
+      } else if (kind === "image") {
+        bub.appendChild(el("div", "wa-media-fallback", "Sending photo\\u2026"));
+      } else if (kind === "video") {
+        bub.appendChild(el("div", "wa-media-fallback", "Sending video\\u2026"));
+      } else if (kind === "document") {
+        bub.appendChild(el("div", "wa-media-fallback", "Sending file\\u2026"));
+      } else if (kind === "audio") {
+        bub.appendChild(el("div", "wa-media-fallback", "Sending audio\\u2026"));
       } else {
         var txt = el("div", "wa-text");
-        txt.appendChild(linkify(bodyText));
+        txt.appendChild(linkify(bodyText || ""));
         bub.appendChild(txt);
       }
       var meta = el("span", "wa-msg-meta");
@@ -1818,11 +2019,11 @@ const SCRIPT = `
     var composer = el("div", "wa-composer");
     var attach = el("button", "wa-icon-btn wa-attach-btn");
     attach.type = "button"; attach.innerHTML = I.clip;
-    attach.title = "Send an audio file";
-    attach.setAttribute("aria-label", "Send an audio file");
+    attach.title = "Attach photo, video, PDF, or audio";
+    attach.setAttribute("aria-label", "Attach file");
     var fileInput = el("input");
     fileInput.type = "file";
-    fileInput.accept = "audio/*,.ogg,.mp3,.m4a,.aac,.webm";
+    fileInput.accept = "image/*,video/*,audio/*,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv,.zip,.ogg,.mp3,.m4a,.aac,.webm,.jpg,.jpeg,.png,.webp,.mp4,.mov";
     fileInput.className = "wa-hidden";
     var wrap = el("div", "wa-input-wrap");
     var input = el("textarea", "wa-input");
@@ -1925,7 +2126,7 @@ const SCRIPT = `
     function sendAudioBlob(blob, mime, isVoice) {
       var who = agentName();
       if (!who) { openIdentityPicker(function () { sendAudioBlob(blob, mime, isVoice); }); return Promise.resolve(); }
-      var row = addPending("", true);
+      var row = addPending("", isVoice !== false ? "voice" : "audio");
       micBtn.disabled = true; attach.disabled = true;
       return blobToBase64(blob)
         .then(function (b64) {
@@ -1948,12 +2149,59 @@ const SCRIPT = `
         })
         .then(function () { micBtn.disabled = false; attach.disabled = false; });
     }
+    function guessKind(file) {
+      var t = String(file.type || "").toLowerCase();
+      var n = String(file.name || "").toLowerCase();
+      if (t.startsWith("image/") || /\\.(jpe?g|png|gif|webp)$/i.test(n)) return "image";
+      if (t.startsWith("video/") || /\\.(mp4|mov|3gp|webm)$/i.test(n)) return "video";
+      if (t.startsWith("audio/") || /\\.(ogg|mp3|m4a|aac|opus|wav|webm)$/i.test(n)) return "audio";
+      return "document";
+    }
+    function sendMediaFile(file) {
+      var who = agentName();
+      if (!who) { openIdentityPicker(function () { sendMediaFile(file); }); return Promise.resolve(); }
+      var kind = guessKind(file);
+      if (kind === "audio") {
+        return sendAudioBlob(file, file.type || "audio/mpeg", /ogg|opus|webm/i.test(file.type || file.name));
+      }
+      if (file.size > 64 * 1024 * 1024) {
+        toast("File too large (max 64 MB)", "error");
+        return Promise.resolve();
+      }
+      var row = addPending("", kind);
+      micBtn.disabled = true; attach.disabled = true;
+      return blobToBase64(file)
+        .then(function (b64) {
+          return fetch("/__nesher_wa/contact/" + contactId + "/send-media/", {
+            method: "POST",
+            credentials: "same-origin",
+            headers: { "Content-Type": "application/json", "X-Requested-With": "XMLHttpRequest" },
+            body: JSON.stringify({
+              fileBase64: b64,
+              mimeType: file.type || "application/octet-stream",
+              filename: file.name || "file.bin",
+              agentTag: who
+            })
+          });
+        })
+        .then(function (r) {
+          return r.json().catch(function () { return {}; }).then(function (data) {
+            if (!r.ok) throw new Error(data.error || ("HTTP " + r.status));
+            return refresh([row]);
+          });
+        })
+        .catch(function (e) {
+          toast("Send failed: " + (e.message || e), "error");
+          markFailed(row, e.message, function () { sendMediaFile(file); });
+        })
+        .then(function () { micBtn.disabled = false; attach.disabled = false; });
+    }
     attach.addEventListener("click", function () { fileInput.click(); });
     fileInput.addEventListener("change", function () {
       var f = fileInput.files && fileInput.files[0];
       fileInput.value = "";
       if (!f) return;
-      sendAudioBlob(f, f.type || "audio/mpeg", /ogg|opus|webm/i.test(f.type || f.name));
+      sendMediaFile(f);
     });
 
     /* recorder */

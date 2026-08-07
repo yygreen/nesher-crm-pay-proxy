@@ -26,15 +26,80 @@ export function waConfig() {
   return { token, phoneNumberId, configured: Boolean(token && phoneNumberId) };
 }
 
+/** Durable media cache — Meta only keeps media downloadable ~30 days. */
+const MEDIA_CACHE_MAX = 12 * 1024 * 1024; // 12 MB
+let mediaCacheReady = false;
+
+async function ensureMediaCache() {
+  if (mediaCacheReady) return;
+  const p = getPool();
+  await p.query(`
+    CREATE TABLE IF NOT EXISTS nesher_wa_media_cache (
+      media_id TEXT PRIMARY KEY,
+      mime_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+      bytes BYTEA NOT NULL,
+      byte_size INT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `);
+  mediaCacheReady = true;
+}
+
+export async function cacheMediaBlob(mediaId, buffer, mimeType) {
+  const id = String(mediaId || "").replace(/[^\d]/g, "");
+  if (!id || !buffer?.length || buffer.length > MEDIA_CACHE_MAX) return false;
+  try {
+    await ensureMediaCache();
+    await getPool().query(
+      `INSERT INTO nesher_wa_media_cache (media_id, mime_type, bytes, byte_size)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (media_id) DO NOTHING`,
+      [id, mimeType || "application/octet-stream", buffer, buffer.length]
+    );
+    return true;
+  } catch (e) {
+    console.warn("wa media cache write", e.message);
+    return false;
+  }
+}
+
+async function readMediaCache(mediaId) {
+  const id = String(mediaId || "").replace(/[^\d]/g, "");
+  if (!id) return null;
+  try {
+    await ensureMediaCache();
+    const r = await getPool().query(
+      `SELECT mime_type, bytes, byte_size FROM nesher_wa_media_cache WHERE media_id = $1`,
+      [id]
+    );
+    if (!r.rows.length) return null;
+    const row = r.rows[0];
+    return {
+      buffer: row.bytes,
+      mimeType: row.mime_type,
+      fileSize: row.byte_size,
+      id,
+      cached: true,
+    };
+  } catch (e) {
+    console.warn("wa media cache read", e.message);
+    return null;
+  }
+}
+
 /**
- * Resolve Meta media metadata + binary.
+ * Resolve Meta media metadata + binary (with durable Postgres cache).
  * @param {string} mediaId
  */
 export async function downloadWhatsAppMedia(mediaId) {
-  const { token } = waConfig();
-  if (!token) throw new Error("WHATSAPP_ACCESS_TOKEN not configured on proxy");
   const id = String(mediaId || "").replace(/[^\d]/g, "");
   if (!id) throw new Error("Invalid media id");
+
+  const hit = await readMediaCache(id);
+  if (hit) return hit;
+
+  const { token } = waConfig();
+  if (!token) throw new Error("WHATSAPP_ACCESS_TOKEN not configured on proxy");
 
   const metaRes = await fetch(`${GRAPH}/${id}`, {
     headers: { Authorization: `Bearer ${token}` },
@@ -50,12 +115,15 @@ export async function downloadWhatsAppMedia(mediaId) {
   });
   if (!binRes.ok) throw new Error(`Meta media download HTTP ${binRes.status}`);
   const buf = Buffer.from(await binRes.arrayBuffer());
-  return {
+  const out = {
     buffer: buf,
-    mimeType: meta.mime_type || binRes.headers.get("content-type") || "audio/ogg",
+    mimeType: meta.mime_type || binRes.headers.get("content-type") || "application/octet-stream",
     fileSize: meta.file_size || buf.length,
     id: meta.id || id,
+    cached: false,
   };
+  cacheMediaBlob(out.id, out.buffer, out.mimeType).catch(() => {});
+  return out;
 }
 
 /**
@@ -253,27 +321,29 @@ export async function markContactRead(contactId) {
   );
 }
 
-/**
- * Pull media metadata out of a WhatsApp Cloud API message raw_payload.
- * Handles the common CRM shapes: top-level { image|audio|…: { id } }, nested
- * under message / messages[0] / entry…value.messages[0], and message_type alone.
- * Returns null when no media id is present.
- */
-export function extractWaMedia(raw, messageType) {
+/** Normalize webhook / CRM shapes to a list of candidate message objects. */
+export function waPayloadCandidates(raw) {
   const root = raw && typeof raw === "object" ? raw : {};
   const candidates = [root];
   if (root.message && typeof root.message === "object") candidates.push(root.message);
   if (Array.isArray(root.messages) && root.messages[0]) candidates.push(root.messages[0]);
-  // Full webhook envelope occasionally stored whole
   try {
     const msgs = root.entry?.[0]?.changes?.[0]?.value?.messages;
     if (Array.isArray(msgs) && msgs[0]) candidates.push(msgs[0]);
   } catch {
     /* ignore */
   }
+  return candidates.filter((o) => o && typeof o === "object");
+}
 
+/**
+ * Pull media metadata out of a WhatsApp Cloud API message raw_payload.
+ * Returns null when no media id is present.
+ */
+export function extractWaMedia(raw, messageType) {
+  const candidates = waPayloadCandidates(raw);
   const kinds = ["image", "video", "sticker", "document", "audio"];
-  const prefer = String(messageType || root.type || "")
+  const prefer = String(messageType || candidates[0]?.type || "")
     .toLowerCase()
     .replace(/[^a-z]/g, "");
   if (prefer && kinds.includes(prefer)) {
@@ -282,7 +352,6 @@ export function extractWaMedia(raw, messageType) {
   }
 
   for (const obj of candidates) {
-    if (!obj || typeof obj !== "object") continue;
     for (const kind of kinds) {
       const m = obj[kind];
       if (m && typeof m === "object" && (m.id || m.link)) {
@@ -300,8 +369,114 @@ export function extractWaMedia(raw, messageType) {
   return null;
 }
 
+function phonesFromVcard(vcard) {
+  if (!vcard) return [];
+  let text = String(vcard);
+  // Django sometimes stores base64-encoded vcards
+  if (!/^BEGIN:VCARD/i.test(text) && /^[A-Za-z0-9+/=]+$/.test(text.replace(/\s/g, ""))) {
+    try {
+      text = Buffer.from(text.replace(/\s/g, ""), "base64").toString("utf8");
+    } catch {
+      /* keep original */
+    }
+  }
+  const phones = [];
+  for (const line of text.split(/\r?\n/)) {
+    const m = line.match(/^TEL[^:]*:(.+)$/i);
+    if (m) phones.push(m[1].trim());
+  }
+  return phones;
+}
+
+/**
+ * Non-media structured fields: location, contacts, reaction, interactive, context.
+ */
+export function extractWaStructured(raw, messageType) {
+  const candidates = waPayloadCandidates(raw);
+  const out = {
+    location: null,
+    contacts: null,
+    reaction: null,
+    interactive: null,
+    forwarded: false,
+    contextWamid: null,
+  };
+
+  for (const obj of candidates) {
+    if (obj.location && typeof obj.location === "object") {
+      const loc = obj.location;
+      out.location = {
+        lat: loc.latitude != null ? Number(loc.latitude) : null,
+        lng: loc.longitude != null ? Number(loc.longitude) : null,
+        name: loc.name ? String(loc.name) : null,
+        address: loc.address ? String(loc.address) : null,
+      };
+    }
+    if (Array.isArray(obj.contacts) && obj.contacts.length) {
+      out.contacts = obj.contacts.map((c) => {
+        const name =
+          c?.name?.formatted_name ||
+          [c?.name?.first_name, c?.name?.last_name].filter(Boolean).join(" ") ||
+          "Contact";
+        const phones = [];
+        if (Array.isArray(c.phones)) {
+          for (const p of c.phones) {
+            if (p?.phone) phones.push(String(p.phone));
+            else if (p?.wa_id) phones.push(String(p.wa_id));
+          }
+        }
+        for (const p of phonesFromVcard(c.vcard)) {
+          if (!phones.includes(p)) phones.push(p);
+        }
+        return { name: String(name), phones };
+      });
+    }
+    if (obj.reaction && typeof obj.reaction === "object") {
+      out.reaction = {
+        emoji: String(obj.reaction.emoji || "").trim() || "👍",
+        messageId: obj.reaction.message_id ? String(obj.reaction.message_id) : null,
+      };
+    }
+    if (obj.interactive && typeof obj.interactive === "object") {
+      const it = obj.interactive;
+      const br = it.button_reply || it.list_reply || null;
+      if (br) {
+        out.interactive = {
+          kind: it.type || (it.button_reply ? "button_reply" : "list_reply"),
+          title: String(br.title || br.id || "Reply"),
+          id: br.id ? String(br.id) : null,
+          description: br.description ? String(br.description) : null,
+        };
+      }
+    }
+    if (obj.button && typeof obj.button === "object" && obj.button.text) {
+      out.interactive = {
+        kind: "button",
+        title: String(obj.button.text),
+        id: obj.button.payload ? String(obj.button.payload) : null,
+        description: null,
+      };
+    }
+    if (obj.context && typeof obj.context === "object") {
+      if (obj.context.forwarded || obj.context.frequently_forwarded) out.forwarded = true;
+      if (obj.context.id) out.contextWamid = String(obj.context.id);
+    }
+  }
+
+  // Fallback when message_type alone is the only signal
+  const mt = String(messageType || "").toLowerCase();
+  if (mt === "reaction" && !out.reaction && raw?.reaction) {
+    out.reaction = {
+      emoji: String(raw.reaction.emoji || "👍"),
+      messageId: raw.reaction.message_id ? String(raw.reaction.message_id) : null,
+    };
+  }
+  return out;
+}
+
 /**
  * List messages for a contact (newest last for chat UI).
+ * Reactions are attached onto their target bubble when the target is in-thread.
  */
 export async function listContactMessages(contactId, limit = 100) {
   const p = getPool();
@@ -318,9 +493,10 @@ export async function listContactMessages(contactId, limit = 100) {
      LIMIT $2`,
     [id, lim]
   );
-  return r.rows.map((row) => {
+  const mapped = r.rows.map((row) => {
     const raw = row.raw_payload || {};
     const media = extractWaMedia(raw, row.message_type);
+    const structured = extractWaStructured(raw, row.message_type);
     return {
       id: Number(row.id),
       direction: row.direction,
@@ -336,11 +512,39 @@ export async function listContactMessages(contactId, limit = 100) {
       mimeType: media?.mimeType || null,
       caption: media?.caption || null,
       filename: media?.filename || null,
+      location: structured.location,
+      contacts: structured.contacts,
+      reaction: structured.reaction,
+      interactive: structured.interactive,
+      forwarded: structured.forwarded,
+      contextWamid: structured.contextWamid,
+      reactions: [],
       sentBy: row.sender || null,
       agentTag: (raw.agent_tag || "").trim() || null,
       transcriptEn: String(raw.transcript_en || "").trim() || null,
     };
   });
+
+  const byWamid = new Map();
+  for (const m of mapped) {
+    if (m.wamid) byWamid.set(String(m.wamid), m);
+  }
+  const out = [];
+  for (const m of mapped) {
+    if (m.messageType === "reaction" && m.reaction?.messageId) {
+      const target = byWamid.get(String(m.reaction.messageId));
+      if (target) {
+        target.reactions.push({
+          emoji: m.reaction.emoji,
+          direction: m.direction,
+          id: m.id,
+        });
+        continue; // fold into target bubble — no standalone row
+      }
+    }
+    out.push(m);
+  }
+  return out;
 }
 
 /**
@@ -936,6 +1140,7 @@ export async function sendContactAudio({
   }
 
   const mediaId = await uploadWhatsAppMedia(uploadBuf, uploadMime, filename);
+  await cacheMediaBlob(mediaId, uploadBuf, uploadMime);
   const { wamid } = await sendWhatsAppAudio({
     to: contact.phone_number,
     mediaId,
@@ -956,6 +1161,206 @@ export async function sendContactAudio({
     messageId,
     wamid,
     mediaId,
+    phone: contact.phone_number,
+    displayName: contact.display_name,
+  };
+}
+
+/**
+ * Infer Cloud API media kind from mime / filename.
+ * @returns {"image"|"video"|"document"|"audio"|null}
+ */
+export function inferMediaKind(mimeType, filename = "") {
+  const mime = String(mimeType || "").toLowerCase();
+  const name = String(filename || "").toLowerCase();
+  if (mime.startsWith("image/") || /\.(jpe?g|png|gif|webp)$/i.test(name)) return "image";
+  if (mime.startsWith("video/") || /\.(mp4|mov|3gp|webm)$/i.test(name)) return "video";
+  if (mime.startsWith("audio/") || /\.(ogg|mp3|m4a|aac|opus|wav)$/i.test(name)) return "audio";
+  if (mime && mime !== "application/octet-stream") return "document";
+  if (/\.(pdf|docx?|xlsx?|pptx?|txt|csv|zip)$/i.test(name)) return "document";
+  return null;
+}
+
+/**
+ * Send image / video / document via Cloud API.
+ */
+export async function sendWhatsAppMediaMessage({ to, kind, mediaId, caption, filename }) {
+  const { token, phoneNumberId } = waConfig();
+  if (!token || !phoneNumberId) throw new Error("WhatsApp not configured on proxy");
+  const phone = String(to || "").replace(/\D/g, "");
+  if (!phone) throw new Error("Missing recipient phone");
+  const type = String(kind || "").toLowerCase();
+  if (!["image", "video", "document"].includes(type)) {
+    throw new Error(`Unsupported media send kind: ${kind}`);
+  }
+  const payload = {
+    messaging_product: "whatsapp",
+    recipient_type: "individual",
+    to: phone,
+    type,
+    [type]: {
+      id: mediaId,
+      ...(caption ? { caption: String(caption).slice(0, 1024) } : {}),
+      ...(type === "document" && filename ? { filename: String(filename).slice(0, 240) } : {}),
+    },
+  };
+  const res = await fetch(`${GRAPH}/${phoneNumberId}/messages`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(humanizeMetaSendError(data, `Send ${type} HTTP ${res.status}`));
+  }
+  return { wamid: data?.messages?.[0]?.id || "", data };
+}
+
+/**
+ * Persist outbound image/video/document row.
+ */
+export async function recordOutboundMedia({
+  contactId,
+  wamid,
+  kind,
+  mediaId,
+  mimeType,
+  caption = "",
+  filename = "",
+  sentById = null,
+  agentTag = "",
+}) {
+  const p = getPool();
+  const now = new Date();
+  const type = String(kind || "document");
+  const raw = {
+    type,
+    [type]: {
+      id: mediaId,
+      mime_type: mimeType || null,
+      ...(caption ? { caption } : {}),
+      ...(filename ? { filename } : {}),
+    },
+    direction: "outbound",
+  };
+  const tag = String(agentTag || "").trim().slice(0, 40);
+  if (tag) raw.agent_tag = tag;
+  const body =
+    caption ||
+    (type === "image"
+      ? "[image sent]"
+      : type === "video"
+        ? "[video sent]"
+        : filename
+          ? `[document sent] ${filename}`
+          : "[document sent]");
+  const ins = await p.query(
+    `INSERT INTO core_whatsappmessage
+      (direction, status, message_type, body, whatsapp_message_id, raw_payload,
+       error_message, created_at, message_at, contact_id, customer_id, sent_by_id)
+     VALUES
+      ('outbound', 'sent', $1, $2, $3, $4::jsonb, '', $5, $5, $6, NULL, $7)
+     RETURNING id`,
+    [
+      type,
+      body,
+      wamid || `local-${Date.now()}`,
+      JSON.stringify(raw),
+      now,
+      Number(contactId),
+      sentById == null ? null : Number(sentById),
+    ]
+  );
+  await p.query(
+    `UPDATE core_whatsappcontact
+     SET last_message_at = $1, updated_at = $1
+     WHERE id = $2`,
+    [now, Number(contactId)]
+  );
+  return Number(ins.rows[0].id);
+}
+
+/**
+ * Full outbound path for image / video / document attachments.
+ */
+export async function sendContactMedia({
+  contactId,
+  buffer,
+  mimeType = "application/octet-stream",
+  filename = "file.bin",
+  caption = "",
+  sentById = null,
+  agentTag = "",
+}) {
+  if (!buffer?.length) throw new Error("Empty file");
+  if (buffer.length > 64 * 1024 * 1024) throw new Error("File too large (max 64 MB)");
+
+  const contact = await getContact(contactId);
+  let kind = inferMediaKind(mimeType, filename);
+  if (!kind || kind === "audio") {
+    // Audio still goes through the AAC conversion path
+    if (kind === "audio" || /^audio\//i.test(mimeType)) {
+      return sendContactAudio({
+        contactId,
+        buffer,
+        mimeType,
+        isVoice: false,
+        sentById,
+        agentTag,
+      });
+    }
+    kind = "document";
+  }
+
+  // Meta limits (approximate, enforced server-side too)
+  const limits = { image: 5 * 1024 * 1024, video: 16 * 1024 * 1024, document: 100 * 1024 * 1024 };
+  if (buffer.length > (limits[kind] || limits.document)) {
+    throw new Error(
+      `${kind} is too large (${Math.round(buffer.length / 1024 / 1024)} MB). Max for ${kind}: ${Math.round((limits[kind] || limits.document) / 1024 / 1024)} MB.`
+    );
+  }
+
+  let uploadMime = mimeType || "application/octet-stream";
+  let uploadName = filename || "file.bin";
+  if (kind === "image") {
+    if (!/^image\//i.test(uploadMime)) uploadMime = "image/jpeg";
+    if (!/\.(jpe?g|png|webp|gif)$/i.test(uploadName)) uploadName = "photo.jpg";
+  } else if (kind === "video") {
+    if (!/^video\//i.test(uploadMime)) uploadMime = "video/mp4";
+    if (!/\.(mp4|3gp|mov)$/i.test(uploadName)) uploadName = "video.mp4";
+  } else {
+    if (!uploadName || uploadName === "file.bin") uploadName = "document.bin";
+  }
+
+  const mediaId = await uploadWhatsAppMedia(buffer, uploadMime, uploadName);
+  await cacheMediaBlob(mediaId, buffer, uploadMime);
+  const { wamid } = await sendWhatsAppMediaMessage({
+    to: contact.phone_number,
+    kind,
+    mediaId,
+    caption,
+    filename: uploadName,
+  });
+  const messageId = await recordOutboundMedia({
+    contactId: contact.id,
+    wamid,
+    kind,
+    mediaId,
+    mimeType: uploadMime,
+    caption,
+    filename: uploadName,
+    sentById,
+    agentTag,
+  });
+  return {
+    ok: true,
+    messageId,
+    wamid,
+    mediaId,
+    kind,
     phone: contact.phone_number,
     displayName: contact.display_name,
   };

@@ -28,6 +28,7 @@ import {
   listInboxSummaries,
   markContactRead,
   sendContactAudio,
+  sendContactMedia,
   sessionUserId,
   stampAgentTag,
   listAgents,
@@ -344,10 +345,14 @@ async function handleWaMedia(req, res, mediaId) {
   if (!(await requireStaff(req, res))) return;
   try {
     const file = await downloadWhatsAppMedia(mediaId);
+    // Cached blobs are durable — allow long browser cache. Fresh Meta pulls
+    // still cache for a day so refresh storms don't re-download.
+    const maxAge = file.cached ? 86400 * 30 : 86400;
     res.writeHead(200, {
-      "Content-Type": file.mimeType || "audio/ogg",
+      "Content-Type": file.mimeType || "application/octet-stream",
       "Content-Length": String(file.buffer.length),
-      "Cache-Control": "private, max-age=300",
+      "Cache-Control": `private, max-age=${maxAge}`,
+      "X-WA-Media-Cache": file.cached ? "hit" : "miss",
     });
     res.end(file.buffer);
   } catch (e) {
@@ -446,6 +451,39 @@ async function handleWaSendAudio(req, res, contactId) {
     sendJson(res, 200, out);
   } catch (e) {
     console.error("wa send-audio", e.message);
+    sendJson(res, 400, { error: e.message || String(e) });
+  }
+}
+
+async function handleWaSendMedia(req, res, contactId) {
+  if (req.method !== "POST") {
+    sendJson(res, 405, { error: "POST only" });
+    return;
+  }
+  if (!(await requireStaff(req, res))) return;
+  try {
+    // Base64 inflates ~33% — allow up to ~18 MB binary (Meta video max is 16 MB).
+    const raw = await readBodyBuffer(req, 25 * 1024 * 1024);
+    const j = JSON.parse(raw.toString("utf8") || "{}");
+    const b64 = j.fileBase64 || j.mediaBase64 || j.audioBase64;
+    if (!b64) throw new Error("fileBase64 required");
+    const buffer = Buffer.from(b64, "base64");
+    if (!buffer.length) throw new Error("Empty file");
+    const sentById = await sessionUserId(
+      extractSessionId(String(req.headers.cookie || ""))
+    );
+    const out = await sendContactMedia({
+      contactId,
+      buffer,
+      mimeType: j.mimeType || "application/octet-stream",
+      filename: typeof j.filename === "string" ? j.filename.slice(0, 240) : "file.bin",
+      caption: typeof j.caption === "string" ? j.caption.slice(0, 1024) : "",
+      sentById,
+      agentTag: typeof j.agentTag === "string" ? j.agentTag : "",
+    });
+    sendJson(res, 200, out);
+  } catch (e) {
+    console.error("wa send-media", e.message);
     sendJson(res, 400, { error: e.message || String(e) });
   }
 }
@@ -608,7 +646,7 @@ const server = http.createServer(async (req, res) => {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-08-07-wa-images",
+      build: "2026-08-07-wa-media-complete",
       upstream: UPSTREAM,
       paySync: lastPaySync
         ? {
@@ -653,6 +691,13 @@ const server = http.createServer(async (req, res) => {
   );
   if (waSendAudioMatch) {
     await handleWaSendAudio(req, res, waSendAudioMatch[1]);
+    return;
+  }
+  const waSendMediaMatch = url.pathname.match(
+    /^\/__nesher_wa\/contact\/(\d+)\/send-media\/?$/
+  );
+  if (waSendMediaMatch) {
+    await handleWaSendMedia(req, res, waSendMediaMatch[1]);
     return;
   }
 
