@@ -6,6 +6,10 @@ import {
   createOrReusePaymentRequest,
   humanizePayError,
 } from "./mercury.js";
+import {
+  createSquarePaymentLink,
+  isSquareConfigured,
+} from "./square.js";
 import { injectPayButtons, injectPaidBadges } from "./inject.js";
 import { injectWhatsAppUi } from "./whatsapp-ui.js";
 import {
@@ -276,17 +280,63 @@ async function handlePayApi(req, res, kind, id, query) {
       mercuryOptsFromDraft(token, draftBundle)
     );
 
+    // Card via Stripe (Mercury) when healthy. When Stripe is blocked, create a
+    // Square checkout link so guests still have a card path.
+    let cardProcessor =
+      result.cardProcessor || (result.creditCardEnabled ? "stripe" : "none");
+    let creditCardEnabled = Boolean(result.creditCardEnabled);
+    let squarePayUrl = null;
+    let squarePaymentLinkId = null;
+    let squareError = null;
+    let paymentMethodsLabel = result.paymentMethodsLabel;
+
+    const needsCardBackup =
+      !creditCardEnabled || result.cardFallback || cardProcessor === "none";
+
+    if (needsCardBackup) {
+      if (isSquareConfigured()) {
+        try {
+          const d = draftBundle.draft;
+          const sq = await createSquarePaymentLink({
+            amountUsd: d.amountUsd,
+            invoiceNumber: d.invoiceNumber,
+            lineName: d.lineItemName || d.summary || d.invoiceNumber,
+            customerEmail: d.customerEmail,
+            customerName: d.customerName,
+            // Stable-ish key so double-clicks don't mint many links for same invoice+amount
+            idempotencyKey: `crm-${d.invoiceNumber}-${Math.round(Number(d.amountUsd) * 100)}`,
+          });
+          if (sq.ok && sq.payUrl) {
+            squarePayUrl = sq.payUrl;
+            squarePaymentLinkId = sq.paymentLinkId || null;
+            cardProcessor = "square";
+            creditCardEnabled = true; // card available — via Square, not Mercury
+            paymentMethodsLabel = "Bank transfer / ACH + card (Square)";
+          } else {
+            squareError = sq.error || "Square link not created";
+            console.warn("square backup failed", squareError);
+          }
+        } catch (e) {
+          squareError = e.message || String(e);
+          console.warn("square backup threw", squareError);
+        }
+      } else {
+        squareError =
+          "Square access token not set on server (SQUARE_ACCESS_TOKEN_NESHER) — card backup offline";
+      }
+    }
+
     // CRM note
     try {
       const d = draftBundle.draft;
       const ph = d.emailPlaceholder ? " (placeholder email)" : "";
-      const methods = result.paymentMethodsLabel || "pay link";
-      const cardNote = result.cardFallback
-        ? " | card offline (bank/ACH only — Stripe unavailable)"
-        : result.creditCardEnabled
-          ? " | card+ACH"
-          : " | bank/ACH only";
-      const note = `[Automated Mercury] ${result.updated ? "Updated" : result.reused ? "Reused" : "Created"} pay link ${result.payUrl} | ${d.summary} | invoice ${d.invoiceNumber} | ${methods}${cardNote}${ph}`;
+      const cardNote =
+        cardProcessor === "stripe"
+          ? " | card+ACH (Stripe/Mercury)"
+          : cardProcessor === "square"
+            ? ` | bank + card via Square ${squarePayUrl || ""}`.trim()
+            : " | bank/ACH only (card offline)";
+      const note = `[Automated Mercury] ${result.updated ? "Updated" : result.reused ? "Reused" : "Created"} pay link ${result.payUrl} | ${d.summary} | invoice ${d.invoiceNumber} | ${paymentMethodsLabel || "pay"}${cardNote}${ph}`;
       if (kind === "reservation") {
         await appendReservationNote(ctx.reservation.id, note);
       } else if (ctx.request?.id) {
@@ -301,15 +351,18 @@ async function handlePayApi(req, res, kind, id, query) {
       reused: result.reused,
       updated: Boolean(result.updated),
       payUrl: result.payUrl,
+      squarePayUrl,
+      squarePaymentLinkId,
+      squareError: squareError || undefined,
       invoiceNumber: draftBundle.draft.invoiceNumber,
       amountUsd: draftBundle.draft.amountUsd,
       slug: result.invoice.slug,
       invoiceId: result.invoice.id,
-      creditCardEnabled: Boolean(result.creditCardEnabled),
-      cardProcessor: result.cardProcessor || (result.creditCardEnabled ? "stripe" : "none"),
-      cardFallback: Boolean(result.cardFallback),
+      creditCardEnabled,
+      cardProcessor,
+      cardFallback: Boolean(result.cardFallback) || cardProcessor === "square",
       achDebitEnabled: result.achDebitEnabled !== false,
-      paymentMethodsLabel: result.paymentMethodsLabel,
+      paymentMethodsLabel,
       emailPlaceholder: draftBundle.draft.emailPlaceholder,
       missing: draftBundle.missing,
       advice: draftBundle.advice,
@@ -768,10 +821,11 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (url.pathname === "/__nesher_pay/health") {
+    // include square readiness (no secrets) so ops can see card-backup status
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-08-07-wa-webhook-page",
+      build: "2026-08-11-square-card-backup",
       upstream: UPSTREAM,
       paySync: lastPaySync
         ? {
@@ -784,6 +838,13 @@ const server = http.createServer(async (req, res) => {
         : null,
       hasMercury: Boolean(
         process.env.MERCURY_TOKEN_NESHER || process.env.MERCURY_TOKEN
+      ),
+      hasSquare: isSquareConfigured(),
+      squareAppIdSet: Boolean(
+        process.env.SQUARE_APP_ID_NESHER || process.env.SQUARE_APPLICATION_ID
+      ),
+      squareLocationSet: Boolean(
+        process.env.SQUARE_LOCATION_ID_NESHER || process.env.SQUARE_LOCATION_ID
       ),
       hasDb: Boolean(process.env.DATABASE_URL || process.env.DATABASE_PUBLIC_URL),
       hasWhatsApp: wa.configured,
