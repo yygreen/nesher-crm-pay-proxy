@@ -2,7 +2,10 @@ import http from "node:http";
 import crypto from "node:crypto";
 import { URL } from "node:url";
 import httpProxy from "http-proxy";
-import { createOrReusePaymentRequest } from "./mercury.js";
+import {
+  createOrReusePaymentRequest,
+  humanizePayError,
+} from "./mercury.js";
 import { injectPayButtons, injectPaidBadges } from "./inject.js";
 import { injectWhatsAppUi } from "./whatsapp-ui.js";
 import {
@@ -277,7 +280,13 @@ async function handlePayApi(req, res, kind, id, query) {
     try {
       const d = draftBundle.draft;
       const ph = d.emailPlaceholder ? " (placeholder email)" : "";
-      const note = `[Automated Mercury] ${result.updated ? "Updated" : result.reused ? "Reused" : "Created"} pay link ${result.payUrl} | ${d.summary} | invoice ${d.invoiceNumber}${ph}`;
+      const methods = result.paymentMethodsLabel || "pay link";
+      const cardNote = result.cardFallback
+        ? " | card offline (bank/ACH only — Stripe unavailable)"
+        : result.creditCardEnabled
+          ? " | card+ACH"
+          : " | bank/ACH only";
+      const note = `[Automated Mercury] ${result.updated ? "Updated" : result.reused ? "Reused" : "Created"} pay link ${result.payUrl} | ${d.summary} | invoice ${d.invoiceNumber} | ${methods}${cardNote}${ph}`;
       if (kind === "reservation") {
         await appendReservationNote(ctx.reservation.id, note);
       } else if (ctx.request?.id) {
@@ -296,6 +305,11 @@ async function handlePayApi(req, res, kind, id, query) {
       amountUsd: draftBundle.draft.amountUsd,
       slug: result.invoice.slug,
       invoiceId: result.invoice.id,
+      creditCardEnabled: Boolean(result.creditCardEnabled),
+      cardProcessor: result.cardProcessor || (result.creditCardEnabled ? "stripe" : "none"),
+      cardFallback: Boolean(result.cardFallback),
+      achDebitEnabled: result.achDebitEnabled !== false,
+      paymentMethodsLabel: result.paymentMethodsLabel,
       emailPlaceholder: draftBundle.draft.emailPlaceholder,
       missing: draftBundle.missing,
       advice: draftBundle.advice,
@@ -314,12 +328,13 @@ async function handlePayApi(req, res, kind, id, query) {
   } catch (e) {
     console.error("pay api error", e);
     // Even on unexpected errors, try not to hard-block the UI — structured message
+    // Never dump raw Stripe/Mercury stack traces into the modal.
     sendJson(res, 200, {
       ok: false,
-      error: e.message || String(e),
+      error: humanizePayError(e),
       needsInput: true,
       advice: [
-        "Something failed loading CRM or talking to Mercury. Check the message, fix any missing fields, and try again.",
+        "Could not create the link this time. Confirm amount and email, then try again. Bank transfer does not need card processing.",
       ],
       missing: [],
     });

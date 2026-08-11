@@ -321,12 +321,53 @@ const CSS = `
     width: 52px; height: 52px; margin: 0 auto 12px; border-radius: 50%;
     background: #f0fdfa; border: 1px solid #99f6e4; color: #0f766e;
     display: flex; align-items: center; justify-content: center;
+    animation: nesherPop .35s ease-out;
+  }
+  @keyframes nesherPop {
+    0% { transform: scale(.6); opacity: 0; }
+    70% { transform: scale(1.06); opacity: 1; }
+    100% { transform: scale(1); }
   }
   .nesher-success-amt {
     font-size: 30px; font-weight: 700; letter-spacing: -.02em;
     font-variant-numeric: tabular-nums; color: #0f172a;
   }
   .nesher-success-meta { font-size: 13px; color: #64748b; margin-top: 4px; overflow-wrap: anywhere; }
+  .nesher-method-row {
+    display: flex; flex-wrap: wrap; gap: 8px; justify-content: center;
+    margin: 14px 0 4px;
+  }
+  .nesher-method-chip {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 6px 12px; border-radius: 999px; font-size: 12.5px; font-weight: 650;
+    border: 1px solid #99f6e4; background: #f0fdfa; color: #0f766e;
+  }
+  .nesher-method-chip.off {
+    border-color: #fde68a; background: #fffbeb; color: #b45309;
+  }
+  .nesher-method-chip .dot {
+    width: 7px; height: 7px; border-radius: 50%; background: currentColor; opacity: .85;
+  }
+  .nesher-guest-box {
+    margin-top: 14px; text-align: left; border: 1px solid #e2e8f0; border-radius: 12px;
+    background: #f8fafc; overflow: hidden;
+  }
+  .nesher-guest-box header {
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    padding: 8px 12px; border-bottom: 1px solid #e2e8f0; background: #fff;
+    font-size: 12px; font-weight: 700; color: #334155;
+  }
+  .nesher-guest-box pre {
+    margin: 0; padding: 12px; white-space: pre-wrap; word-break: break-word;
+    font-size: 12.5px; line-height: 1.5; color: #0f172a;
+    font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif;
+    max-height: 160px; overflow-y: auto;
+  }
+  .nesher-soft-warn {
+    margin: 12px 0 0; padding: 10px 12px; border-radius: 10px; text-align: left;
+    font-size: 12.5px; line-height: 1.45; color: #92400e;
+    background: #fffbeb; border: 1px solid #fde68a;
+  }
   .nesher-pill {
     display: inline-flex; margin-top: 10px; padding: 3px 10px;
     border-radius: 999px; background: #fffbeb; border: 1px solid #fde68a;
@@ -801,6 +842,31 @@ const SCRIPT = `
     else createBtn.focus();
   }
 
+  function buildGuestMessage(data) {
+    var draft = data.draft || {};
+    var amount = Number(data.amountUsd || draft.amountUsd);
+    var inv = data.invoiceNumber || draft.invoiceNumber || "";
+    var name = String(draft.customerName || "").trim().split(/\\s+/)[0] || "there";
+    var cardOn = data.creditCardEnabled !== false && data.cardProcessor !== "none";
+    // If server omitted the flag (old deploy / reuse without field), assume bank works.
+    if (data.creditCardEnabled === false || data.cardProcessor === "none") cardOn = false;
+    if (data.cardFallback) cardOn = false;
+    var payHow = cardOn
+      ? "You can pay by bank transfer (ACH) or credit card here:"
+      : "You can pay by bank transfer (ACH) here:";
+    var lines = [
+      "Hi " + name + ",",
+      "",
+      "Your balance of " + money(amount) + (inv ? " (" + inv + ")" : "") + " is ready.",
+      payHow,
+      data.payUrl || "",
+      "",
+      "Thank you,",
+      "Nesher / JRM Hotels"
+    ];
+    return lines.join("\\n");
+  }
+
   // ── Success: its own clean screen ──
   function renderSuccess(data) {
     var root = ensureModal();
@@ -808,9 +874,20 @@ const SCRIPT = `
     modalState.success = { url: data.payUrl };
     root.querySelector(".nesher-pay-panel").classList.add("success");
 
+    var cardOn = data.creditCardEnabled === true || data.cardProcessor === "stripe";
+    if (data.creditCardEnabled === false || data.cardProcessor === "none" || data.cardFallback) {
+      cardOn = false;
+    }
+    // Reused invoices without meta: don't claim card is on
+    if (data.reused && data.creditCardEnabled === undefined && !data.cardProcessor) {
+      cardOn = data.creditCardEnabled === true;
+    }
+
     document.getElementById("nesher-pay-title").textContent = "Payment link ready";
     setSub(subFor({ kind: data.kind || (modalState.kind === "reservation" ? "reservation" : "hotel"), draft: draft },
-      '<span class="nesher-chip ok">Link ready</span>'));
+      cardOn
+        ? '<span class="nesher-chip ok">Bank + card</span>'
+        : '<span class="nesher-chip">Bank / ACH</span>'));
 
     var amount = Number(data.amountUsd || draft.amountUsd);
     var emailBit = draft.customerEmail
@@ -819,21 +896,44 @@ const SCRIPT = `
     var meta = [data.invoiceNumber || draft.invoiceNumber, draft.customerName, emailBit]
       .filter(function (x) { return x && String(x).trim(); }).join(" · ");
 
+    var methodsHtml =
+      '<div class="nesher-method-row">' +
+        '<span class="nesher-method-chip"><span class="dot"></span>Bank / ACH</span>' +
+        (cardOn
+          ? '<span class="nesher-method-chip"><span class="dot"></span>Card</span>'
+          : '<span class="nesher-method-chip off"><span class="dot"></span>Card offline</span>') +
+      "</div>";
+
+    var softWarn = !cardOn
+      ? '<p class="nesher-soft-warn">Card processing is temporarily unavailable. This link still accepts bank transfer / ACH — send it with confidence.</p>'
+      : "";
+
+    var guestMsg = buildGuestMessage(data);
+    var reusedPill = data.updated
+      ? '<div class="nesher-pill">Existing link updated — same URL, new amount/details</div>'
+      : (data.reused ? '<div class="nesher-pill">Existing unpaid link reused — same URL as before</div>' : "");
+
     var body = document.getElementById("nesher-pay-body");
     body.innerHTML =
       '<div class="nesher-success">' +
         '<div class="nesher-success-check">' + ICON_CHECK + "</div>" +
         '<div class="nesher-success-amt">' + money(amount) + "</div>" +
         '<div class="nesher-success-meta">' + esc(meta) + "</div>" +
-        (data.updated
-          ? '<div class="nesher-pill">Existing link updated — same URL, new amount/details</div>'
-          : (data.reused ? '<div class="nesher-pill">Existing unpaid link reused — same URL as before</div>' : "")) +
+        methodsHtml +
+        softWarn +
+        reusedPill +
         '<div class="nesher-url-box">' +
           '<input id="nesher-success-url" readonly value="' + esc(data.payUrl) + '" aria-label="Payment link URL" />' +
-          '<button type="button" class="nesher-btn-sec" id="nesher-copy-url">Copy</button>' +
+          '<button type="button" class="nesher-btn-sec" id="nesher-copy-url">Copy link</button>' +
+        "</div>" +
+        '<div class="nesher-guest-box">' +
+          "<header><span>Guest message (ready to send)</span>" +
+            '<button type="button" class="nesher-btn-sec" id="nesher-copy-msg" style="padding:4px 10px;font-size:12px">Copy message</button>' +
+          "</header>" +
+          '<pre id="nesher-guest-msg">' + esc(guestMsg) + "</pre>" +
         "</div>" +
         '<div class="nesher-success-actions">' +
-          '<a class="nesher-btn-sec" href="' + esc(data.payUrl) + '" target="_blank" rel="noopener">Open in Mercury</a>' +
+          '<a class="nesher-btn-sec" href="' + esc(data.payUrl) + '" target="_blank" rel="noopener">Open pay page</a>' +
         "</div>" +
       "</div>";
 
@@ -841,23 +941,53 @@ const SCRIPT = `
     createBtn.disabled = false;
     createBtn.textContent = "Done";
 
+    function flashCopy(btn, label) {
+      var prev = btn.textContent;
+      btn.textContent = label || "Copied";
+      setTimeout(function () { btn.textContent = prev; }, 1600);
+    }
+    function copyText(text, btn, label) {
+      function fallback() {
+        try {
+          var ta = document.createElement("textarea");
+          ta.value = text;
+          ta.setAttribute("readonly", "");
+          ta.style.position = "fixed";
+          ta.style.left = "-9999px";
+          document.body.appendChild(ta);
+          ta.select();
+          document.execCommand("copy");
+          document.body.removeChild(ta);
+          flashCopy(btn, label);
+        } catch (e) {}
+      }
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(function () { flashCopy(btn, label); }, fallback);
+      } else fallback();
+    }
+
     var urlInput = document.getElementById("nesher-success-url");
     urlInput.addEventListener("focus", function () { urlInput.select(); });
     document.getElementById("nesher-copy-url").addEventListener("click", function () {
-      var btn = this;
-      function done() {
-        btn.textContent = "Copied";
-        setTimeout(function () { btn.textContent = "Copy"; }, 1600);
-      }
-      function fallback() {
-        try { urlInput.select(); document.execCommand("copy"); done(); } catch (e) {}
-      }
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(data.payUrl).then(done, fallback);
-      } else fallback();
+      copyText(data.payUrl, this, "Copied");
+    });
+    document.getElementById("nesher-copy-msg").addEventListener("click", function () {
+      copyText(guestMsg, this, "Copied");
+      setStatus("Guest message copied — paste into WhatsApp or email.", true);
     });
 
     openRoot(root);
+    // Prefer clipboard = guest message (what staff actually send)
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(guestMsg);
+        setStatus("Guest message copied — paste into WhatsApp or email.", true);
+      } else {
+        setStatus("Link ready — copy the guest message below.", true);
+      }
+    } catch (e) {
+      setStatus("Link ready — copy the guest message below.", true);
+    }
     createBtn.focus();
   }
 
@@ -928,10 +1058,6 @@ const SCRIPT = `
           }
         }
         renderSuccess(data);
-        try {
-          await navigator.clipboard.writeText(data.payUrl);
-          setStatus("Link copied to clipboard.", true);
-        } catch (e) {}
         return;
       }
 

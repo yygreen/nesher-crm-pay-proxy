@@ -7,6 +7,8 @@ import {
   payUrlFromSlug,
   normalizeToken,
   toUsdAmount,
+  isStripeCardBlockedError,
+  humanizePayError,
 } from "../mercury.js";
 import { injectPayButtons, BUTTON_MARKER } from "../inject.js";
 
@@ -180,6 +182,7 @@ describe("createOrReusePaymentRequest", () => {
               status: "Unpaid",
               slug: "newslug99",
               amount: 50.5,
+              creditCardEnabled: true,
             };
           },
         };
@@ -197,6 +200,133 @@ describe("createOrReusePaymentRequest", () => {
     });
     assert.equal(result.reused, false);
     assert.equal(result.payUrl, "https://app.mercury.com/pay/newslug99");
+    assert.equal(result.creditCardEnabled, true);
+    assert.equal(result.cardProcessor, "stripe");
+    assert.equal(result.cardFallback, false);
+  });
+
+  it("falls back to bank-only when Stripe is disabled (400)", async () => {
+    let postCount = 0;
+    const stripeErr =
+      "Your Stripe account is currently disabled, you must take action to re-enable it before your card payments can be accepted.";
+    const fetchImpl = async (url, init = {}) => {
+      const method = init.method || "GET";
+      if (url.endsWith("/ar/invoices") && method === "GET") {
+        return { ok: true, async json() { return { invoices: [] }; } };
+      }
+      if (url.endsWith("/ar/customers") && method === "GET") {
+        return {
+          ok: true,
+          async json() {
+            return { customers: [{ id: "cust-1", email: "t@example.com" }] };
+          },
+        };
+      }
+      if (url.endsWith("/ar/invoices") && method === "POST") {
+        postCount += 1;
+        const body = JSON.parse(init.body);
+        if (body.creditCardEnabled === true) {
+          return {
+            ok: false,
+            status: 400,
+            async text() {
+              return stripeErr;
+            },
+          };
+        }
+        assert.equal(body.creditCardEnabled, false);
+        assert.equal(body.achDebitEnabled, true);
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return {
+              id: "inv-bank",
+              invoiceNumber: body.invoiceNumber,
+              status: "Unpaid",
+              slug: "bankonly1",
+              amount: 200,
+              creditCardEnabled: false,
+            };
+          },
+        };
+      }
+      throw new Error(`unexpected ${method} ${url}`);
+    };
+    const result = await createOrReusePaymentRequest({
+      token: "secret-token:test",
+      customerName: "Test",
+      customerEmail: "t@example.com",
+      invoiceNumber: "JRM-200-O1",
+      amountUsd: 200,
+      fetchImpl,
+    });
+    assert.equal(postCount, 2);
+    assert.equal(result.payUrl, "https://app.mercury.com/pay/bankonly1");
+    assert.equal(result.creditCardEnabled, false);
+    assert.equal(result.cardProcessor, "none");
+    assert.equal(result.cardFallback, true);
+    assert.match(result.paymentMethodsLabel, /bank/i);
+  });
+
+  it("does not strip card on unrelated 400", async () => {
+    const fetchImpl = async (url, init = {}) => {
+      const method = init.method || "GET";
+      if (url.endsWith("/ar/invoices") && method === "GET") {
+        return { ok: true, async json() { return { invoices: [] }; } };
+      }
+      if (url.endsWith("/ar/customers") && method === "GET") {
+        return {
+          ok: true,
+          async json() {
+            return { customers: [{ id: "cust-1", email: "t@example.com" }] };
+          },
+        };
+      }
+      if (url.endsWith("/ar/invoices") && method === "POST") {
+        return {
+          ok: false,
+          status: 400,
+          async text() {
+            return "invoiceNumber already exists for a paid invoice";
+          },
+        };
+      }
+      throw new Error(`unexpected ${method} ${url}`);
+    };
+    await assert.rejects(
+      () =>
+        createOrReusePaymentRequest({
+          token: "secret-token:test",
+          customerName: "Test",
+          customerEmail: "t@example.com",
+          invoiceNumber: "JRM-dup",
+          amountUsd: 10,
+          fetchImpl,
+        }),
+      /Mercury create invoice failed: 400/
+    );
+  });
+});
+
+describe("stripe error detection", () => {
+  it("detects the live Stripe-disabled message", () => {
+    assert.equal(
+      isStripeCardBlockedError(
+        400,
+        "Your Stripe account is currently disabled, you must take action to re-enable it before your card payments can be accepted."
+      ),
+      true
+    );
+  });
+  it("humanizes without dumping stripe text", () => {
+    const msg = humanizePayError(
+      new Error(
+        "Mercury create invoice failed: 400 Your Stripe account is currently disabled"
+      )
+    );
+    assert.match(msg, /card processing is temporarily unavailable/i);
+    assert.doesNotMatch(msg, /currently disabled/i);
   });
 });
 

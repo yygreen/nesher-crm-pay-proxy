@@ -127,6 +127,116 @@ export function buildLineItems(opts) {
 }
 
 /**
+ * True when Mercury rejected create/update because Stripe card is blocked
+ * (account disabled, not connected, cannot accept cards, etc.).
+ * Safe false-negative is OK (we surface the real error); false-positive would
+ * wrongly strip card — keep patterns tight to card/Stripe wording.
+ */
+export function isStripeCardBlockedError(status, bodyText) {
+  const code = Number(status);
+  if (code !== 400 && code !== 422) return false;
+  const t = String(bodyText || "").toLowerCase();
+  if (!t) return false;
+  const mentionsCardOrStripe =
+    /\bstripe\b/.test(t) ||
+    /\bcredit\s*card\b/.test(t) ||
+    /\bcard\s+payments?\b/.test(t) ||
+    /creditcardenabled/.test(t);
+  if (!mentionsCardOrStripe) return false;
+  return (
+    /\bdisabled\b/.test(t) ||
+    /\bre-?enable\b/.test(t) ||
+    /\bnot\s+connected\b/.test(t) ||
+    /\bcannot\s+accept\b/.test(t) ||
+    /\bcan'?t\s+accept\b/.test(t) ||
+    /\bunable\s+to\s+accept\b/.test(t) ||
+    /\bmust\s+take\s+action\b/.test(t) ||
+    /\binactive\b/.test(t) ||
+    /\bsuspended\b/.test(t) ||
+    /\brestricted\b/.test(t) ||
+    /\bsetup\b/.test(t) ||
+    /\bvalidat/.test(t)
+  );
+}
+
+/** Staff-facing message — never dump raw Stripe/Mercury JSON. */
+export function humanizePayError(err) {
+  const raw = err instanceof Error ? err.message : String(err || "");
+  if (isStripeCardBlockedError(400, raw) || isStripeCardBlockedError(422, raw)) {
+    return "Card processing is temporarily unavailable. Bank transfer still works — try again.";
+  }
+  if (/Mercury create invoice failed:\s*400/i.test(raw)) {
+    return "Could not create the payment link. Check amount and email, then try again.";
+  }
+  if (/Mercury (list|update|create)/i.test(raw)) {
+    // Strip long JSON tails
+    const short = raw.replace(/\{[\s\S]*$/, "").trim();
+    return short.length > 180 ? short.slice(0, 177) + "…" : short || "Payment service error — try again.";
+  }
+  return raw.length > 220 ? raw.slice(0, 217) + "…" : raw || "Something went wrong — try again.";
+}
+
+/**
+ * Prefer card+ACH; if Stripe is blocked, create bank/ACH-only so invoicing never dies.
+ * @returns {Promise<{ ok: boolean, res: Response, bodyText: string, creditCardEnabled: boolean, cardFallback: boolean }>}
+ */
+async function postInvoiceWithCardFallback(fetchImpl, url, headers, baseBody, preferCard) {
+  const wantCard = preferCard !== false;
+  const attempts = wantCard
+    ? [
+        { creditCardEnabled: true, cardFallback: false },
+        { creditCardEnabled: false, cardFallback: true },
+      ]
+    : [{ creditCardEnabled: false, cardFallback: false }];
+
+  let last = { ok: false, res: null, bodyText: "", creditCardEnabled: false, cardFallback: false };
+
+  for (let i = 0; i < attempts.length; i++) {
+    const attempt = attempts[i];
+    const body = { ...baseBody, creditCardEnabled: attempt.creditCardEnabled };
+    const res = await fetchImpl(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    });
+    const bodyText = res.ok ? "" : await res.text();
+    last = {
+      ok: res.ok,
+      res,
+      bodyText,
+      creditCardEnabled: attempt.creditCardEnabled,
+      cardFallback: attempt.cardFallback,
+    };
+    if (res.ok) return last;
+    // Only retry without card when Stripe/card is the reason
+    const canRetryBankOnly =
+      i === 0 &&
+      wantCard &&
+      attempt.creditCardEnabled === true &&
+      isStripeCardBlockedError(res.status, bodyText);
+    if (!canRetryBankOnly) return last;
+  }
+  return last;
+}
+
+function cardMetaFromInvoice(invoice, { creditCardEnabled, cardFallback }) {
+  const enabled =
+    typeof creditCardEnabled === "boolean"
+      ? creditCardEnabled
+      : Boolean(invoice?.creditCardEnabled);
+  return {
+    creditCardEnabled: enabled,
+    cardProcessor: enabled ? "stripe" : "none",
+    cardFallback: Boolean(cardFallback) && !enabled,
+    achDebitEnabled:
+      invoice?.achDebitEnabled !== undefined ? Boolean(invoice.achDebitEnabled) : true,
+    paymentMethodsLabel: enabled
+      ? "Bank transfer / ACH + card"
+      : "Bank transfer / ACH (card offline)",
+  };
+}
+
+/**
  * Create or reuse an unpaid Mercury AR invoice.
  * @param {object} opts
  * @param {string} opts.token
@@ -138,8 +248,9 @@ export function buildLineItems(opts) {
  * @param {Array<{name:string,unitPrice:number,quantity?:number}>} [opts.lineItems]
  * @param {string} [opts.payerMemo]
  * @param {string} [opts.destinationAccountId]
+ * @param {boolean} [opts.creditCardEnabled] default true; false = bank-only
  * @param {typeof fetch} [opts.fetchImpl]
- * @returns {Promise<{ reused: boolean, invoice: object, payUrl: string }>}
+ * @returns {Promise<{ reused: boolean, invoice: object, payUrl: string, creditCardEnabled: boolean, cardProcessor: string, cardFallback: boolean, paymentMethodsLabel: string }>}
  */
 export async function createOrReusePaymentRequest(opts) {
   const rawFetch = opts.fetchImpl || fetch;
@@ -166,6 +277,7 @@ export async function createOrReusePaymentRequest(opts) {
     opts.destinationAccountId ||
     process.env.MERCURY_DESTINATION_ACCOUNT_ID ||
     DEFAULT_DEST;
+  const preferCard = opts.creditCardEnabled !== false;
 
   const headers = {
     Authorization: `Bearer ${token}`,
@@ -207,10 +319,15 @@ export async function createOrReusePaymentRequest(opts) {
       existing.lineItems.map((li) => li.name).join("|") ===
         lineItems.map((li) => li.name).join("|");
     if (sameAmount && sameMemo && sameLines) {
+      const meta = cardMetaFromInvoice(existing, {
+        creditCardEnabled: existing.creditCardEnabled,
+        cardFallback: false,
+      });
       return {
         reused: true,
         invoice: existing,
         payUrl: payUrlFromSlug(existing.slug),
+        ...meta,
       };
     }
   }
@@ -244,14 +361,13 @@ export async function createOrReusePaymentRequest(opts) {
   const due = new Date(today.getTime() + 24 * 60 * 60 * 1000);
   const iso = (d) => d.toISOString().slice(0, 10);
   const memo = memoOf(opts.payerMemo);
-  const body = {
+  const baseBody = {
     customerId: customer.id,
     destinationAccountId: dest,
     invoiceDate: iso(today),
     dueDate: iso(due),
     invoiceNumber,
     ccEmails: [],
-    creditCardEnabled: true,
     achDebitEnabled: true,
     useRealAccountNumber: false,
     sendEmailOption: "DontSend",
@@ -262,63 +378,78 @@ export async function createOrReusePaymentRequest(opts) {
   // org-only; service period renders as the covered date range.
   const isoOnly = (s) =>
     /^\d{4}-\d{2}-\d{2}$/.test(String(s || "")) ? String(s) : null;
-  if (opts.poNumber) body.poNumber = String(opts.poNumber).slice(0, 100);
+  if (opts.poNumber) baseBody.poNumber = String(opts.poNumber).slice(0, 100);
   if (opts.internalNote) {
-    body.internalNote = String(opts.internalNote).slice(0, 1000);
+    baseBody.internalNote = String(opts.internalNote).slice(0, 1000);
   }
   const spStart = isoOnly(opts.servicePeriodStartDate);
   const spEnd = isoOnly(opts.servicePeriodEndDate);
   if (spStart && spEnd && spStart <= spEnd) {
-    body.servicePeriodStartDate = spStart;
-    body.servicePeriodEndDate = spEnd;
+    baseBody.servicePeriodStartDate = spStart;
+    baseBody.servicePeriodEndDate = spEnd;
   }
 
   if (existing?.slug) {
     // Same invoice number, details changed → update in place (same pay URL).
     // Mercury update is POST /ar/invoices/{id} with the FULL body (PUT/PATCH → 405).
-    if (existing.invoiceDate) body.invoiceDate = existing.invoiceDate;
+    if (existing.invoiceDate) baseBody.invoiceDate = existing.invoiceDate;
     if (existing.dueDate && existing.dueDate >= iso(today)) {
-      body.dueDate = existing.dueDate;
+      baseBody.dueDate = existing.dueDate;
     }
-    const updRes = await fetchImpl(`${MERCURY_API}/ar/invoices/${existing.id}`, {
-      method: "POST",
+    const posted = await postInvoiceWithCardFallback(
+      fetchImpl,
+      `${MERCURY_API}/ar/invoices/${existing.id}`,
       headers,
-      body: JSON.stringify(body),
-    });
-    if (!updRes.ok) {
-      const t = await updRes.text();
-      throw new Error(`Mercury update invoice failed: ${updRes.status} ${t}`);
+      baseBody,
+      preferCard
+    );
+    if (!posted.ok) {
+      throw new Error(
+        `Mercury update invoice failed: ${posted.res?.status} ${posted.bodyText}`
+      );
     }
     let updated = {};
     try {
-      updated = await updRes.json();
+      updated = await posted.res.json();
     } catch {
       updated = {};
     }
-    const invoice = { ...existing, ...updated };
+    const invoice = {
+      ...existing,
+      ...updated,
+      creditCardEnabled: posted.creditCardEnabled,
+    };
+    const meta = cardMetaFromInvoice(invoice, posted);
     return {
       reused: false,
       updated: true,
       invoice,
       payUrl: payUrlFromSlug(invoice.slug || existing.slug),
+      ...meta,
     };
   }
 
-  const invRes = await fetchImpl(`${MERCURY_API}/ar/invoices`, {
-    method: "POST",
+  const posted = await postInvoiceWithCardFallback(
+    fetchImpl,
+    `${MERCURY_API}/ar/invoices`,
     headers,
-    body: JSON.stringify(body),
-  });
-  if (!invRes.ok) {
-    const t = await invRes.text();
-    throw new Error(`Mercury create invoice failed: ${invRes.status} ${t}`);
+    baseBody,
+    preferCard
+  );
+  if (!posted.ok) {
+    throw new Error(
+      `Mercury create invoice failed: ${posted.res?.status} ${posted.bodyText}`
+    );
   }
-  const invoice = await invRes.json();
+  const invoice = await posted.res.json();
   if (!invoice.slug) throw new Error("Mercury invoice missing slug");
+  invoice.creditCardEnabled = posted.creditCardEnabled;
+  const meta = cardMetaFromInvoice(invoice, posted);
   return {
     reused: false,
     invoice,
     payUrl: payUrlFromSlug(invoice.slug),
+    ...meta,
   };
 }
 
