@@ -10,6 +10,13 @@ import {
   createSquarePaymentLink,
   isSquareConfigured,
 } from "./square.js";
+import {
+  mintInvoiceToken,
+  verifyInvoiceToken,
+  buildCombinedPayUrl,
+  renderInvoiceHtml,
+  renderInvoiceErrorHtml,
+} from "./invoice-page.js";
 import { injectPayButtons, injectPaidBadges } from "./inject.js";
 import { injectWhatsAppUi } from "./whatsapp-ui.js";
 import {
@@ -326,17 +333,41 @@ async function handlePayApi(req, res, kind, id, query) {
       }
     }
 
+    // One guest-facing invoice URL (bank + card choices on a single branded page).
+    // Mercury/Square hosted pages stay as destinations; guests only need this link.
+    const d = draftBundle.draft;
+    let combinedPayUrl = null;
+    try {
+      const invToken = mintInvoiceToken({
+        amountUsd: d.amountUsd,
+        invoiceNumber: d.invoiceNumber,
+        customerName: d.customerName,
+        summary: d.summary || d.lineItemName,
+        lineName: d.lineItemName,
+        mercuryUrl: result.payUrl,
+        squareUrl: squarePayUrl || "",
+        cardProcessor,
+      });
+      const origin = `https://${publicHostFor(req)}`;
+      combinedPayUrl = buildCombinedPayUrl(origin, invToken);
+    } catch (e) {
+      console.warn("combined invoice token failed", e.message);
+      combinedPayUrl = result.payUrl; // never block create
+    }
+
+    // Primary URL staff/guests share = unified invoice when available
+    const shareUrl = combinedPayUrl || result.payUrl;
+
     // CRM note
     try {
-      const d = draftBundle.draft;
       const ph = d.emailPlaceholder ? " (placeholder email)" : "";
       const cardNote =
         cardProcessor === "stripe"
           ? " | card+ACH (Stripe/Mercury)"
           : cardProcessor === "square"
-            ? ` | bank + card via Square ${squarePayUrl || ""}`.trim()
+            ? " | one invoice: bank (Mercury) + card (Square)"
             : " | bank/ACH only (card offline)";
-      const note = `[Automated Mercury] ${result.updated ? "Updated" : result.reused ? "Reused" : "Created"} pay link ${result.payUrl} | ${d.summary} | invoice ${d.invoiceNumber} | ${paymentMethodsLabel || "pay"}${cardNote}${ph}`;
+      const note = `[Automated Mercury] ${result.updated ? "Updated" : result.reused ? "Reused" : "Created"} invoice ${shareUrl} | mercury ${result.payUrl}${squarePayUrl ? ` | square ${squarePayUrl}` : ""} | ${d.summary} | ${d.invoiceNumber} | ${paymentMethodsLabel || "pay"}${cardNote}${ph}`;
       if (kind === "reservation") {
         await appendReservationNote(ctx.reservation.id, note);
       } else if (ctx.request?.id) {
@@ -350,7 +381,10 @@ async function handlePayApi(req, res, kind, id, query) {
       ok: true,
       reused: result.reused,
       updated: Boolean(result.updated),
-      payUrl: result.payUrl,
+      // Guest-facing primary link = unified invoice page
+      payUrl: shareUrl,
+      combinedPayUrl: shareUrl,
+      mercuryPayUrl: result.payUrl,
       squarePayUrl,
       squarePaymentLinkId,
       squareError: squareError || undefined,
@@ -820,12 +854,36 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Public guest invoice page — ONE link with bank + card choices (no staff auth)
+  const payPageMatch =
+    url.pathname.match(/^\/pay\/([^/]+)\/?$/) ||
+    url.pathname.match(/^\/__nesher_pay\/i\/([^/]+)\/?$/);
+  if (payPageMatch && (req.method || "GET") === "GET") {
+    const verified = verifyInvoiceToken(decodeURIComponent(payPageMatch[1]));
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    if (!verified.ok) {
+      res.writeHead(410);
+      res.end(
+        renderInvoiceErrorHtml(
+          verified.error === "expired"
+            ? "This payment link has expired. Please ask your coordinator for a fresh invoice."
+            : "This payment link is invalid. Please ask your coordinator for a new link."
+        )
+      );
+      return;
+    }
+    res.writeHead(200);
+    res.end(renderInvoiceHtml(verified.data));
+    return;
+  }
+
   if (url.pathname === "/__nesher_pay/health") {
     // include square readiness (no secrets) so ops can see card-backup status
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-08-11-square-card-backup",
+      build: "2026-08-11-unified-invoice",
       upstream: UPSTREAM,
       paySync: lastPaySync
         ? {

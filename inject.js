@@ -847,30 +847,21 @@ const SCRIPT = `
     var amount = Number(data.amountUsd || draft.amountUsd);
     var inv = data.invoiceNumber || draft.invoiceNumber || "";
     var name = String(draft.customerName || "").trim().split(/\\s+/)[0] || "there";
-    var squareUrl = data.squarePayUrl || "";
-    var stripeCard = data.cardProcessor === "stripe" && data.creditCardEnabled !== false;
-    var squareCard = data.cardProcessor === "square" && squareUrl;
+    // One unified invoice URL (bank + card choices on the same page when available)
+    var pay = data.combinedPayUrl || data.payUrl || "";
+    var hasCard = data.cardProcessor === "stripe" || data.cardProcessor === "square";
     var lines = [
       "Hi " + name + ",",
       "",
-      "Your balance of " + money(amount) + (inv ? " (" + inv + ")" : "") + " is ready."
+      "Your balance of " + money(amount) + (inv ? " (" + inv + ")" : "") + " is ready.",
+      hasCard
+        ? "Pay securely by bank transfer or card here:"
+        : "Pay by bank transfer (ACH) here:",
+      pay,
+      "",
+      "Thank you,",
+      "Nesher / JRM Hotels"
     ];
-    if (stripeCard) {
-      lines.push("Pay securely by bank transfer or card:");
-      lines.push(data.payUrl || "");
-    } else if (squareCard) {
-      lines.push("Pay by bank transfer (ACH):");
-      lines.push(data.payUrl || "");
-      lines.push("");
-      lines.push("Or pay by credit card:");
-      lines.push(squareUrl);
-    } else {
-      lines.push("Pay by bank transfer (ACH):");
-      lines.push(data.payUrl || "");
-    }
-    lines.push("");
-    lines.push("Thank you,");
-    lines.push("Nesher / JRM Hotels");
     return lines.join("\\n");
   }
 
@@ -881,18 +872,18 @@ const SCRIPT = `
     modalState.success = { url: data.payUrl };
     root.querySelector(".nesher-pay-panel").classList.add("success");
 
+    var shareUrl = data.combinedPayUrl || data.payUrl || "";
     var squareUrl = data.squarePayUrl || "";
+    var mercuryUrl = data.mercuryPayUrl || (!String(shareUrl).includes("/pay/") ? data.payUrl : "");
     var stripeCard = data.cardProcessor === "stripe";
     var squareCard = data.cardProcessor === "square" && !!squareUrl;
     var cardOn = stripeCard || squareCard;
 
-    document.getElementById("nesher-pay-title").textContent = "Payment link ready";
+    document.getElementById("nesher-pay-title").textContent = "Invoice ready";
     setSub(subFor({ kind: data.kind || (modalState.kind === "reservation" ? "reservation" : "hotel"), draft: draft },
-      squareCard
-        ? '<span class="nesher-chip ok">Bank + card (Square)</span>'
-        : (stripeCard
-          ? '<span class="nesher-chip ok">Bank + card</span>'
-          : '<span class="nesher-chip">Bank / ACH</span>')));
+      cardOn
+        ? '<span class="nesher-chip ok">One invoice · bank + card</span>'
+        : '<span class="nesher-chip">One invoice · bank / ACH</span>'));
 
     var amount = Number(data.amountUsd || draft.amountUsd);
     var emailBit = draft.customerEmail
@@ -905,44 +896,22 @@ const SCRIPT = `
       '<div class="nesher-method-row">' +
         '<span class="nesher-method-chip"><span class="dot"></span>Bank / ACH</span>' +
         (squareCard
-          ? '<span class="nesher-method-chip"><span class="dot"></span>Card via Square</span>'
+          ? '<span class="nesher-method-chip"><span class="dot"></span>Card (Square)</span>'
           : (stripeCard
             ? '<span class="nesher-method-chip"><span class="dot"></span>Card</span>'
             : '<span class="nesher-method-chip off"><span class="dot"></span>Card offline</span>')) +
       "</div>";
 
-    var softWarn = "";
-    if (squareCard) {
-      softWarn = '<p class="nesher-soft-warn" style="background:#f0fdfa;border-color:#99f6e4;color:#0f766e">Stripe card is offline — guests can still pay by <strong>card via Square</strong>, or bank transfer on the Mercury link.</p>';
-    } else if (!cardOn) {
-      softWarn = '<p class="nesher-soft-warn">Card is offline right now (Stripe down' +
-        (data.squareError ? "; Square: " + esc(String(data.squareError).slice(0, 120)) : "; Square not connected on server") +
-        "). Bank transfer / ACH still works.</p>";
-    }
+    var softWarn = squareCard
+      ? '<p class="nesher-soft-warn" style="background:#f0fdfa;border-color:#99f6e4;color:#0f766e"><strong>One link for the guest.</strong> Their page offers card (Square) and bank transfer — no need to send two URLs.</p>'
+      : (!cardOn
+        ? '<p class="nesher-soft-warn">Card offline for now. The invoice still works for bank / ACH.</p>'
+        : "");
 
     var guestMsg = buildGuestMessage(data);
     var reusedPill = data.updated
-      ? '<div class="nesher-pill">Existing link updated — same URL, new amount/details</div>'
-      : (data.reused ? '<div class="nesher-pill">Existing unpaid link reused — same URL as before</div>' : "");
-
-    var bankBox =
-      '<div class="nesher-url-box" style="flex-direction:column;align-items:stretch;gap:6px">' +
-        '<div style="font-size:11px;font-weight:700;color:#64748b;text-align:left;letter-spacing:.02em">BANK / ACH (Mercury)</div>' +
-        '<div style="display:flex;gap:8px">' +
-          '<input id="nesher-success-url" readonly value="' + esc(data.payUrl) + '" aria-label="Bank payment link" />' +
-          '<button type="button" class="nesher-btn-sec" id="nesher-copy-url">Copy</button>' +
-        "</div>" +
-      "</div>";
-
-    var squareBox = squareCard
-      ? '<div class="nesher-url-box" style="flex-direction:column;align-items:stretch;gap:6px;margin-top:8px">' +
-          '<div style="font-size:11px;font-weight:700;color:#64748b;text-align:left;letter-spacing:.02em">CARD (Square)</div>' +
-          '<div style="display:flex;gap:8px">' +
-            '<input id="nesher-square-url" readonly value="' + esc(squareUrl) + '" aria-label="Square card payment link" />' +
-            '<button type="button" class="nesher-btn-sec" id="nesher-copy-square">Copy</button>' +
-          "</div>" +
-        "</div>"
-      : "";
+      ? '<div class="nesher-pill">Existing invoice updated</div>'
+      : (data.reused ? '<div class="nesher-pill">Existing unpaid invoice reused</div>' : "");
 
     var body = document.getElementById("nesher-pay-body");
     body.innerHTML =
@@ -953,8 +922,13 @@ const SCRIPT = `
         methodsHtml +
         softWarn +
         reusedPill +
-        bankBox +
-        squareBox +
+        '<div class="nesher-url-box" style="flex-direction:column;align-items:stretch;gap:6px">' +
+          '<div style="font-size:11px;font-weight:700;color:#64748b;text-align:left;letter-spacing:.02em">GUEST INVOICE (send this)</div>' +
+          '<div style="display:flex;gap:8px">' +
+            '<input id="nesher-success-url" readonly value="' + esc(shareUrl) + '" aria-label="Guest invoice URL" />' +
+            '<button type="button" class="nesher-btn-sec" id="nesher-copy-url">Copy</button>' +
+          "</div>" +
+        "</div>" +
         '<div class="nesher-guest-box">' +
           "<header><span>Guest message (ready to send)</span>" +
             '<button type="button" class="nesher-btn-sec" id="nesher-copy-msg" style="padding:4px 10px;font-size:12px">Copy message</button>' +
@@ -962,10 +936,7 @@ const SCRIPT = `
           '<pre id="nesher-guest-msg">' + esc(guestMsg) + "</pre>" +
         "</div>" +
         '<div class="nesher-success-actions">' +
-          '<a class="nesher-btn-sec" href="' + esc(data.payUrl) + '" target="_blank" rel="noopener">Open bank page</a>' +
-          (squareCard
-            ? '<a class="nesher-btn-sec" href="' + esc(squareUrl) + '" target="_blank" rel="noopener">Open card page</a>'
-            : "") +
+          '<a class="nesher-btn-sec" href="' + esc(shareUrl) + '" target="_blank" rel="noopener">Open guest invoice</a>' +
         "</div>" +
       "</div>";
 
@@ -1003,34 +974,23 @@ const SCRIPT = `
       urlInput.addEventListener("focus", function () { urlInput.select(); });
     }
     document.getElementById("nesher-copy-url").addEventListener("click", function () {
-      copyText(data.payUrl, this, "Copied");
+      copyText(shareUrl, this, "Copied");
     });
-    var sqCopy = document.getElementById("nesher-copy-square");
-    if (sqCopy) {
-      sqCopy.addEventListener("click", function () {
-        copyText(squareUrl, this, "Copied");
-      });
-    }
     document.getElementById("nesher-copy-msg").addEventListener("click", function () {
       copyText(guestMsg, this, "Copied");
-      setStatus("Guest message copied — paste into WhatsApp or email.", true);
+      setStatus("Guest message copied — one invoice link inside.", true);
     });
 
     openRoot(root);
     try {
       if (navigator.clipboard && navigator.clipboard.writeText) {
         navigator.clipboard.writeText(guestMsg);
-        setStatus(
-          squareCard
-            ? "Guest message copied (bank + Square card links)."
-            : "Guest message copied — paste into WhatsApp or email.",
-          true
-        );
+        setStatus("Guest message copied — one invoice link (bank + card when available).", true);
       } else {
-        setStatus("Link ready — copy the guest message below.", true);
+        setStatus("Invoice ready — copy the guest message below.", true);
       }
     } catch (e) {
-      setStatus("Link ready — copy the guest message below.", true);
+      setStatus("Invoice ready — copy the guest message below.", true);
     }
     createBtn.focus();
   }
