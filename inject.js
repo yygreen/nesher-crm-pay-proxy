@@ -845,27 +845,20 @@ const SCRIPT = `
   function buildGuestMessage(data) {
     var draft = data.draft || {};
     var amount = Number(data.amountUsd || draft.amountUsd);
-    var inv = data.invoiceNumber || draft.invoiceNumber || "";
     var name = String(draft.customerName || "").trim().split(/\\s+/)[0] || "there";
-    // One unified invoice URL (bank + card choices on the same page when available)
     var pay = data.combinedPayUrl || data.payUrl || "";
-    var hasCard = data.cardProcessor === "stripe" || data.cardProcessor === "square";
-    var lines = [
+    return [
       "Hi " + name + ",",
       "",
-      "Your balance of " + money(amount) + (inv ? " (" + inv + ")" : "") + " is ready.",
-      hasCard
-        ? "Pay securely by bank transfer or card here:"
-        : "Pay by bank transfer (ACH) here:",
+      "Please pay " + money(amount) + " for your booking:",
       pay,
       "",
-      "Thank you,",
+      "Thank you",
       "Nesher / JRM Hotels"
-    ];
-    return lines.join("\\n");
+    ].join("\\n");
   }
 
-  // ── Success: its own clean screen ──
+  // ── Success: minimal — amount + copy message + open ──
   function renderSuccess(data) {
     var root = ensureModal();
     var draft = data.draft || {};
@@ -873,70 +866,30 @@ const SCRIPT = `
     root.querySelector(".nesher-pay-panel").classList.add("success");
 
     var shareUrl = data.combinedPayUrl || data.payUrl || "";
-    var squareUrl = data.squarePayUrl || "";
-    var mercuryUrl = data.mercuryPayUrl || (!String(shareUrl).includes("/pay/") ? data.payUrl : "");
-    var stripeCard = data.cardProcessor === "stripe";
-    var squareCard = data.cardProcessor === "square" && !!squareUrl;
-    var cardOn = stripeCard || squareCard;
-
-    document.getElementById("nesher-pay-title").textContent = "Invoice ready";
-    setSub(subFor({ kind: data.kind || (modalState.kind === "reservation" ? "reservation" : "hotel"), draft: draft },
-      cardOn
-        ? '<span class="nesher-chip ok">One invoice · bank + card</span>'
-        : '<span class="nesher-chip">One invoice · bank / ACH</span>'));
-
+    var guestMsg = buildGuestMessage(data);
     var amount = Number(data.amountUsd || draft.amountUsd);
-    var emailBit = draft.customerEmail
-      ? draft.customerEmail + (isOwnEmail(draft.customerEmail) ? " (our inbox — send the customer the link)" : "")
-      : "";
-    var meta = [data.invoiceNumber || draft.invoiceNumber, draft.customerName, emailBit]
+    var who = [draft.customerName, data.invoiceNumber || draft.invoiceNumber]
       .filter(function (x) { return x && String(x).trim(); }).join(" · ");
 
-    var methodsHtml =
-      '<div class="nesher-method-row">' +
-        '<span class="nesher-method-chip"><span class="dot"></span>Bank / ACH</span>' +
-        (squareCard
-          ? '<span class="nesher-method-chip"><span class="dot"></span>Card (Square)</span>'
-          : (stripeCard
-            ? '<span class="nesher-method-chip"><span class="dot"></span>Card</span>'
-            : '<span class="nesher-method-chip off"><span class="dot"></span>Card offline</span>')) +
-      "</div>";
-
-    var softWarn = squareCard
-      ? '<p class="nesher-soft-warn" style="background:#f0fdfa;border-color:#99f6e4;color:#0f766e"><strong>One link for the guest.</strong> Their page offers card (Square) and bank transfer — no need to send two URLs.</p>'
-      : (!cardOn
-        ? '<p class="nesher-soft-warn">Card offline for now. The invoice still works for bank / ACH.</p>'
-        : "");
-
-    var guestMsg = buildGuestMessage(data);
-    var reusedPill = data.updated
-      ? '<div class="nesher-pill">Existing invoice updated</div>'
-      : (data.reused ? '<div class="nesher-pill">Existing unpaid invoice reused</div>' : "");
+    document.getElementById("nesher-pay-title").textContent = "Ready to send";
+    setSub(subFor(
+      { kind: data.kind || (modalState.kind === "reservation" ? "reservation" : "hotel"), draft: draft },
+      '<span class="nesher-chip ok">Copied</span>'
+    ));
 
     var body = document.getElementById("nesher-pay-body");
     body.innerHTML =
-      '<div class="nesher-success">' +
+      '<div class="nesher-success" style="padding-top:8px">' +
         '<div class="nesher-success-check">' + ICON_CHECK + "</div>" +
         '<div class="nesher-success-amt">' + money(amount) + "</div>" +
-        '<div class="nesher-success-meta">' + esc(meta) + "</div>" +
-        methodsHtml +
-        softWarn +
-        reusedPill +
-        '<div class="nesher-url-box" style="flex-direction:column;align-items:stretch;gap:6px">' +
-          '<div style="font-size:11px;font-weight:700;color:#64748b;text-align:left;letter-spacing:.02em">GUEST INVOICE (send this)</div>' +
-          '<div style="display:flex;gap:8px">' +
-            '<input id="nesher-success-url" readonly value="' + esc(shareUrl) + '" aria-label="Guest invoice URL" />' +
-            '<button type="button" class="nesher-btn-sec" id="nesher-copy-url">Copy</button>' +
-          "</div>" +
+        (who ? '<div class="nesher-success-meta">' + esc(who) + "</div>" : "") +
+        '<p style="margin:16px 0 0;font-size:13.5px;color:#64748b;line-height:1.45">Guest message is on your clipboard. Paste into WhatsApp or email.</p>' +
+        '<div class="nesher-guest-box" style="margin-top:14px">' +
+          '<pre id="nesher-guest-msg" style="max-height:120px">' + esc(guestMsg) + "</pre>" +
         "</div>" +
-        '<div class="nesher-guest-box">' +
-          "<header><span>Guest message (ready to send)</span>" +
-            '<button type="button" class="nesher-btn-sec" id="nesher-copy-msg" style="padding:4px 10px;font-size:12px">Copy message</button>' +
-          "</header>" +
-          '<pre id="nesher-guest-msg">' + esc(guestMsg) + "</pre>" +
-        "</div>" +
-        '<div class="nesher-success-actions">' +
-          '<a class="nesher-btn-sec" href="' + esc(shareUrl) + '" target="_blank" rel="noopener">Open guest invoice</a>' +
+        '<div class="nesher-success-actions" style="margin-top:16px;flex-wrap:wrap">' +
+          '<button type="button" class="nesher-btn-sec" id="nesher-copy-msg" style="background:#0f766e;color:#fff!important;border-color:#0f766e">Copy message again</button>' +
+          '<a class="nesher-btn-sec" href="' + esc(shareUrl) + '" target="_blank" rel="noopener">Preview invoice</a>' +
         "</div>" +
       "</div>";
 
@@ -949,49 +902,37 @@ const SCRIPT = `
       btn.textContent = label || "Copied";
       setTimeout(function () { btn.textContent = prev; }, 1600);
     }
-    function copyText(text, btn, label) {
+    function copyText(text, btn) {
       function fallback() {
         try {
           var ta = document.createElement("textarea");
           ta.value = text;
-          ta.setAttribute("readonly", "");
-          ta.style.position = "fixed";
-          ta.style.left = "-9999px";
           document.body.appendChild(ta);
           ta.select();
           document.execCommand("copy");
           document.body.removeChild(ta);
-          flashCopy(btn, label);
+          if (btn) flashCopy(btn);
         } catch (e) {}
       }
       if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(text).then(function () { flashCopy(btn, label); }, fallback);
+        navigator.clipboard.writeText(text).then(function () {
+          if (btn) flashCopy(btn);
+        }, fallback);
       } else fallback();
     }
 
-    var urlInput = document.getElementById("nesher-success-url");
-    if (urlInput) {
-      urlInput.addEventListener("focus", function () { urlInput.select(); });
-    }
-    document.getElementById("nesher-copy-url").addEventListener("click", function () {
-      copyText(shareUrl, this, "Copied");
-    });
     document.getElementById("nesher-copy-msg").addEventListener("click", function () {
-      copyText(guestMsg, this, "Copied");
-      setStatus("Guest message copied — one invoice link inside.", true);
+      copyText(guestMsg, this);
+      setStatus("Message copied.", true);
     });
 
     openRoot(root);
     try {
       if (navigator.clipboard && navigator.clipboard.writeText) {
         navigator.clipboard.writeText(guestMsg);
-        setStatus("Guest message copied — one invoice link (bank + card when available).", true);
-      } else {
-        setStatus("Invoice ready — copy the guest message below.", true);
+        setStatus("Message copied — paste to guest.", true);
       }
-    } catch (e) {
-      setStatus("Invoice ready — copy the guest message below.", true);
-    }
+    } catch (e) {}
     createBtn.focus();
   }
 

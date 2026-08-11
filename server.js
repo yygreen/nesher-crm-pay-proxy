@@ -11,12 +11,11 @@ import {
   isSquareConfigured,
 } from "./square.js";
 import {
-  mintInvoiceToken,
-  verifyInvoiceToken,
   buildCombinedPayUrl,
   renderInvoiceHtml,
   renderInvoiceErrorHtml,
 } from "./invoice-page.js";
+import { storeInvoice, loadInvoice } from "./invoice-store.js";
 import { injectPayButtons, injectPaidBadges } from "./inject.js";
 import { injectWhatsAppUi } from "./whatsapp-ui.js";
 import {
@@ -333,12 +332,11 @@ async function handlePayApi(req, res, kind, id, query) {
       }
     }
 
-    // One guest-facing invoice URL (bank + card choices on a single branded page).
-    // Mercury/Square hosted pages stay as destinations; guests only need this link.
+    // One short guest invoice URL (bank + card on one clean page).
     const d = draftBundle.draft;
     let combinedPayUrl = null;
     try {
-      const invToken = mintInvoiceToken({
+      const stored = await storeInvoice({
         amountUsd: d.amountUsd,
         invoiceNumber: d.invoiceNumber,
         customerName: d.customerName,
@@ -349,13 +347,18 @@ async function handlePayApi(req, res, kind, id, query) {
         cardProcessor,
       });
       const origin = `https://${publicHostFor(req)}`;
-      combinedPayUrl = buildCombinedPayUrl(origin, invToken);
+      if (stored.ok && stored.code) {
+        combinedPayUrl = buildCombinedPayUrl(origin, stored.code);
+      } else if (stored.longToken) {
+        combinedPayUrl = buildCombinedPayUrl(origin, stored.longToken);
+      } else {
+        combinedPayUrl = result.payUrl;
+      }
     } catch (e) {
-      console.warn("combined invoice token failed", e.message);
-      combinedPayUrl = result.payUrl; // never block create
+      console.warn("combined invoice failed", e.message);
+      combinedPayUrl = result.payUrl;
     }
 
-    // Primary URL staff/guests share = unified invoice when available
     const shareUrl = combinedPayUrl || result.payUrl;
 
     // CRM note
@@ -854,21 +857,21 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Public guest invoice page — ONE link with bank + card choices (no staff auth)
+  // Public guest invoice — short code or long token (no staff auth)
   const payPageMatch =
     url.pathname.match(/^\/pay\/([^/]+)\/?$/) ||
     url.pathname.match(/^\/__nesher_pay\/i\/([^/]+)\/?$/);
   if (payPageMatch && (req.method || "GET") === "GET") {
-    const verified = verifyInvoiceToken(decodeURIComponent(payPageMatch[1]));
+    const verified = await loadInvoice(decodeURIComponent(payPageMatch[1]));
     res.setHeader("Cache-Control", "no-store");
     res.setHeader("Content-Type", "text/html; charset=utf-8");
-    if (!verified.ok) {
+    if (!verified.ok || !verified.data?.mercuryUrl) {
       res.writeHead(410);
       res.end(
         renderInvoiceErrorHtml(
           verified.error === "expired"
-            ? "This payment link has expired. Please ask your coordinator for a fresh invoice."
-            : "This payment link is invalid. Please ask your coordinator for a new link."
+            ? "This payment link has expired. Please ask for a new one."
+            : "This payment link is invalid. Please ask for a new one."
         )
       );
       return;
@@ -883,7 +886,7 @@ const server = http.createServer(async (req, res) => {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-08-11-unified-invoice",
+      build: "2026-08-11-clean-invoice",
       upstream: UPSTREAM,
       paySync: lastPaySync
         ? {

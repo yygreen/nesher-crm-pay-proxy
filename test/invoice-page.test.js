@@ -50,8 +50,8 @@ describe("unified invoice token", () => {
       squareUrl: "https://square.link/u/b",
       cardProcessor: "square",
     });
-    assert.match(html, /Pay by card/);
-    assert.match(html, /Pay by bank/);
+    assert.match(html, /Pay with card/);
+    assert.match(html, /Pay with bank/);
     assert.match(html, /square\.link\/u\/b/);
     assert.match(html, /mercury\.com\/pay\/a/);
     assert.match(html, /\$100\.00/);
