@@ -781,14 +781,23 @@ function proxyWithInject(req, res) {
         (async () => {
           try {
             const text = body.toString("utf8");
-            let injected = injectPayButtons(text, pathOnly);
-            injected = injectWhatsAppUi(injected, pathOnly);
-            injected = await injectPaidBadges(injected, pathOnly, badgePool());
+            let injected = text;
+            // Staff-only surfaces. These MUST NOT run on the public marketing
+            // pages — injectPayButtons has no path gate of its own and would
+            // drop the internal payment-link modal onto flynesher.com.
+            if (!isPublicMarketingPath(pathOnly)) {
+              injected = injectPayButtons(injected, pathOnly);
+              injected = injectWhatsAppUi(injected, pathOnly);
+              injected = await injectPaidBadges(injected, pathOnly, badgePool());
+            }
+            // Staff-page check reads the ORIGINAL upstream HTML: the injectors
+            // above add markup that would otherwise look like the CRM.
             injected = injectSnapEngage(injected, pathOnly, {
               host: req.headers.host,
               widgetId: SNAPENGAGE_WIDGET_ID,
               enabled: SNAPENGAGE_ENABLED,
               hosts: SNAPENGAGE_HOSTS,
+              staffCheckHtml: text,
             });
             finish(Buffer.from(injected, "utf8"));
           } catch (e) {

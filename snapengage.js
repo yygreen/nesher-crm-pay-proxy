@@ -76,7 +76,10 @@ export function snapEngageSnippet(widgetId) {
 /**
  * @param {string} html   upstream HTML
  * @param {string} path   request path
- * @param {{host?: string, widgetId?: string, enabled?: boolean, hosts?: string[]}} [opts]
+ * @param {{host?: string, widgetId?: string, enabled?: boolean, hosts?: string[],
+ *          staffCheckHtml?: string}} [opts]
+ *   staffCheckHtml — the ORIGINAL upstream HTML, when earlier injectors have
+ *   already added markup that would trip the staff-page check.
  */
 export function injectSnapEngage(html, path, opts = {}) {
   if (!html || typeof html !== "string") return html;
@@ -92,7 +95,7 @@ export function injectSnapEngage(html, path, opts = {}) {
 
   if (!isPublicMarketingHost(opts.host, opts.hosts || DEFAULT_HOSTS)) return html;
   if (!isPublicMarketingPath(path)) return html;
-  if (looksLikeStaffPage(html)) return html;
+  if (looksLikeStaffPage(opts.staffCheckHtml ?? html)) return html;
 
   const snippet = snapEngageSnippet(widgetId);
   if (/<\/body>/i.test(html)) return html.replace(/<\/body>/i, `${snippet}</body>`);

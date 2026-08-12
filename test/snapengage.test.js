@@ -69,6 +69,25 @@ test("NEVER injects into the staff CRM", () => {
   assert.equal(injectSnapEngage(STAFF, "/", { host: WWW }), STAFF);
 });
 
+test("staffCheckHtml judges the ORIGINAL page, not injector output", () => {
+  // Regression: injectPayButtons adds #nesher-pay-title, which used to make a
+  // marketing page look like staff UI and silently suppressed the widget.
+  const afterPayInjector = MARKETING.replace(
+    "</body>",
+    '<h2 id="nesher-pay-title">Create payment link</h2></body>'
+  );
+  assert.equal(injectSnapEngage(afterPayInjector, "/", { host: WWW }), afterPayInjector);
+  assert.match(
+    injectSnapEngage(afterPayInjector, "/", { host: WWW, staffCheckHtml: MARKETING }),
+    /code\.snapengage\.com/
+  );
+  // and a genuinely staff page is still blocked even via staffCheckHtml
+  assert.equal(
+    injectSnapEngage(MARKETING, "/", { host: WWW, staffCheckHtml: STAFF }),
+    MARKETING
+  );
+});
+
 test("is idempotent — a second pass adds nothing", () => {
   const once = injectSnapEngage(MARKETING, "/", { host: WWW });
   const twice = injectSnapEngage(once, "/", { host: WWW });
