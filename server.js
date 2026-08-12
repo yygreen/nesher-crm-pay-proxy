@@ -19,6 +19,11 @@ import { storeInvoice, loadInvoice } from "./invoice-store.js";
 import { injectPayButtons, injectPaidBadges } from "./inject.js";
 import { injectWhatsAppUi } from "./whatsapp-ui.js";
 import {
+  injectSnapEngage,
+  isPublicMarketingPath,
+  DEFAULT_WIDGET_ID,
+} from "./snapengage.js";
+import {
   getPool,
   loadHotelPayContext,
   loadHotelOfferPayContext,
@@ -81,6 +86,19 @@ function publicHostFor(req) {
   if (raw && ALLOWED_PUBLIC_HOSTS.has(raw)) return raw;
   return PUBLIC_HOST;
 }
+
+// ── SnapEngage live chat on the public marketing pages ──────────────────────
+const SNAPENGAGE_ENABLED = String(
+  process.env.SNAPENGAGE_ENABLED ?? "1"
+).toLowerCase() !== "0";
+const SNAPENGAGE_WIDGET_ID =
+  process.env.SNAPENGAGE_WIDGET_ID || DEFAULT_WIDGET_ID;
+const SNAPENGAGE_HOSTS = String(
+  process.env.SNAPENGAGE_HOSTS || "www.flynesher.com,flynesher.com"
+)
+  .split(",")
+  .map((s) => s.trim().toLowerCase())
+  .filter(Boolean);
 
 const proxy = httpProxy.createProxyServer({
   target: UPSTREAM,
@@ -709,7 +727,9 @@ function proxyWithInject(req, res) {
     /^\/jrm\/hotels(\/|$)/.test(pathOnly) ||
     /^\/reservations(\/|$)/.test(pathOnly) ||
     /^\/whatsapp(\/|$)/.test(pathOnly) ||
-    /^\/customers\/\d+\/?$/.test(pathOnly);
+    /^\/customers\/\d+\/?$/.test(pathOnly) ||
+    // public marketing pages — SnapEngage live chat
+    isPublicMarketingPath(pathOnly);
 
   if (!shouldInject || req.method !== "GET") {
     proxy.web(req, res);
@@ -764,6 +784,12 @@ function proxyWithInject(req, res) {
             let injected = injectPayButtons(text, pathOnly);
             injected = injectWhatsAppUi(injected, pathOnly);
             injected = await injectPaidBadges(injected, pathOnly, badgePool());
+            injected = injectSnapEngage(injected, pathOnly, {
+              host: req.headers.host,
+              widgetId: SNAPENGAGE_WIDGET_ID,
+              enabled: SNAPENGAGE_ENABLED,
+              hosts: SNAPENGAGE_HOSTS,
+            });
             finish(Buffer.from(injected, "utf8"));
           } catch (e) {
             console.error("inject failed", e.message);
@@ -886,7 +912,12 @@ const server = http.createServer(async (req, res) => {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-08-11-clean-invoice",
+      build: "2026-08-12-snapengage",
+      snapEngage: {
+        enabled: SNAPENGAGE_ENABLED,
+        widgetId: SNAPENGAGE_WIDGET_ID,
+        hosts: SNAPENGAGE_HOSTS,
+      },
       upstream: UPSTREAM,
       paySync: lastPaySync
         ? {
