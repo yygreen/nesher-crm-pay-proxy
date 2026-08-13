@@ -43,6 +43,28 @@ test("no-ops if upstream drops the buttons (their fix lands)", () => {
   assert.equal(injectPublicHomeUi(plain, "/"), plain);
 });
 
+test("classifies SnapEngage's launcher by size, not height alone", () => {
+  const out = injectPublicHomeUi(HOME, "/");
+  // regression: the 300x85 proactive invite bar used to pass as the 60x60
+  // launcher, anchoring the button to the wrong element and pushing it up
+  // into the hero card.
+  assert.match(out, /LAUNCHER_MAX = 90/);
+  assert.match(out, /r\.width <= LAUNCHER_MAX && r\.height <= LAUNCHER_MAX/);
+});
+
+test("centre-aligns with the launcher rather than matching right edges", () => {
+  const out = injectPublicHomeUi(HOME, "/");
+  assert.match(out, /launcher\.left \+ launcher\.width \/ 2/);
+  assert.match(out, /box\.offsetWidth \/ 2/);
+});
+
+test("refuses to sit on top of the hero card", () => {
+  const out = injectPublicHomeUi(HOME, "/");
+  assert.match(out, /KEEP_CLEAR = "\.premium-service-panel"/);
+  assert.match(out, /data-se-state="blocked"/);
+  assert.match(out, /addEventListener\("scroll", apply/);
+});
+
 test("is idempotent", () => {
   const once = injectPublicHomeUi(HOME, "/");
   assert.equal(injectPublicHomeUi(once, "/"), once);

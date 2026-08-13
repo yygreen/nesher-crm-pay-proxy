@@ -23,8 +23,16 @@ export function isHomePath(path) {
 
 /** Gap between the WhatsApp button and SnapEngage's button, in px. */
 const GAP = 12;
-/** A SnapEngage element taller than this is the panel/invite, not the button. */
-const PANEL_MIN_HEIGHT = 100;
+/**
+ * SnapEngage's launcher is a small square iframe (~60x60). Everything else it
+ * renders — the 404x524 chat panel, the 300x85 proactive invite bar — is an
+ * overlay we must stay out of. Classifying by height alone let the 85px-tall
+ * invite bar pass as the launcher, which anchored this button to the wrong
+ * element and pushed it up into the hero card.
+ */
+const LAUNCHER_MAX = 90;
+/** Page elements the floating button must never cover. */
+const KEEP_CLEAR = ".premium-service-panel";
 
 const STYLE = `
 <style id="${MARKER}-css">
@@ -34,7 +42,8 @@ const STYLE = `
   .floating-contact-buttons {
     transition: bottom .2s ease, right .2s ease, opacity .18s ease;
   }
-  .floating-contact-buttons[data-se-state="panel"] {
+  .floating-contact-buttons[data-se-state="panel"],
+  .floating-contact-buttons[data-se-state="blocked"] {
     opacity: 0;
     visibility: hidden;
     pointer-events: none;
@@ -44,7 +53,7 @@ const STYLE = `
 const SCRIPT = `
 <script id="${MARKER}-js">
 (function () {
-  var GAP = ${GAP}, PANEL_MIN_HEIGHT = ${PANEL_MIN_HEIGHT};
+  var GAP = ${GAP}, LAUNCHER_MAX = ${LAUNCHER_MAX}, KEEP_CLEAR = ${JSON.stringify(KEEP_CLEAR)};
   var box = document.querySelector(".floating-contact-buttons");
   if (!box) return;
 
@@ -75,38 +84,75 @@ const SCRIPT = `
     return out;
   }
 
+  function intersects(a, b) {
+    return !(a.right <= b.left || b.right <= a.left || a.bottom <= b.top || b.bottom <= a.top);
+  }
+
+  /** Would the box sit on top of the hero card at this position? */
+  function hitsContent(bottomPx, rightPx) {
+    var w = box.offsetWidth, h = box.offsetHeight;
+    if (!w || !h) return false;
+    var probe = {
+      left: innerWidth - rightPx - w,
+      right: innerWidth - rightPx,
+      top: innerHeight - bottomPx - h,
+      bottom: innerHeight - bottomPx
+    };
+    var blockers = document.querySelectorAll(KEEP_CLEAR);
+    for (var i = 0; i < blockers.length; i++) {
+      var s = getComputedStyle(blockers[i]);
+      if (s.display === "none" || s.visibility === "hidden") continue;
+      var r = blockers[i].getBoundingClientRect();
+      if (r.width > 0 && r.height > 0 && intersects(probe, r)) return true;
+    }
+    return false;
+  }
+
   function apply() {
     var rects = snapEngageRects();
-    var panel = null, button = null;
+    var overlay = null, launcher = null;
     for (var i = 0; i < rects.length; i++) {
-      if (rects[i].height >= PANEL_MIN_HEIGHT) {
-        if (!panel || rects[i].height > panel.height) panel = rects[i];
-      } else if (!button || rects[i].top < button.top) {
-        button = rects[i];
+      var r = rects[i];
+      var isLauncher = r.width <= LAUNCHER_MAX && r.height <= LAUNCHER_MAX;
+      if (isLauncher) {
+        if (!launcher || r.top < launcher.top) launcher = r;
+      } else if (!overlay || r.height > overlay.height) {
+        overlay = r;
       }
     }
 
-    // Panel or proactive invite is showing — get out of its way entirely.
-    if (panel) {
+    // Chat panel or proactive invite is showing — get out of its way entirely.
+    if (overlay) {
       box.setAttribute("data-se-state", "panel");
       return;
     }
-    box.setAttribute("data-se-state", "idle");
 
-    if (button) {
-      // sit directly above SnapEngage's button, aligned to the same right edge
-      box.style.bottom = Math.round(innerHeight - button.top + GAP) + "px";
-      box.style.right = Math.max(0, Math.round(innerWidth - button.right)) + "px";
-    } else {
-      box.style.bottom = baseBottom + "px";
-      box.style.right = baseRight + "px";
+    var bottom = baseBottom, right = baseRight;
+    if (launcher) {
+      // stack directly above SnapEngage's launcher, CENTRE-aligned with it
+      bottom = Math.round(innerHeight - launcher.top + GAP);
+      right = Math.round(
+        innerWidth - (launcher.left + launcher.width / 2) - box.offsetWidth / 2
+      );
+      if (!(right >= 0)) right = baseRight;
     }
+
+    // Never cover the hero card; wait until the page scrolls it clear.
+    if (hitsContent(bottom, right)) {
+      box.setAttribute("data-se-state", "blocked");
+      return;
+    }
+
+    box.setAttribute("data-se-state", "idle");
+    box.style.bottom = bottom + "px";
+    box.style.right = right + "px";
   }
 
   apply();
   setInterval(apply, 500);
   addEventListener("resize", apply);
   addEventListener("orientationchange", apply);
+  addEventListener("scroll", apply, { passive: true });
 })();
 </script>`;
 
