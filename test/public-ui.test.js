@@ -62,6 +62,7 @@ test("refuses to sit on top of the hero card", () => {
   const out = injectPublicHomeUi(HOME, "/");
   assert.match(out, /KEEP_CLEAR = "\.premium-service-panel"/);
   assert.match(out, /data-se-state="blocked"/);
+  assert.match(out, /shouldStandDown/);
   assert.match(out, /addEventListener\("scroll", apply/);
 });
 

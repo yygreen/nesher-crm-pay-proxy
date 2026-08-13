@@ -88,24 +88,42 @@ const SCRIPT = `
     return !(a.right <= b.left || b.right <= a.left || a.bottom <= b.top || b.bottom <= a.top);
   }
 
-  /** Would the box sit on top of the hero card at this position? */
-  function hitsContent(bottomPx, rightPx) {
+  function blockers() {
+    var out = [], all = document.querySelectorAll(KEEP_CLEAR);
+    for (var i = 0; i < all.length; i++) {
+      var s = getComputedStyle(all[i]);
+      if (s.display === "none" || s.visibility === "hidden") continue;
+      var r = all[i].getBoundingClientRect();
+      if (r.width > 0 && r.height > 0) out.push(r);
+    }
+    return out;
+  }
+
+  function hitsAny(rect, list) {
+    for (var i = 0; i < list.length; i++) if (intersects(rect, list[i])) return true;
+    return false;
+  }
+
+  /**
+   * Stand down only when WE would cover the hero card and the chat launcher
+   * would not — i.e. when this button alone is sticking up into the content.
+   * If the launcher covers the card too (narrow screens, where the card spans
+   * the full width), floating over it is simply how the page works, and
+   * hiding one button of the pair would look broken.
+   */
+  function shouldStandDown(bottomPx, rightPx, launcher) {
     var w = box.offsetWidth, h = box.offsetHeight;
     if (!w || !h) return false;
+    var cards = blockers();
+    if (!cards.length) return false;
     var probe = {
       left: innerWidth - rightPx - w,
       right: innerWidth - rightPx,
       top: innerHeight - bottomPx - h,
       bottom: innerHeight - bottomPx
     };
-    var blockers = document.querySelectorAll(KEEP_CLEAR);
-    for (var i = 0; i < blockers.length; i++) {
-      var s = getComputedStyle(blockers[i]);
-      if (s.display === "none" || s.visibility === "hidden") continue;
-      var r = blockers[i].getBoundingClientRect();
-      if (r.width > 0 && r.height > 0 && intersects(probe, r)) return true;
-    }
-    return false;
+    if (!hitsAny(probe, cards)) return false;
+    return !(launcher && hitsAny(launcher, cards));
   }
 
   function apply() {
@@ -137,8 +155,8 @@ const SCRIPT = `
       if (!(right >= 0)) right = baseRight;
     }
 
-    // Never cover the hero card; wait until the page scrolls it clear.
-    if (hitsContent(bottom, right)) {
+    // Never be the odd one out sitting on the hero card.
+    if (shouldStandDown(bottom, right, launcher)) {
       box.setAttribute("data-se-state", "blocked");
       return;
     }
