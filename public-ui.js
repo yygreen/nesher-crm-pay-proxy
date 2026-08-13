@@ -64,9 +64,19 @@ const SCRIPT = `
     baseRight = parseInt(cs.right, 10) || baseRight;
   } catch (e) {}
 
+  /**
+   * Viewport width/height EXCLUDING scrollbars. getBoundingClientRect() and a
+   * fixed element's CSS right/bottom are both measured against this box, while
+   * innerWidth INCLUDES the scrollbar — mixing them shifted this button left by
+   * exactly the scrollbar width (15px on Windows). Invisible in headless
+   * Chromium, which uses zero-width overlay scrollbars.
+   */
+  function vw() { return document.documentElement.clientWidth || innerWidth; }
+  function vh() { return document.documentElement.clientHeight || innerHeight; }
+
   function onScreen(r) {
     return r.width > 0 && r.height > 0 &&
-      r.right > 0 && r.left < innerWidth && r.bottom > 0 && r.top < innerHeight;
+      r.right > 0 && r.left < vw() && r.bottom > 0 && r.top < vh();
   }
 
   function snapEngageRects() {
@@ -117,10 +127,10 @@ const SCRIPT = `
     var cards = blockers();
     if (!cards.length) return false;
     var probe = {
-      left: innerWidth - rightPx - w,
-      right: innerWidth - rightPx,
-      top: innerHeight - bottomPx - h,
-      bottom: innerHeight - bottomPx
+      left: vw() - rightPx - w,
+      right: vw() - rightPx,
+      top: vh() - bottomPx - h,
+      bottom: vh() - bottomPx
     };
     if (!hitsAny(probe, cards)) return false;
     return !(launcher && hitsAny(launcher, cards));
@@ -148,9 +158,9 @@ const SCRIPT = `
     var bottom = baseBottom, right = baseRight;
     if (launcher) {
       // stack directly above SnapEngage's launcher, CENTRE-aligned with it
-      bottom = Math.round(innerHeight - launcher.top + GAP);
+      bottom = Math.round(vh() - launcher.top + GAP);
       right = Math.round(
-        innerWidth - (launcher.left + launcher.width / 2) - box.offsetWidth / 2
+        vw() - (launcher.left + launcher.width / 2) - box.offsetWidth / 2
       );
       if (!(right >= 0)) right = baseRight;
     }

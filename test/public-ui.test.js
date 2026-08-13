@@ -66,6 +66,22 @@ test("refuses to sit on top of the hero card", () => {
   assert.match(out, /addEventListener\("scroll", apply/);
 });
 
+test("positions against the layout viewport, never innerWidth", () => {
+  // regression: CSS right on a fixed element excludes the scrollbar, innerWidth
+  // includes it — mixing them shifted the button left by the scrollbar width
+  // (15px on Windows). Headless Chromium has zero-width overlay scrollbars, so
+  // only a headed browser reproduces it.
+  const out = injectPublicHomeUi(HOME, "/");
+  const script = out.slice(out.indexOf("nesher-public-ui-js"));
+  const bare = script.replace(/document\.documentElement\.clientWidth \|\| innerWidth/, "")
+                     .replace(/document\.documentElement\.clientHeight \|\| innerHeight/, "")
+                     .replace(/innerWidth INCLUDES[^\n]*\n/, "");
+  assert.doesNotMatch(bare, /\binnerWidth\b/);
+  assert.doesNotMatch(bare, /\binnerHeight\b/);
+  assert.match(out, /function vw\(\)/);
+  assert.match(out, /function vh\(\)/);
+});
+
 test("is idempotent", () => {
   const once = injectPublicHomeUi(HOME, "/");
   assert.equal(injectPublicHomeUi(once, "/"), once);
