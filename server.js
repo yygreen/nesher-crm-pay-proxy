@@ -21,8 +21,10 @@ import { injectWhatsAppUi } from "./whatsapp-ui.js";
 import {
   injectSnapEngage,
   isPublicMarketingPath,
+  isPublicMarketingHost,
   DEFAULT_WIDGET_ID,
 } from "./snapengage.js";
+import { injectPublicHomeUi } from "./public-ui.js";
 import {
   getPool,
   loadHotelPayContext,
@@ -799,6 +801,9 @@ function proxyWithInject(req, res) {
               hosts: SNAPENGAGE_HOSTS,
               staffCheckHtml: text,
             });
+            injected = injectPublicHomeUi(injected, pathOnly, {
+              isPublicHost: isPublicMarketingHost(req.headers.host, SNAPENGAGE_HOSTS),
+            });
             finish(Buffer.from(injected, "utf8"));
           } catch (e) {
             console.error("inject failed", e.message);
@@ -921,7 +926,7 @@ const server = http.createServer(async (req, res) => {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-08-12-snapengage",
+      build: "2026-08-13-chat-buttons",
       snapEngage: {
         enabled: SNAPENGAGE_ENABLED,
         widgetId: SNAPENGAGE_WIDGET_ID,
