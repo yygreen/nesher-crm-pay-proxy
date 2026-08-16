@@ -1,5 +1,5 @@
 /**
- * Square Checkout payment links — card backup when Mercury/Stripe card is down.
+ * Square Checkout payment links — THE card path (Mercury invoices are bank/ACH-only).
  *
  * Env (Railway / local):
  *   SQUARE_ACCESS_TOKEN_NESHER  (or SQUARE_ACCESS_TOKEN)

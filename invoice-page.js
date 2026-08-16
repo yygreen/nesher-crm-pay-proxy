@@ -149,7 +149,6 @@ export function renderInvoiceHtml(data) {
   const mercuryUrl = esc(data.mercuryUrl);
   const squareUrl = data.squareUrl ? esc(data.squareUrl) : "";
   const hasSquare = Boolean(data.squareUrl);
-  const stripeCombo = data.cardProcessor === "stripe";
 
   let actions = "";
   if (hasSquare) {
@@ -157,10 +156,6 @@ export function renderInvoiceHtml(data) {
       <a class="btn btn-primary" href="${squareUrl}">Pay with card</a>
       <a class="btn btn-secondary" href="${mercuryUrl}">Pay with bank</a>
       <p class="hint">Card is usually fastest. Bank transfer works too. Please pay once.</p>`;
-  } else if (stripeCombo) {
-    actions = `
-      <a class="btn btn-primary" href="${mercuryUrl}">Pay now</a>
-      <p class="hint">Card or bank transfer on the next screen.</p>`;
   } else {
     actions = `
       <a class="btn btn-primary" href="${mercuryUrl}">Pay with bank</a>

@@ -126,45 +126,9 @@ export function buildLineItems(opts) {
   ];
 }
 
-/**
- * True when Mercury rejected create/update because Stripe card is blocked
- * (account disabled, not connected, cannot accept cards, etc.).
- * Safe false-negative is OK (we surface the real error); false-positive would
- * wrongly strip card — keep patterns tight to card/Stripe wording.
- */
-export function isStripeCardBlockedError(status, bodyText) {
-  const code = Number(status);
-  if (code !== 400 && code !== 422) return false;
-  const t = String(bodyText || "").toLowerCase();
-  if (!t) return false;
-  const mentionsCardOrStripe =
-    /\bstripe\b/.test(t) ||
-    /\bcredit\s*card\b/.test(t) ||
-    /\bcard\s+payments?\b/.test(t) ||
-    /creditcardenabled/.test(t);
-  if (!mentionsCardOrStripe) return false;
-  return (
-    /\bdisabled\b/.test(t) ||
-    /\bre-?enable\b/.test(t) ||
-    /\bnot\s+connected\b/.test(t) ||
-    /\bcannot\s+accept\b/.test(t) ||
-    /\bcan'?t\s+accept\b/.test(t) ||
-    /\bunable\s+to\s+accept\b/.test(t) ||
-    /\bmust\s+take\s+action\b/.test(t) ||
-    /\binactive\b/.test(t) ||
-    /\bsuspended\b/.test(t) ||
-    /\brestricted\b/.test(t) ||
-    /\bsetup\b/.test(t) ||
-    /\bvalidat/.test(t)
-  );
-}
-
-/** Staff-facing message — never dump raw Stripe/Mercury JSON. */
+/** Staff-facing message — never dump raw Mercury JSON. */
 export function humanizePayError(err) {
   const raw = err instanceof Error ? err.message : String(err || "");
-  if (isStripeCardBlockedError(400, raw) || isStripeCardBlockedError(422, raw)) {
-    return "Card processing is temporarily unavailable. Bank transfer still works — try again.";
-  }
   if (/Mercury create invoice failed:\s*400/i.test(raw)) {
     return "Could not create the payment link. Check amount and email, then try again.";
   }
@@ -177,62 +141,29 @@ export function humanizePayError(err) {
 }
 
 /**
- * Prefer card+ACH; if Stripe is blocked, create bank/ACH-only so invoicing never dies.
- * @returns {Promise<{ ok: boolean, res: Response, bodyText: string, creditCardEnabled: boolean, cardFallback: boolean }>}
+ * Mercury invoices are always bank/ACH-only — the Mercury card processor is
+ * gone for good, so card payments run through Square checkout links instead.
+ * @returns {Promise<{ ok: boolean, res: Response, bodyText: string }>}
  */
-async function postInvoiceWithCardFallback(fetchImpl, url, headers, baseBody, preferCard) {
-  const wantCard = preferCard !== false;
-  const attempts = wantCard
-    ? [
-        { creditCardEnabled: true, cardFallback: false },
-        { creditCardEnabled: false, cardFallback: true },
-      ]
-    : [{ creditCardEnabled: false, cardFallback: false }];
-
-  let last = { ok: false, res: null, bodyText: "", creditCardEnabled: false, cardFallback: false };
-
-  for (let i = 0; i < attempts.length; i++) {
-    const attempt = attempts[i];
-    const body = { ...baseBody, creditCardEnabled: attempt.creditCardEnabled };
-    const res = await fetchImpl(url, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(body),
-    });
-    const bodyText = res.ok ? "" : await res.text();
-    last = {
-      ok: res.ok,
-      res,
-      bodyText,
-      creditCardEnabled: attempt.creditCardEnabled,
-      cardFallback: attempt.cardFallback,
-    };
-    if (res.ok) return last;
-    // Only retry without card when Stripe/card is the reason
-    const canRetryBankOnly =
-      i === 0 &&
-      wantCard &&
-      attempt.creditCardEnabled === true &&
-      isStripeCardBlockedError(res.status, bodyText);
-    if (!canRetryBankOnly) return last;
-  }
-  return last;
+async function postBankOnlyInvoice(fetchImpl, url, headers, baseBody) {
+  const body = { ...baseBody, creditCardEnabled: false };
+  const res = await fetchImpl(url, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+  });
+  const bodyText = res.ok ? "" : await res.text();
+  return { ok: res.ok, res, bodyText };
 }
 
-function cardMetaFromInvoice(invoice, { creditCardEnabled, cardFallback }) {
-  const enabled =
-    typeof creditCardEnabled === "boolean"
-      ? creditCardEnabled
-      : Boolean(invoice?.creditCardEnabled);
+function cardMetaFromInvoice(invoice) {
   return {
-    creditCardEnabled: enabled,
-    cardProcessor: enabled ? "stripe" : "none",
-    cardFallback: Boolean(cardFallback) && !enabled,
+    creditCardEnabled: false,
+    cardProcessor: "none",
+    cardFallback: false,
     achDebitEnabled:
       invoice?.achDebitEnabled !== undefined ? Boolean(invoice.achDebitEnabled) : true,
-    paymentMethodsLabel: enabled
-      ? "Bank transfer / ACH + card"
-      : "Bank transfer / ACH (card offline)",
+    paymentMethodsLabel: "Bank transfer / ACH",
   };
 }
 
@@ -248,7 +179,6 @@ function cardMetaFromInvoice(invoice, { creditCardEnabled, cardFallback }) {
  * @param {Array<{name:string,unitPrice:number,quantity?:number}>} [opts.lineItems]
  * @param {string} [opts.payerMemo]
  * @param {string} [opts.destinationAccountId]
- * @param {boolean} [opts.creditCardEnabled] default true; false = bank-only
  * @param {typeof fetch} [opts.fetchImpl]
  * @returns {Promise<{ reused: boolean, invoice: object, payUrl: string, creditCardEnabled: boolean, cardProcessor: string, cardFallback: boolean, paymentMethodsLabel: string }>}
  */
@@ -277,7 +207,6 @@ export async function createOrReusePaymentRequest(opts) {
     opts.destinationAccountId ||
     process.env.MERCURY_DESTINATION_ACCOUNT_ID ||
     DEFAULT_DEST;
-  const preferCard = opts.creditCardEnabled !== false;
 
   const headers = {
     Authorization: `Bearer ${token}`,
@@ -318,11 +247,11 @@ export async function createOrReusePaymentRequest(opts) {
       !Array.isArray(existing.lineItems) ||
       existing.lineItems.map((li) => li.name).join("|") ===
         lineItems.map((li) => li.name).join("|");
-    if (sameAmount && sameMemo && sameLines) {
-      const meta = cardMetaFromInvoice(existing, {
-        creditCardEnabled: existing.creditCardEnabled,
-        cardFallback: false,
-      });
+    // An old invoice with card still enabled must fall through to the update
+    // path, which reposts it bank-only (card processing is gone).
+    const cardAlreadyOff = existing.creditCardEnabled !== true;
+    if (sameAmount && sameMemo && sameLines && cardAlreadyOff) {
+      const meta = cardMetaFromInvoice(existing);
       return {
         reused: true,
         invoice: existing,
@@ -396,12 +325,11 @@ export async function createOrReusePaymentRequest(opts) {
     if (existing.dueDate && existing.dueDate >= iso(today)) {
       baseBody.dueDate = existing.dueDate;
     }
-    const posted = await postInvoiceWithCardFallback(
+    const posted = await postBankOnlyInvoice(
       fetchImpl,
       `${MERCURY_API}/ar/invoices/${existing.id}`,
       headers,
-      baseBody,
-      preferCard
+      baseBody
     );
     if (!posted.ok) {
       throw new Error(
@@ -417,9 +345,9 @@ export async function createOrReusePaymentRequest(opts) {
     const invoice = {
       ...existing,
       ...updated,
-      creditCardEnabled: posted.creditCardEnabled,
+      creditCardEnabled: false,
     };
-    const meta = cardMetaFromInvoice(invoice, posted);
+    const meta = cardMetaFromInvoice(invoice);
     return {
       reused: false,
       updated: true,
@@ -429,12 +357,11 @@ export async function createOrReusePaymentRequest(opts) {
     };
   }
 
-  const posted = await postInvoiceWithCardFallback(
+  const posted = await postBankOnlyInvoice(
     fetchImpl,
     `${MERCURY_API}/ar/invoices`,
     headers,
-    baseBody,
-    preferCard
+    baseBody
   );
   if (!posted.ok) {
     throw new Error(
@@ -443,8 +370,8 @@ export async function createOrReusePaymentRequest(opts) {
   }
   const invoice = await posted.res.json();
   if (!invoice.slug) throw new Error("Mercury invoice missing slug");
-  invoice.creditCardEnabled = posted.creditCardEnabled;
-  const meta = cardMetaFromInvoice(invoice, posted);
+  invoice.creditCardEnabled = false;
+  const meta = cardMetaFromInvoice(invoice);
   return {
     reused: false,
     invoice,

@@ -306,50 +306,44 @@ async function handlePayApi(req, res, kind, id, query) {
       mercuryOptsFromDraft(token, draftBundle)
     );
 
-    // Card via Stripe (Mercury) when healthy. When Stripe is blocked, create a
-    // Square checkout link so guests still have a card path.
-    let cardProcessor =
-      result.cardProcessor || (result.creditCardEnabled ? "stripe" : "none");
-    let creditCardEnabled = Boolean(result.creditCardEnabled);
+    // Mercury invoices are bank/ACH-only. Square checkout is THE card path
+    // on every invoice.
+    let cardProcessor = "none";
+    let creditCardEnabled = false;
     let squarePayUrl = null;
     let squarePaymentLinkId = null;
     let squareError = null;
     let paymentMethodsLabel = result.paymentMethodsLabel;
 
-    const needsCardBackup =
-      !creditCardEnabled || result.cardFallback || cardProcessor === "none";
-
-    if (needsCardBackup) {
-      if (isSquareConfigured()) {
-        try {
-          const d = draftBundle.draft;
-          const sq = await createSquarePaymentLink({
-            amountUsd: d.amountUsd,
-            invoiceNumber: d.invoiceNumber,
-            lineName: d.lineItemName || d.summary || d.invoiceNumber,
-            customerEmail: d.customerEmail,
-            customerName: d.customerName,
-            // Stable-ish key so double-clicks don't mint many links for same invoice+amount
-            idempotencyKey: `crm-${d.invoiceNumber}-${Math.round(Number(d.amountUsd) * 100)}`,
-          });
-          if (sq.ok && sq.payUrl) {
-            squarePayUrl = sq.payUrl;
-            squarePaymentLinkId = sq.paymentLinkId || null;
-            cardProcessor = "square";
-            creditCardEnabled = true; // card available — via Square, not Mercury
-            paymentMethodsLabel = "Bank transfer / ACH + card (Square)";
-          } else {
-            squareError = sq.error || "Square link not created";
-            console.warn("square backup failed", squareError);
-          }
-        } catch (e) {
-          squareError = e.message || String(e);
-          console.warn("square backup threw", squareError);
+    if (isSquareConfigured()) {
+      try {
+        const d = draftBundle.draft;
+        const sq = await createSquarePaymentLink({
+          amountUsd: d.amountUsd,
+          invoiceNumber: d.invoiceNumber,
+          lineName: d.lineItemName || d.summary || d.invoiceNumber,
+          customerEmail: d.customerEmail,
+          customerName: d.customerName,
+          // Stable-ish key so double-clicks don't mint many links for same invoice+amount
+          idempotencyKey: `crm-${d.invoiceNumber}-${Math.round(Number(d.amountUsd) * 100)}`,
+        });
+        if (sq.ok && sq.payUrl) {
+          squarePayUrl = sq.payUrl;
+          squarePaymentLinkId = sq.paymentLinkId || null;
+          cardProcessor = "square";
+          creditCardEnabled = true; // card available — via Square
+          paymentMethodsLabel = "Bank transfer / ACH + card (Square)";
+        } else {
+          squareError = sq.error || "Square link not created";
+          console.warn("square card link failed", squareError);
         }
-      } else {
-        squareError =
-          "Square access token not set on server (SQUARE_ACCESS_TOKEN_NESHER) — card backup offline";
+      } catch (e) {
+        squareError = e.message || String(e);
+        console.warn("square card link threw", squareError);
       }
+    } else {
+      squareError =
+        "Square access token not set on server (SQUARE_ACCESS_TOKEN_NESHER) — card payments offline";
     }
 
     // One short guest invoice URL (bank + card on one clean page).
@@ -385,11 +379,9 @@ async function handlePayApi(req, res, kind, id, query) {
     try {
       const ph = d.emailPlaceholder ? " (placeholder email)" : "";
       const cardNote =
-        cardProcessor === "stripe"
-          ? " | card+ACH (Stripe/Mercury)"
-          : cardProcessor === "square"
-            ? " | one invoice: bank (Mercury) + card (Square)"
-            : " | bank/ACH only (card offline)";
+        cardProcessor === "square"
+          ? " | one invoice: bank (Mercury) + card (Square)"
+          : " | bank/ACH only (card offline)";
       const note = `[Automated Mercury] ${result.updated ? "Updated" : result.reused ? "Reused" : "Created"} invoice ${shareUrl} | mercury ${result.payUrl}${squarePayUrl ? ` | square ${squarePayUrl}` : ""} | ${d.summary} | ${d.invoiceNumber} | ${paymentMethodsLabel || "pay"}${cardNote}${ph}`;
       if (kind === "reservation") {
         await appendReservationNote(ctx.reservation.id, note);
@@ -417,7 +409,7 @@ async function handlePayApi(req, res, kind, id, query) {
       invoiceId: result.invoice.id,
       creditCardEnabled,
       cardProcessor,
-      cardFallback: Boolean(result.cardFallback) || cardProcessor === "square",
+      cardFallback: cardProcessor === "square",
       achDebitEnabled: result.achDebitEnabled !== false,
       paymentMethodsLabel,
       emailPlaceholder: draftBundle.draft.emailPlaceholder,
@@ -438,7 +430,7 @@ async function handlePayApi(req, res, kind, id, query) {
   } catch (e) {
     console.error("pay api error", e);
     // Even on unexpected errors, try not to hard-block the UI — structured message
-    // Never dump raw Stripe/Mercury stack traces into the modal.
+    // Never dump raw Mercury stack traces into the modal.
     sendJson(res, 200, {
       ok: false,
       error: humanizePayError(e),
@@ -926,7 +918,7 @@ const server = http.createServer(async (req, res) => {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-08-13-buttons-v4",
+      build: "2026-08-16-square-card-v1",
       snapEngage: {
         enabled: SNAPENGAGE_ENABLED,
         widgetId: SNAPENGAGE_WIDGET_ID,
