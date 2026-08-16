@@ -7,10 +7,6 @@ import {
   humanizePayError,
 } from "./mercury.js";
 import {
-  createSquarePaymentLink,
-  isSquareConfigured,
-} from "./square.js";
-import {
   buildCombinedPayUrl,
   renderInvoiceHtml,
   renderInvoiceErrorHtml,
@@ -306,47 +302,11 @@ async function handlePayApi(req, res, kind, id, query) {
       mercuryOptsFromDraft(token, draftBundle)
     );
 
-    // Mercury invoices are bank/ACH-only. Square checkout is THE card path
-    // on every invoice.
-    let cardProcessor = "none";
-    let creditCardEnabled = false;
-    let squarePayUrl = null;
-    let squarePaymentLinkId = null;
-    let squareError = null;
-    let paymentMethodsLabel = result.paymentMethodsLabel;
+    // No card processor exists anymore (Stripe closed 8/11, Square closed 8/16).
+    // Mercury invoices are bank/ACH-only, and the guest page offers bank only.
+    const paymentMethodsLabel = "Bank transfer / ACH only";
 
-    if (isSquareConfigured()) {
-      try {
-        const d = draftBundle.draft;
-        const sq = await createSquarePaymentLink({
-          amountUsd: d.amountUsd,
-          invoiceNumber: d.invoiceNumber,
-          lineName: d.lineItemName || d.summary || d.invoiceNumber,
-          customerEmail: d.customerEmail,
-          customerName: d.customerName,
-          // Stable-ish key so double-clicks don't mint many links for same invoice+amount
-          idempotencyKey: `crm-${d.invoiceNumber}-${Math.round(Number(d.amountUsd) * 100)}`,
-        });
-        if (sq.ok && sq.payUrl) {
-          squarePayUrl = sq.payUrl;
-          squarePaymentLinkId = sq.paymentLinkId || null;
-          cardProcessor = "square";
-          creditCardEnabled = true; // card available — via Square
-          paymentMethodsLabel = "Bank transfer / ACH + card (Square)";
-        } else {
-          squareError = sq.error || "Square link not created";
-          console.warn("square card link failed", squareError);
-        }
-      } catch (e) {
-        squareError = e.message || String(e);
-        console.warn("square card link threw", squareError);
-      }
-    } else {
-      squareError =
-        "Square access token not set on server (SQUARE_ACCESS_TOKEN_NESHER) — card payments offline";
-    }
-
-    // One short guest invoice URL (bank + card on one clean page).
+    // One short guest invoice URL (bank-only, one clean page).
     const d = draftBundle.draft;
     let combinedPayUrl = null;
     try {
@@ -357,8 +317,6 @@ async function handlePayApi(req, res, kind, id, query) {
         summary: d.summary || d.lineItemName,
         lineName: d.lineItemName,
         mercuryUrl: result.payUrl,
-        squareUrl: squarePayUrl || "",
-        cardProcessor,
       });
       const origin = `https://${publicHostFor(req)}`;
       if (stored.ok && stored.code) {
@@ -378,11 +336,7 @@ async function handlePayApi(req, res, kind, id, query) {
     // CRM note
     try {
       const ph = d.emailPlaceholder ? " (placeholder email)" : "";
-      const cardNote =
-        cardProcessor === "square"
-          ? " | one invoice: bank (Mercury) + card (Square)"
-          : " | bank/ACH only (card offline)";
-      const note = `[Automated Mercury] ${result.updated ? "Updated" : result.reused ? "Reused" : "Created"} invoice ${shareUrl} | mercury ${result.payUrl}${squarePayUrl ? ` | square ${squarePayUrl}` : ""} | ${d.summary} | ${d.invoiceNumber} | ${paymentMethodsLabel || "pay"}${cardNote}${ph}`;
+      const note = `[Automated Mercury] ${result.updated ? "Updated" : result.reused ? "Reused" : "Created"} invoice ${shareUrl} | mercury ${result.payUrl} | ${d.summary} | ${d.invoiceNumber} | ${paymentMethodsLabel} | bank/ACH only${ph}`;
       if (kind === "reservation") {
         await appendReservationNote(ctx.reservation.id, note);
       } else if (ctx.request?.id) {
@@ -400,16 +354,12 @@ async function handlePayApi(req, res, kind, id, query) {
       payUrl: shareUrl,
       combinedPayUrl: shareUrl,
       mercuryPayUrl: result.payUrl,
-      squarePayUrl,
-      squarePaymentLinkId,
-      squareError: squareError || undefined,
       invoiceNumber: draftBundle.draft.invoiceNumber,
       amountUsd: draftBundle.draft.amountUsd,
       slug: result.invoice.slug,
       invoiceId: result.invoice.id,
-      creditCardEnabled,
-      cardProcessor,
-      cardFallback: cardProcessor === "square",
+      creditCardEnabled: false,
+      cardProcessor: "none",
       achDebitEnabled: result.achDebitEnabled !== false,
       paymentMethodsLabel,
       emailPlaceholder: draftBundle.draft.emailPlaceholder,
@@ -914,11 +864,10 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (url.pathname === "/__nesher_pay/health") {
-    // include square readiness (no secrets) so ops can see card-backup status
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-08-16-square-card-v1",
+      build: "2026-08-16-square-removed-v1",
       snapEngage: {
         enabled: SNAPENGAGE_ENABLED,
         widgetId: SNAPENGAGE_WIDGET_ID,
@@ -936,13 +885,6 @@ const server = http.createServer(async (req, res) => {
         : null,
       hasMercury: Boolean(
         process.env.MERCURY_TOKEN_NESHER || process.env.MERCURY_TOKEN
-      ),
-      hasSquare: isSquareConfigured(),
-      squareAppIdSet: Boolean(
-        process.env.SQUARE_APP_ID_NESHER || process.env.SQUARE_APPLICATION_ID
-      ),
-      squareLocationSet: Boolean(
-        process.env.SQUARE_LOCATION_ID_NESHER || process.env.SQUARE_LOCATION_ID
       ),
       hasDb: Boolean(process.env.DATABASE_URL || process.env.DATABASE_PUBLIC_URL),
       hasWhatsApp: wa.configured,

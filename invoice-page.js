@@ -50,7 +50,6 @@ export function mintInvoiceToken(data) {
   if (!/^https:\/\//i.test(mercuryUrl)) {
     throw new Error("mercuryUrl required");
   }
-  const squareUrl = String(data.squareUrl || "").trim();
   const payload = {
     v: 1,
     a: amountUsd,
@@ -58,8 +57,6 @@ export function mintInvoiceToken(data) {
     c: String(data.customerName || "").slice(0, 120),
     s: String(data.summary || data.lineName || "").slice(0, 240),
     m: mercuryUrl.slice(0, 500),
-    q: squareUrl && /^https:\/\//i.test(squareUrl) ? squareUrl.slice(0, 500) : "",
-    p: String(data.cardProcessor || (squareUrl ? "square" : "none")).slice(0, 16),
     exp: Math.floor(Date.now() / 1000) + (Number(data.ttlSec) || DEFAULT_TTL_SEC),
   };
   const body = b64urlJson(payload);
@@ -95,6 +92,7 @@ export function verifyInvoiceToken(token) {
   if (!payload.m || !/^https:\/\//i.test(payload.m)) {
     return { ok: false, error: "missing pay url" };
   }
+  // Older tokens may carry q/p (dead Square card fields) — deliberately ignored.
   return {
     ok: true,
     data: {
@@ -103,8 +101,6 @@ export function verifyInvoiceToken(token) {
       customerName: payload.c || "",
       summary: payload.s || "",
       mercuryUrl: payload.m,
-      squareUrl: payload.q || "",
-      cardProcessor: payload.p || "none",
       exp: payload.exp,
     },
   };
@@ -147,20 +143,12 @@ export function renderInvoiceHtml(data) {
   const name = esc(data.customerName || "");
   const summary = esc(data.summary || "");
   const mercuryUrl = esc(data.mercuryUrl);
-  const squareUrl = data.squareUrl ? esc(data.squareUrl) : "";
-  const hasSquare = Boolean(data.squareUrl);
 
-  let actions = "";
-  if (hasSquare) {
-    actions = `
-      <a class="btn btn-primary" href="${squareUrl}">Pay with card</a>
-      <a class="btn btn-secondary" href="${mercuryUrl}">Pay with bank</a>
-      <p class="hint">Card is usually fastest. Bank transfer works too. Please pay once.</p>`;
-  } else {
-    actions = `
+  // Bank-only by design: no card processor exists (stored/tokenized card URLs
+  // from the Square era must never render — that account is closed).
+  const actions = `
       <a class="btn btn-primary" href="${mercuryUrl}">Pay with bank</a>
       <p class="hint">Secure bank transfer on the next screen.</p>`;
-  }
 
   return `<!doctype html>
 <html lang="en">

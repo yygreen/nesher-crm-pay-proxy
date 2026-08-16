@@ -46,8 +46,6 @@ export async function storeInvoice(data) {
     customerName: String(data.customerName || ""),
     summary: String(data.summary || data.lineName || ""),
     mercuryUrl: String(data.mercuryUrl || ""),
-    squareUrl: String(data.squareUrl || ""),
-    cardProcessor: String(data.cardProcessor || "none"),
   };
   const expiresAt = new Date(Date.now() + 45 * 24 * 60 * 60 * 1000);
 
@@ -115,8 +113,6 @@ export async function loadInvoice(idOrToken) {
           customerName: p.customerName || "",
           summary: p.summary || "",
           mercuryUrl: p.mercuryUrl || "",
-          squareUrl: p.squareUrl || "",
-          cardProcessor: p.cardProcessor || "none",
         },
       };
     } catch (e) {

@@ -141,8 +141,9 @@ export function humanizePayError(err) {
 }
 
 /**
- * Mercury invoices are always bank/ACH-only — the Mercury card processor is
- * gone for good, so card payments run through Square checkout links instead.
+ * Mercury invoices are always bank/ACH-only. No card processor exists for this
+ * business (Stripe closed 2026-08-11, Square closed 2026-08-16) — never
+ * re-enable creditCardEnabled.
  * @returns {Promise<{ ok: boolean, res: Response, bodyText: string }>}
  */
 async function postBankOnlyInvoice(fetchImpl, url, headers, baseBody) {
