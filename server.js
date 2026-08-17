@@ -14,10 +14,12 @@ import {
 import { storeInvoice, loadInvoice } from "./invoice-store.js";
 import { injectPayButtons, injectPaidBadges } from "./inject.js";
 import { injectWhatsAppUi } from "./whatsapp-ui.js";
+import { injectIntakeUi, INTAKE_UI_PATH_RE, loadIntakeFeed } from "./intake-ui.js";
 import {
   injectSnapEngage,
   isPublicMarketingPath,
   isPublicMarketingHost,
+  looksLikeStaffPage,
   DEFAULT_WIDGET_ID,
 } from "./snapengage.js";
 import { injectPublicHomeUi } from "./public-ui.js";
@@ -667,11 +669,17 @@ async function handleWaSendMedia(req, res, contactId) {
 
 function proxyWithInject(req, res) {
   const pathOnly = (req.url || "/").split("?")[0];
-  const shouldInject =
+  // Pages that get the pay modal / WhatsApp UI / PAID badges (these injectors are NOT path-gated
+  // themselves — keep this set tight; see the 8/12 outage note in memory).
+  const staffCore =
     /^\/jrm\/hotels(\/|$)/.test(pathOnly) ||
     /^\/reservations(\/|$)/.test(pathOnly) ||
     /^\/whatsapp(\/|$)/.test(pathOnly) ||
-    /^\/customers\/\d+\/?$/.test(pathOnly) ||
+    /^\/customers\/\d+\/?$/.test(pathOnly);
+  const shouldInject =
+    staffCore ||
+    // wider staff surface: only the JRM Inbox bell/badge is injected here
+    INTAKE_UI_PATH_RE.test(pathOnly) ||
     // public marketing pages — SnapEngage live chat
     isPublicMarketingPath(pathOnly);
 
@@ -730,9 +738,17 @@ function proxyWithInject(req, res) {
             // pages — injectPayButtons has no path gate of its own and would
             // drop the internal payment-link modal onto flynesher.com.
             if (!isPublicMarketingPath(pathOnly)) {
-              injected = injectPayButtons(injected, pathOnly);
-              injected = injectWhatsAppUi(injected, pathOnly);
-              injected = await injectPaidBadges(injected, pathOnly, badgePool());
+              if (staffCore) {
+                injected = injectPayButtons(injected, pathOnly);
+                injected = injectWhatsAppUi(injected, pathOnly);
+                injected = await injectPaidBadges(injected, pathOnly, badgePool());
+              }
+              // JRM Inbox bell/badge on every staff page (skips the login page by itself)
+              injected = injectIntakeUi(injected, pathOnly, { staffCheckHtml: text });
+            } else if (looksLikeStaffPage(text)) {
+              // "/" is a public marketing path for visitors but the CRM dashboard for a
+              // logged-in agent — decide on the ORIGINAL upstream HTML.
+              injected = injectIntakeUi(injected, pathOnly, { staffCheckHtml: text });
             }
             // Staff-page check reads the ORIGINAL upstream HTML: the injectors
             // above add markup that would otherwise look like the CRM.
@@ -863,11 +879,26 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ── JRM Inbox feed (bell / unread badge) — staff session required ────
+  if (/^\/__nesher_intake\/feed\/?$/.test(url.pathname)) {
+    if (!(await requireStaff(req, res))) return;
+    try {
+      const pool = badgePool();
+      if (!pool) { sendJson(res, 503, { error: "database not configured" }); return; }
+      const items = await loadIntakeFeed(pool);
+      sendJson(res, 200, { now: new Date().toISOString(), items });
+    } catch (e) {
+      console.error("intake feed failed", e.message);
+      sendJson(res, 500, { error: e.message });
+    }
+    return;
+  }
+
   if (url.pathname === "/__nesher_pay/health") {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-08-16-square-removed-v1",
+      build: "2026-08-17-intake-bell",
       snapEngage: {
         enabled: SNAPENGAGE_ENABLED,
         widgetId: SNAPENGAGE_WIDGET_ID,
