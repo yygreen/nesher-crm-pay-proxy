@@ -43,3 +43,7 @@ If create fails with `ipNotWhitelisted` for Railway IP `35.188.247.1`, either:
 npm test
 npm start
 ```
+
+## JRM Inbox bell (intake-ui.js)
+
+Unread badge / bell / NEW markers for leads auto-filed by the jrm-lead-intake service. Feed API `/__nesher_intake/feed/` (staff session). Full build doc: `C:\Users\User\jrm-lead-intake\docs\BUILD-DOC.html` and https://docs.google.com/document/d/1trJWjAAVgZXl5AamVDpmhjpAaYl15okRSWUR7U0mKC0/edit?usp=drivesdk
