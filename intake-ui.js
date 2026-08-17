@@ -93,6 +93,7 @@ tr.nib-newrow{background:#fff7e6 !important}
 const SCRIPT = `<script id="${INTAKE_UI_MARKER}-js">(function(){
 if (window.__nibLoaded) return; window.__nibLoaded = true;
 var FEED='/__nesher_intake/feed/', POLL=30000, LS_SEEN='nesherIntakeSeen', LS_MUTE='nesherIntakeMute', LS_LAST='nesherIntakeLastPoll';
+var firstEver = localStorage.getItem(LS_SEEN)==null;
 var seen = {}; try { seen = JSON.parse(localStorage.getItem(LS_SEEN)||'{}')||{}; } catch(e){}
 var muted = localStorage.getItem(LS_MUTE)==='1';
 var items = [], firstPoll = true, lastAt = localStorage.getItem(LS_LAST)||'';
@@ -160,6 +161,8 @@ function poll(){
     if (!j || !j.items) return;
     var prev={}; items.forEach(function(i){ prev[i.key]=1; });
     items=j.items;
+    // first time this browser sees the bell: only the last 24h count as unread (older backlog is history, not news)
+    if (firstEver) { items.forEach(function(i){ if (Date.now()-Date.parse(i.at) > 86400000) seen[i.key]=Date.now(); }); save(); firstEver=false; }
     // auto-mark the request you are looking at
     var m=location.pathname.match(/^\\/jrm\\/hotels\\/(\\d+)\\/?$/); if (m) { var rid=Number(m[1]); var ch=false; items.forEach(function(i){ if(i.requestId===rid && !seen[i.key]){ seen[i.key]=Date.now(); ch=true; } }); if (ch) save(); }
     var fresh=items.filter(function(i){ return !seen[i.key] && !prev[i.key] && (!firstPoll || (lastAt && i.at>lastAt)); });
