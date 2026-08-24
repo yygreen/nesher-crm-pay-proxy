@@ -21,6 +21,7 @@ import {
   setHotelRequestStatus,
   STATUS_LABEL,
 } from "./status-option.js";
+import { injectQuoteEmail, buildQuoteDraft } from "./quote-email.js";
 import { injectWhatsAppUi } from "./whatsapp-ui.js";
 import {
   injectSnapEngage,
@@ -236,6 +237,30 @@ async function handleStatusApi(req, res, requestId) {
     sendJson(res, 200, { ok: true, status: value });
   } catch (e) {
     sendJson(res, 500, { error: e.message });
+  }
+}
+
+/**
+ * Draft of the "please quote us" email for a hotel request.
+ * Read-only: it composes text and looks up an address, and sends nothing.
+ */
+async function handleQuoteApi(req, res, requestId, query) {
+  if (req.method !== "GET") {
+    sendJson(res, 405, { error: "GET only" });
+    return;
+  }
+  if (!(await requireStaff(req, res))) return;
+
+  try {
+    const draft = await buildQuoteDraft(
+      getPool(),
+      requestId,
+      query ? query.get("offer") : null,
+      { replyTo: process.env.QUOTE_REPLY_TO || null }
+    );
+    sendJson(res, 200, { ok: true, draft });
+  } catch (e) {
+    sendJson(res, /not found/i.test(e.message) ? 404 : 500, { error: e.message });
   }
 }
 
@@ -790,6 +815,7 @@ function proxyWithInject(req, res) {
               injected = injectWhatsAppUi(injected, pathOnly);
               injected = await injectPaidBadges(injected, pathOnly, badgePool());
               injected = injectStatusOption(injected, pathOnly);
+              injected = injectQuoteEmail(injected, pathOnly);
             }
             // Staff-page check reads the ORIGINAL upstream HTML: the injectors
             // above add markup that would otherwise look like the CRM.
@@ -924,7 +950,7 @@ const server = http.createServer(async (req, res) => {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-08-24-status-option-v1",
+      build: "2026-08-24-quote-email-v1",
       snapEngage: {
         enabled: SNAPENGAGE_ENABLED,
         widgetId: SNAPENGAGE_WIDGET_ID,
@@ -1011,6 +1037,13 @@ const server = http.createServer(async (req, res) => {
   );
   if (statusMatch) {
     await handleStatusApi(req, res, statusMatch[1]);
+    return;
+  }
+
+  // ── Quote-request email draft for the injected "Email hotel" button ─
+  const quoteMatch = url.pathname.match(/^\/__nesher_quote\/hotel\/(\d+)\/?$/);
+  if (quoteMatch) {
+    await handleQuoteApi(req, res, quoteMatch[1], url.searchParams);
     return;
   }
 

@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import vm from "node:vm";
+import { build, runScript, scriptBody } from "./dom-stub.js";
 import {
   injectStatusOption,
   isHotelRequestPath,
@@ -227,5 +228,148 @@ describe("the CRM's real status vocabulary", () => {
       assert.ok(out.includes(optionHtml(s)), `dropped existing status ${s}`);
     }
     assert.ok(out.includes(STATUS_LABEL));
+  });
+});
+
+/* ── the injected script, driven for real ───────────────────────────── */
+
+const VALUE = STATUS_LABEL;
+
+/** The Change Status card, plus the per-offer select that must not be bound. */
+function statusPage() {
+  return build([
+    { tag: "h1", text: "Hotel request 87" },
+    {
+      tag: "div",
+      attrs: { class: "card" },
+      children: [
+        { tag: "h3", text: "Change Status" },
+        {
+          tag: "form",
+          attrs: { method: "post", action: "/jrm/hotels/87/status/" },
+          children: [
+            {
+              tag: "select",
+              attrs: { name: "status" },
+              children: LIVE_STATUSES.map((v) => ({
+                tag: "option", attrs: { value: v }, value: v, text: v,
+              })),
+            },
+            { tag: "button", attrs: { type: "submit" }, text: "Update Status" },
+          ],
+        },
+      ],
+    },
+    {
+      tag: "select",
+      attrs: { name: "customer_answer_status" },
+      children: [{ tag: "option", attrs: { value: "" }, value: "", text: "--" }],
+    },
+  ]);
+}
+
+function driveStatus({ current = "New", doc = null, saveOk = true } = {}) {
+  const page = doc || statusPage();
+  const src = scriptBody(injectStatusOption(PAGE, "/jrm/hotels/87/"), "nesher-status-option-js");
+  const sandbox = runScript(src, {
+    doc: page,
+    fetchImpl: (url, opts) =>
+      opts && opts.method === "POST"
+        ? { ok: saveOk, json: () => Promise.resolve(saveOk ? { ok: true, status: VALUE } : { ok: false, error: "column too small" }) }
+        : { ok: true, json: () => Promise.resolve({ ok: true, value: VALUE, label: STATUS_LABEL, current }) },
+  });
+  vm.createContext(sandbox);
+  new vm.Script(src).runInContext(sandbox);
+  return sandbox;
+}
+
+const settle = () => new Promise((r) => setImmediate(r));
+const statusSelect = (doc) => doc.querySelectorAll("select").find((x) => x.getAttribute("name") === "status");
+const decoySelect = (doc) => doc.querySelectorAll("select").find((x) => x.getAttribute("name") === "customer_answer_status");
+
+describe("the injected browser script", () => {
+  it("binds the Change Status select, not the per-offer decoy", async () => {
+    const s = driveStatus();
+    await settle();
+    assert.equal(statusSelect(s.document).getAttribute("data-nesher-status-option"), "1");
+    assert.equal(decoySelect(s.document).getAttribute("data-nesher-status-option"), null);
+  });
+
+  it("appends the option without disturbing the CRM's own", async () => {
+    const s = driveStatus();
+    await settle();
+    const opts = statusSelect(s.document).options;
+    assert.deepEqual(opts.slice(0, LIVE_STATUSES.length).map((o) => o.value), LIVE_STATUSES);
+    assert.equal(opts[opts.length - 1].value, VALUE);
+    assert.equal(opts[opts.length - 1].textContent, STATUS_LABEL);
+  });
+
+  it("re-selects our value when it is what the request is stored as", async () => {
+    const s = driveStatus({ current: VALUE });
+    await settle();
+    assert.equal(statusSelect(s.document).value, VALUE);
+  });
+
+  it("leaves the selection alone for a normal CRM status", async () => {
+    const s = driveStatus({ current: "Hotel Responded" });
+    await settle();
+    assert.notEqual(statusSelect(s.document).value, VALUE);
+  });
+
+  it("intercepts submit and saves when our option is chosen", async () => {
+    const s = driveStatus();
+    await settle();
+    const sel = statusSelect(s.document);
+    sel.value = VALUE;
+    const ev = sel.form.dispatch("submit");
+    await settle();
+    assert.equal(ev.defaultPrevented, true, "the CRM form must not post an unknown status");
+    const post = s.calls.fetch.find((c) => c.opts && c.opts.method === "POST");
+    assert.ok(post, "saved through our endpoint");
+    assert.equal(post.url, "/__nesher_status/hotel/87/");
+    assert.deepEqual(JSON.parse(post.opts.body), { status: VALUE });
+  });
+
+  it("lets a normal status post to the CRM untouched", async () => {
+    const s = driveStatus();
+    await settle();
+    const sel = statusSelect(s.document);
+    sel.value = "Booked";
+    const ev = sel.form.dispatch("submit");
+    await settle();
+    assert.equal(ev.defaultPrevented, false, "the CRM must handle its own statuses");
+    assert.equal(s.calls.fetch.filter((c) => c.opts && c.opts.method === "POST").length, 0);
+  });
+
+  it("reloads only after the save succeeds", async () => {
+    const s = driveStatus();
+    await settle();
+    const sel = statusSelect(s.document);
+    sel.value = VALUE;
+    sel.form.dispatch("submit");
+    await settle();
+    assert.equal(s.calls.reload, 1);
+  });
+
+  it("shows the failure instead of silently losing the change", async () => {
+    const s = driveStatus({ saveOk: false });
+    await settle();
+    const sel = statusSelect(s.document);
+    sel.value = VALUE;
+    sel.form.dispatch("submit");
+    await settle();
+    assert.match(s.document.body.textContent, /column too small/);
+    assert.equal(s.calls.reload, 0, "must not reload away an unsaved change");
+  });
+
+  it("binds nothing when the page has only the decoy select", async () => {
+    const doc = build([
+      { tag: "h1", text: "Hotel request 87" },
+      { tag: "select", attrs: { name: "customer_answer_status" }, children: [] },
+    ]);
+    const s = driveStatus({ doc });
+    await settle();
+    assert.equal(decoySelect(s.document).getAttribute("data-nesher-status-option"), null);
+    assert.equal(s.calls.fetch.length, 0, "no request when there is nothing to extend");
   });
 });
