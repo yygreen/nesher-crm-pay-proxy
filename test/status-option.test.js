@@ -11,14 +11,37 @@ import {
   STATUS_LABEL,
 } from "../status-option.js";
 
+// The CRM's real status vocabulary, read off the live dropdown on
+// /jrm/hotels/<id>/. Kept verbatim so a change in how values are picked is
+// judged against what the column actually holds, not an invented list.
+const LIVE_STATUSES = [
+  "New",
+  "Needs Customer Clarification",
+  "Ready to Contact Hotels",
+  "Sent to Hotels",
+  "Hotel Responded",
+  "Sent to Customer",
+  "Customer Interested",
+  "Booking in Progress",
+  "Booked",
+  "Lost",
+  "Cancelled",
+];
+
+/** Django's own slug form of the same list, for CRMs that store the key. */
+const LIVE_SLUGS = LIVE_STATUSES.map((s) =>
+  s.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "")
+);
+
+const optionHtml = (v) => `<option value="${v}">${v}</option>`;
+
 // Shape of the Change Status card from the CRM, plus the per-offer select that
 // also lives on that page — the injector must not bind to the wrong one.
 const PAGE =
   "<html><body><h1>Hotel request 87</h1>" +
   '<div class="card"><h3>Change Status</h3>' +
   '<form method="post" action="/jrm/hotels/87/status/">' +
-  '<select name="status"><option value="New">New</option>' +
-  '<option value="Quoted">Quoted</option></select>' +
+  '<select name="status">' + LIVE_STATUSES.map(optionHtml).join("") + "</select>" +
   '<button type="submit">Update Status</button></form></div>' +
   '<select name="customer_answer_status"><option value="">--</option></select>' +
   "</body></html>";
@@ -173,5 +196,36 @@ describe("injectStatusOption", () => {
   it("carries the label through to the browser script", () => {
     const out = injectStatusOption(PAGE, "/jrm/hotels/87/");
     assert.match(out, /Not Interested \\?\/ Can't Help/);
+  });
+});
+
+describe("the CRM's real status vocabulary", () => {
+  it("stores the readable label when the column holds labels", () => {
+    // Longest live label is "Needs Customer Clarification" (28), so any column
+    // that fits the CRM's own list also fits ours (27).
+    assert.equal(pickStatusValue(LIVE_STATUSES, 30), STATUS_LABEL);
+    assert.equal(pickStatusValue(LIVE_STATUSES, null), STATUS_LABEL);
+  });
+
+  it("stores an underscore slug when the column holds Django keys", () => {
+    assert.equal(pickStatusValue(LIVE_SLUGS, 30), "not_interested");
+  });
+
+  it("never overflows a column sized to the CRM's own longest value", () => {
+    const longest = Math.max(...LIVE_STATUSES.map((s) => s.length));
+    for (const len of [longest, 20, 14, 10]) {
+      assert.ok(
+        pickStatusValue(LIVE_STATUSES, len).length <= len,
+        `overflowed at max_length=${len}`
+      );
+    }
+  });
+
+  it("offers the option alongside Lost and Cancelled, not in place of them", () => {
+    const out = injectStatusOption(PAGE, "/jrm/hotels/87/");
+    for (const s of LIVE_STATUSES) {
+      assert.ok(out.includes(optionHtml(s)), `dropped existing status ${s}`);
+    }
+    assert.ok(out.includes(STATUS_LABEL));
   });
 });
