@@ -13,6 +13,15 @@ import {
 } from "./invoice-page.js";
 import { storeInvoice, loadInvoice } from "./invoice-store.js";
 import { injectPayButtons, injectPaidBadges } from "./inject.js";
+import {
+  injectStatusOption,
+  loadStatusMeta,
+  pickStatusValue,
+  loadHotelRequestStatus,
+  setHotelRequestStatus,
+  STATUS_LABEL,
+} from "./status-option.js";
+import { injectQuoteEmail, buildQuoteDraft } from "./quote-email.js";
 import { injectWhatsAppUi } from "./whatsapp-ui.js";
 import {
   injectSnapEngage,
@@ -181,6 +190,78 @@ async function requireStaff(req, res) {
     return false;
   }
   return true;
+}
+
+/**
+ * Status API for the injected "Not Interested / Can't Help" choice.
+ *
+ * GET  → the value we would store (discovered from the column) + the row's
+ *        current status, so the injected option can render as selected.
+ * POST → set it. Any value other than the one we added is refused: this is a
+ *        one-choice endpoint, never a general status editor for the CRM.
+ */
+async function handleStatusApi(req, res, requestId) {
+  if (req.method !== "GET" && req.method !== "POST") {
+    sendJson(res, 405, { error: "GET or POST only" });
+    return;
+  }
+  if (!(await requireStaff(req, res))) return;
+
+  try {
+    const pool = getPool();
+    const meta = await loadStatusMeta(pool);
+    const value = pickStatusValue(meta.existing, meta.maxLen);
+
+    if (req.method === "GET") {
+      const current = await loadHotelRequestStatus(pool, requestId);
+      if (current === null) {
+        sendJson(res, 404, { error: `Hotel request ${requestId} not found` });
+        return;
+      }
+      sendJson(res, 200, { ok: true, value, label: STATUS_LABEL, current });
+      return;
+    }
+
+    const body = await readJson(req);
+    if (String(body?.status ?? "") !== value) {
+      sendJson(res, 400, {
+        error: "This endpoint only sets the added status.",
+      });
+      return;
+    }
+    const changed = await setHotelRequestStatus(pool, requestId, value);
+    if (!changed) {
+      sendJson(res, 404, { error: `Hotel request ${requestId} not found` });
+      return;
+    }
+    sendJson(res, 200, { ok: true, status: value });
+  } catch (e) {
+    sendJson(res, 500, { error: e.message });
+  }
+}
+
+/**
+ * Draft of the "please quote us" email for a hotel request.
+ * Read-only: it composes text and looks up an address, and sends nothing.
+ */
+async function handleQuoteApi(req, res, requestId, query) {
+  if (req.method !== "GET") {
+    sendJson(res, 405, { error: "GET only" });
+    return;
+  }
+  if (!(await requireStaff(req, res))) return;
+
+  try {
+    const draft = await buildQuoteDraft(
+      getPool(),
+      requestId,
+      query ? query.get("offer") : null,
+      { replyTo: process.env.QUOTE_REPLY_TO || null }
+    );
+    sendJson(res, 200, { ok: true, draft });
+  } catch (e) {
+    sendJson(res, /not found/i.test(e.message) ? 404 : 500, { error: e.message });
+  }
 }
 
 /**
@@ -733,6 +814,8 @@ function proxyWithInject(req, res) {
               injected = injectPayButtons(injected, pathOnly);
               injected = injectWhatsAppUi(injected, pathOnly);
               injected = await injectPaidBadges(injected, pathOnly, badgePool());
+              injected = injectStatusOption(injected, pathOnly);
+              injected = injectQuoteEmail(injected, pathOnly);
             }
             // Staff-page check reads the ORIGINAL upstream HTML: the injectors
             // above add markup that would otherwise look like the CRM.
@@ -867,7 +950,7 @@ const server = http.createServer(async (req, res) => {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-08-16-square-removed-v1",
+      build: "2026-08-24-quote-email-v1",
       snapEngage: {
         enabled: SNAPENGAGE_ENABLED,
         widgetId: SNAPENGAGE_WIDGET_ID,
@@ -945,6 +1028,22 @@ const server = http.createServer(async (req, res) => {
   );
   if (waSendTplMatch) {
     await handleWaSendTemplate(req, res, waSendTplMatch[1]);
+    return;
+  }
+
+  // ── Status API for the injected hotel-request status choice ─────────
+  const statusMatch = url.pathname.match(
+    /^\/__nesher_status\/hotel\/(\d+)\/?$/
+  );
+  if (statusMatch) {
+    await handleStatusApi(req, res, statusMatch[1]);
+    return;
+  }
+
+  // ── Quote-request email draft for the injected "Email hotel" button ─
+  const quoteMatch = url.pathname.match(/^\/__nesher_quote\/hotel\/(\d+)\/?$/);
+  if (quoteMatch) {
+    await handleQuoteApi(req, res, quoteMatch[1], url.searchParams);
     return;
   }
 
