@@ -23,6 +23,8 @@ import {
   DEFAULT_WIDGET_ID,
 } from "./snapengage.js";
 import { injectPublicHomeUi } from "./public-ui.js";
+import { injectStatusExtra, handleStatusPost, STATUS_POST_RE } from "./status-extra.js";
+import { handleBoardPage, handleBoardDone } from "./board.js";
 import {
   getPool,
   loadHotelPayContext,
@@ -742,6 +744,8 @@ function proxyWithInject(req, res) {
                 injected = injectPayButtons(injected, pathOnly);
                 injected = injectWhatsAppUi(injected, pathOnly);
                 injected = await injectPaidBadges(injected, pathOnly, badgePool());
+                // the one extra JRM status — see status-extra.js
+                injected = await injectStatusExtra(injected, pathOnly, badgePool());
               }
               // JRM Inbox bell/badge on every staff page (skips the login page by itself)
               injected = injectIntakeUi(injected, pathOnly, { staffCheckHtml: text });
@@ -898,7 +902,7 @@ const server = http.createServer(async (req, res) => {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-08-17-intake-bell",
+      build: "2026-08-31-all-tasks-board",
       snapEngage: {
         enabled: SNAPENGAGE_ENABLED,
         widgetId: SNAPENGAGE_WIDGET_ID,
@@ -1121,6 +1125,31 @@ const server = http.createServer(async (req, res) => {
   );
   if (payMatch) {
     await handlePayApi(req, res, payMatch[1], payMatch[2], url.searchParams);
+    return;
+  }
+
+  // Saving the one extra JRM status. Every other POST — and every post to these
+  // paths that does NOT carry it — is forwarded byte-for-byte (see status-extra.js).
+  if (req.method === "POST" && STATUS_POST_RE.test(url.pathname)) {
+    await handleStatusPost(req, res, { proxy, pool: badgePool() });
+    return;
+  }
+
+  // ── All-Tasks board: every open task across the whole team ─────────────
+  if (/^\/board\/?$/.test(url.pathname) && (req.method || "GET") === "GET") {
+    await handleBoardPage(req, res, {
+      pool: badgePool(),
+      upstream: UPSTREAM,
+      publicHost: publicHostFor(req),
+    });
+    return;
+  }
+  if (req.method === "POST" && /^\/__nesher_board\/done\/?$/.test(url.pathname)) {
+    await handleBoardDone(req, res, {
+      pool: badgePool(),
+      upstream: UPSTREAM,
+      publicHost: publicHostFor(req),
+    });
     return;
   }
 
