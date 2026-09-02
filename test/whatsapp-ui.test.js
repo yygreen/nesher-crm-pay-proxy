@@ -149,3 +149,19 @@ test("pagination + in-chat template UI present", () => {
     assert.ok(body.includes(probe), "missing page/template piece: " + probe);
   }
 });
+
+test("send-text error scan cannot match its own script once later injectors add markup", async () => {
+  const { injectIntakeUi } = await import("../intake-ui.js");
+  const page = `<html><head></head><body><nav><a href="/logout/">Logout</a></nav>
+<form method="post"><input type="hidden" name="csrfmiddlewaretoken" value="x"><textarea name="body"></textarea></form></body></html>`;
+  const withWa = injectWhatsAppUi(page, "/whatsapp/12/");
+  const full = injectIntakeUi(withWa, "/whatsapp/12/", { staffCheckHtml: page });
+  assert.notEqual(full, withWa, "intake bell should inject after the WhatsApp script");
+  // The old scan; on the fully injected page it captured thousands of chars of script.
+  const legacy = full.match(/class="message error"[^>]*>([\s\S]*?)<\/div>/);
+  assert.equal(legacy, null, "the self-matching pattern must no longer exist in the emitted script");
+  const m = full.match(new RegExp(`<script id="${WA_UI_MARKER}-js">([\\s\\S]*?)<\\/script>`));
+  assert.ok(m, "script present");
+  assert.match(m[1], /DOMParser\(\)\.parseFromString\(html, "text\/html"\)\.querySelector\("\.message\.error"\)/);
+  assert.doesNotThrow(() => new Function(m[1]));
+});

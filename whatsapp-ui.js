@@ -2636,10 +2636,16 @@ const SCRIPT = `
           if (r.status === 401 || r.status === 403) throw new Error("SESSION_EXPIRED");
           return r.text().then(function (html) {
             if (!r.ok && r.status !== 302) throw new Error("HTTP " + r.status);
-            var em = html.match(/class="message error"[^>]*>([\\s\\S]*?)<\\/div>/);
-            if (em) {
-              var tmp = el("div"); tmp.innerHTML = em[1];
-              throw new Error(tmp.textContent.trim() || "CRM rejected the message");
+            // Look for Django's error box by parsing the page as HTML. A plain
+            // regex here matched its own source inside this injected script
+            // once other injectors (e.g. the JRM Inbox bell) put a </div> after
+            // it, marking every send as failed with a wall of script text.
+            var errBox = null;
+            try {
+              errBox = new DOMParser().parseFromString(html, "text/html").querySelector(".message.error");
+            } catch (e) { errBox = null; }
+            if (errBox) {
+              throw new Error((errBox.textContent || "").trim() || "CRM rejected the message");
             }
             return refresh([row]);
           });
