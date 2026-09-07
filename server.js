@@ -9,15 +9,23 @@ import {
 import {
   mintCardCheckout,
   agentPaste,
-  chargeGuestInvoice,
   nmiPublicKey,
+  chargePayCode,
+  staffCardFields,
+  isShortPayCode,
 } from "./nmi-card.js";
 import {
   buildCombinedPayUrl,
   renderInvoiceHtml,
   renderInvoiceErrorHtml,
 } from "./invoice-page.js";
-import { storeInvoice, loadInvoice, markInvoicePaid } from "./invoice-store.js";
+import {
+  storeInvoice,
+  loadInvoice,
+  markInvoicePaid,
+  claimInvoicePaid,
+  releaseInvoicePaidClaim,
+} from "./invoice-store.js";
 import { injectPayButtons, injectPaidBadges } from "./inject.js";
 import { injectWhatsAppUi } from "./whatsapp-ui.js";
 import { injectIntakeUi, INTAKE_UI_PATH_RE, loadIntakeFeed } from "./intake-ui.js";
@@ -333,9 +341,10 @@ async function handlePayApi(req, res, kind, id, query) {
       cardMint = { ok: false, cardUrl: null, error: e.message };
     }
 
-    const hostedCard = Boolean(cardMint.ok && cardMint.cardUrl);
-    const collectCard = Boolean(cardMint.ok && cardMint.capture === "collectjs");
-    const hasCard = hostedCard || collectCard;
+    const cardFields = staffCardFields(cardMint);
+    const hostedCard = cardFields.hostedCard;
+    const collectCard = cardFields.collectCard;
+    const hasCard = cardFields.hasCard;
     const paymentMethodsLabel = hasCard
       ? "Card (Pinpoint/NMI) + bank transfer / ACH"
       : "Bank transfer / ACH only";
@@ -353,6 +362,9 @@ async function handlePayApi(req, res, kind, id, query) {
         cardUrl: hostedCard ? cardMint.cardUrl : "",
         capture: cardMint.capture || (hostedCard ? "invoice" : ""),
         brandId: cardMint.brand?.id || "",
+        kind: kind === "reservation" ? "reservation" : "hotel",
+        recordId:
+          kind === "reservation" ? ctx.reservation?.id : ctx.request?.id,
       });
       const origin = `https://${publicHostFor(req)}`;
       if (stored.ok && stored.code) {
@@ -404,18 +416,16 @@ async function handlePayApi(req, res, kind, id, query) {
       payUrl: shareUrl,
       combinedPayUrl: shareUrl,
       mercuryPayUrl: result.payUrl,
-      cardUrl: hostedCard ? cardMint.cardUrl : null,
-      cardCapture: cardMint.capture || (hostedCard ? "invoice" : null),
-      cardBlockedReason: hasCard
-        ? null
-        : cardMint.blockedReason || cardMint.error || null,
+      cardUrl: cardFields.cardUrl,
+      cardCapture: cardFields.cardCapture,
+      cardBlockedReason: cardFields.cardBlockedReason,
       agentPaste: paste,
       invoiceNumber: draftBundle.draft.invoiceNumber,
       amountUsd: draftBundle.draft.amountUsd,
       slug: result.invoice.slug,
       invoiceId: result.invoice.id,
-      creditCardEnabled: hasCard,
-      cardProcessor: hasCard ? "nmi" : "none",
+      creditCardEnabled: cardFields.creditCardEnabled,
+      cardProcessor: cardFields.cardProcessor,
       achDebitEnabled: result.achDebitEnabled !== false,
       paymentMethodsLabel,
       emailPlaceholder: draftBundle.draft.emailPlaceholder,
@@ -917,11 +927,6 @@ const server = http.createServer(async (req, res) => {
     url.pathname.match(/^\/__nesher_pay\/i\/([^/]+)\/charge\/?$/);
   if (payChargeMatch && (req.method || "GET") === "POST") {
     const code = decodeURIComponent(payChargeMatch[1]);
-    const verified = await loadInvoice(code);
-    if (!verified.ok || !verified.data) {
-      sendJson(res, 410, { ok: false, error: "invalid" });
-      return;
-    }
     let body = {};
     try {
       body = await readJson(req);
@@ -932,30 +937,24 @@ const server = http.createServer(async (req, res) => {
       sendJson(res, 400, { ok: false, error: "raw_card_rejected" });
       return;
     }
-    const result = await chargeGuestInvoice({
-      invoice: verified.data,
+    const result = await chargePayCode({
+      code,
       paymentToken: body.payment_token || body.paymentToken || body.token || "",
+      loadInvoice,
+      claimInvoicePaid,
+      releaseInvoicePaidClaim,
+      markInvoicePaid,
+      appendHotelNote,
+      appendReservationNote,
     });
     if (result.ok) {
-      await markInvoicePaid(code, { transactionId: result.transactionId });
       sendJson(res, 200, {
         ok: true,
         transactionId: result.transactionId || null,
       });
       return;
     }
-    const status =
-      result.error === "raw_card_rejected" ||
-      result.error === "payment_token required"
-        ? 400
-        : result.error === "already_paid"
-          ? 409
-          : result.error === "second_dba_pending"
-            ? 403
-            : result.error === "keys_missing"
-              ? 503
-              : 200;
-    sendJson(res, status, {
+    sendJson(res, result.httpStatus || 200, {
       ok: false,
       error: result.error,
       message: result.blockedReason || result.error,
@@ -968,7 +967,8 @@ const server = http.createServer(async (req, res) => {
     url.pathname.match(/^\/pay\/([^/]+)\/?$/) ||
     url.pathname.match(/^\/__nesher_pay\/i\/([^/]+)\/?$/);
   if (payPageMatch && (req.method || "GET") === "GET") {
-    const verified = await loadInvoice(decodeURIComponent(payPageMatch[1]));
+    const code = decodeURIComponent(payPageMatch[1]);
+    const verified = await loadInvoice(code);
     res.setHeader("Cache-Control", "no-store");
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     if (!verified.ok || !verified.data?.mercuryUrl) {
@@ -983,7 +983,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     const pageData = { ...verified.data };
-    if (pageData.capture === "collectjs") {
+    if (pageData.capture === "collectjs" && isShortPayCode(code)) {
       pageData.collectPublicKey = nmiPublicKey();
     }
     res.writeHead(200);

@@ -195,6 +195,20 @@ describe("unified invoice token", () => {
     assert.doesNotMatch(html, /Collect\.js/);
   });
 
+  it("does not paint Collect.js without a public key (long-token / keys unset)", () => {
+    const html = renderInvoiceHtml({
+      amountUsd: 12.34,
+      invoiceNumber: "RES-555QA",
+      mercuryUrl: "https://app.mercury.com/pay/a",
+      capture: "collectjs",
+      collectPublicKey: "",
+      brandId: "nesher",
+    });
+    assert.doesNotMatch(html, /Collect\.js/);
+    assert.doesNotMatch(html, /Pay with card/);
+    assert.match(html, /Pay with bank/);
+  });
+
   it("hides card capture after paidAt", () => {
     const html = renderInvoiceHtml({
       amountUsd: 10,

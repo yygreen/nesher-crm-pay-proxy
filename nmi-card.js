@@ -133,6 +133,50 @@ export function looksLikePan(value) {
   return /^\d{12,19}$/.test(compact);
 }
 
+/** Short pay codes can stamp paidAt. Long JWT tokens (they contain `.`) cannot. */
+export function isShortPayCode(code) {
+  const key = String(code || "").trim();
+  return Boolean(key) && !key.includes(".") && key.length <= 16;
+}
+
+/**
+ * Staff mint JSON. Mercury's creditCardEnabled stays false — NMI is
+ * cardProcessor / cardCapture, never Mercury card-on.
+ */
+export function staffCardFields(cardMint = {}) {
+  const hostedCard = Boolean(cardMint.ok && cardMint.cardUrl);
+  const collectCard = Boolean(cardMint.ok && cardMint.capture === "collectjs");
+  const hasCard = hostedCard || collectCard;
+  return {
+    hasCard,
+    hostedCard,
+    collectCard,
+    creditCardEnabled: false,
+    cardProcessor: hasCard ? "nmi" : "none",
+    cardCapture: cardMint.capture || (hostedCard ? "invoice" : null),
+    cardUrl: hostedCard ? cardMint.cardUrl : null,
+    cardBlockedReason: hasCard
+      ? null
+      : cardMint.blockedReason || cardMint.error || null,
+  };
+}
+
+export function nmiPaidStaffNote({ amountUsd, transactionId } = {}) {
+  const amt = money2(amountUsd) || "0.00";
+  const txn = String(transactionId || "").trim() || "unknown";
+  return `NMI card $${amt} txn ${txn}. mark the Mercury invoice PAID, never cancel.`;
+}
+
+function noteKind(invoice = {}) {
+  const k = String(invoice.kind || "").toLowerCase();
+  if (k === "reservation") return "reservation";
+  if (k === "hotel" || k === "hotel-offer") return "hotel";
+  const n = String(invoice.invoiceNumber || "").toUpperCase();
+  if (n.startsWith("JRM-")) return "hotel";
+  if (n.startsWith("RES-") || n.startsWith("FLY-")) return "reservation";
+  return "";
+}
+
 function invoicesNotProvisioned(message) {
   return /not set up to use invoicing/i.test(String(message || ""));
 }
@@ -342,10 +386,14 @@ export async function chargeWithToken(opts = {}) {
         100
       ),
     },
+    // Portal MDFs must match mint: 1 Brand, 2 CRM Ref, 3 Invoice.
     merchant_defined_fields: {
-      field_1: orderId,
-      field_2: brand.id,
-      field_3: descriptor,
+      field_1: brand.id,
+      field_2: orderId,
+      field_3: orderId,
+      ...(String(opts.customerName || "").trim()
+        ? { field_4: String(opts.customerName).trim().slice(0, 80) }
+        : {}),
     },
   };
   const fetchImpl = opts.fetchImpl || fetch;
@@ -404,6 +452,122 @@ export async function chargeGuestInvoice(opts = {}) {
     fetchImpl: opts.fetchImpl,
     privateKey: opts.privateKey,
   });
+}
+
+/**
+ * Guest POST /pay/:code/charge. Dotted long-tokens are refused (cannot
+ * stamp paidAt). Short codes CAS-claim paidAt BEFORE the NMI sale so a
+ * second submit is 409 and does not fire a second sale.
+ */
+export async function chargePayCode(opts = {}) {
+  const code = String(opts.code || "").trim();
+  if (!isShortPayCode(code)) {
+    return { ok: false, error: "short_code_required", httpStatus: 400 };
+  }
+  const token = String(opts.paymentToken || "").trim();
+  if (looksLikePan(token)) {
+    return { ok: false, error: "raw_card_rejected", httpStatus: 400 };
+  }
+  if (!token) {
+    return { ok: false, error: "payment_token required", httpStatus: 400 };
+  }
+  if (typeof opts.loadInvoice !== "function" || typeof opts.claimInvoicePaid !== "function") {
+    return { ok: false, error: "store_missing", httpStatus: 503 };
+  }
+
+  const verified = await opts.loadInvoice(code);
+  if (!verified || !verified.ok || !verified.data) {
+    return {
+      ok: false,
+      error: verified?.error || "invalid",
+      httpStatus: 410,
+    };
+  }
+  const invoice = verified.data;
+  if (invoice.paidAt) {
+    return { ok: false, error: "already_paid", httpStatus: 409 };
+  }
+
+  const claimedAt = opts.now || new Date().toISOString();
+  const claimed = await opts.claimInvoicePaid(code, { paidAt: claimedAt });
+  if (!claimed || !claimed.ok) {
+    const err = claimed?.error || "claim_failed";
+    return {
+      ok: false,
+      error: err === "already_paid" ? "already_paid" : err,
+      httpStatus: err === "already_paid" ? 409 : 503,
+    };
+  }
+
+  const sale = await chargeWithToken({
+    amountUsd: invoice.amountUsd,
+    invoiceNumber: invoice.invoiceNumber,
+    kind: invoice.kind,
+    customerName: invoice.customerName,
+    summary: invoice.summary,
+    paymentToken: token,
+    fetchImpl: opts.fetchImpl,
+    privateKey: opts.privateKey,
+  });
+  if (!sale.ok) {
+    if (typeof opts.releaseInvoicePaidClaim === "function") {
+      try {
+        await opts.releaseInvoicePaidClaim(code, claimed.paidAt || claimedAt);
+      } catch (e) {
+        console.warn("releaseInvoicePaidClaim failed", e.message);
+      }
+    }
+    const err = sale.error;
+    return {
+      ok: false,
+      error: err,
+      blockedReason: sale.blockedReason,
+      httpStatus:
+        err === "second_dba_pending"
+          ? 403
+          : err === "keys_missing"
+            ? 503
+            : err === "payment_token required"
+              ? 400
+              : 200,
+    };
+  }
+
+  if (typeof opts.markInvoicePaid === "function") {
+    try {
+      await opts.markInvoicePaid(code, {
+        paidAt: claimed.paidAt || claimedAt,
+        transactionId: sale.transactionId,
+      });
+    } catch (e) {
+      console.warn("markInvoicePaid failed", e.message);
+    }
+  }
+
+  const note = nmiPaidStaffNote({
+    amountUsd: invoice.amountUsd,
+    transactionId: sale.transactionId,
+  });
+  const recordId = Number(invoice.recordId);
+  const kind = noteKind(invoice);
+  try {
+    if (Number.isFinite(recordId) && recordId > 0) {
+      if (kind === "reservation" && typeof opts.appendReservationNote === "function") {
+        await opts.appendReservationNote(recordId, note);
+      } else if (kind === "hotel" && typeof opts.appendHotelNote === "function") {
+        await opts.appendHotelNote(recordId, note);
+      }
+    }
+  } catch (e) {
+    console.warn("nmi paid CRM note failed", e.message);
+  }
+
+  return {
+    ok: true,
+    transactionId: sale.transactionId || null,
+    httpStatus: 200,
+    note,
+  };
 }
 
 export function stripDeadCardFields(data = {}) {

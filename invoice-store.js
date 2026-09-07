@@ -6,7 +6,7 @@
 import crypto from "node:crypto";
 import { getPool } from "./db.js";
 import { mintInvoiceToken, verifyInvoiceToken } from "./invoice-page.js";
-import { isAllowedCardUrl } from "./nmi-card.js";
+import { isAllowedCardUrl, isShortPayCode } from "./nmi-card.js";
 
 let tableReady = false;
 
@@ -55,6 +55,10 @@ export async function storeInvoice(data) {
     capture: String(data.capture || ""),
     paidAt: data.paidAt || null,
     transactionId: data.transactionId || null,
+    kind: String(data.kind || ""),
+    recordId: Number.isFinite(Number(data.recordId)) && Number(data.recordId) > 0
+      ? Number(data.recordId)
+      : null,
   };
   const expiresAt = new Date(Date.now() + 45 * 24 * 60 * 60 * 1000);
 
@@ -107,7 +111,7 @@ export async function loadInvoice(idOrToken) {
   if (!key) return { ok: false, error: "missing" };
 
   // Short codes are 6–12 alnum; long tokens have a dot
-  if (!key.includes(".") && key.length <= 16) {
+  if (isShortPayCode(key)) {
     try {
       const pool = getPool();
       await ensureTable(pool);
@@ -134,6 +138,10 @@ export async function loadInvoice(idOrToken) {
           capture: p.capture || "",
           paidAt: p.paidAt || null,
           transactionId: p.transactionId || null,
+          kind: p.kind || "",
+          recordId: Number.isFinite(Number(p.recordId)) && Number(p.recordId) > 0
+            ? Number(p.recordId)
+            : null,
         },
       };
     } catch (e) {
@@ -146,14 +154,85 @@ export async function loadInvoice(idOrToken) {
   return verifyInvoiceToken(key);
 }
 
-/** Best-effort: stamp paidAt so a second Collect.js submit cannot re-charge. */
-export async function markInvoicePaid(idOrToken, extra = {}) {
+function storePool(poolImpl) {
+  return poolImpl || getPool();
+}
+
+/**
+ * Compare-and-swap paidAt on a short code. Second claim is already_paid.
+ * Long tokens are refused — they cannot stamp paidAt.
+ */
+export async function claimInvoicePaid(idOrToken, extra = {}, poolImpl) {
   const key = String(idOrToken || "").trim();
-  if (!key || key.includes(".") || key.length > 16) {
+  if (!isShortPayCode(key)) {
+    return { ok: false, error: "short_code_required" };
+  }
+  const paidAt = extra.paidAt || new Date().toISOString();
+  const patch = { paidAt };
+  if (extra.transactionId) patch.transactionId = extra.transactionId;
+  try {
+    const pool = storePool(poolImpl);
+    await ensureTable(pool);
+    const r = await pool.query(
+      `UPDATE nesher_pay_invoices
+          SET payload = COALESCE(payload, '{}'::jsonb) || $2::jsonb
+        WHERE id = $1
+          AND (payload->>'paidAt' IS NULL OR payload->>'paidAt' = '')
+        RETURNING payload`,
+      [key.toLowerCase(), JSON.stringify(patch)]
+    );
+    if (!r.rows.length) {
+      const existing = await pool.query(
+        `SELECT payload FROM nesher_pay_invoices WHERE id = $1`,
+        [key.toLowerCase()]
+      );
+      if (!existing.rows.length) return { ok: false, error: "not found" };
+      return {
+        ok: false,
+        error: "already_paid",
+        paidAt: existing.rows[0].payload?.paidAt || true,
+      };
+    }
+    return { ok: true, paidAt, payload: r.rows[0].payload };
+  } catch (e) {
+    console.warn("claimInvoicePaid failed", e.message);
+    return { ok: false, error: e.message };
+  }
+}
+
+/** Undo a paidAt claim when the NMI sale failed and no transactionId was stored. */
+export async function releaseInvoicePaidClaim(idOrToken, claimedAt, poolImpl) {
+  const key = String(idOrToken || "").trim();
+  if (!isShortPayCode(key) || !claimedAt) {
+    return { ok: false, error: "bad claim" };
+  }
+  try {
+    const pool = storePool(poolImpl);
+    await ensureTable(pool);
+    const r = await pool.query(
+      `UPDATE nesher_pay_invoices
+          SET payload = payload - 'paidAt'
+        WHERE id = $1
+          AND payload->>'paidAt' = $2
+          AND (payload->>'transactionId' IS NULL OR payload->>'transactionId' = '')
+        RETURNING id`,
+      [key.toLowerCase(), String(claimedAt)]
+    );
+    return { ok: Boolean(r.rows.length) };
+  } catch (e) {
+    console.warn("releaseInvoicePaidClaim failed", e.message);
+    return { ok: false, error: e.message };
+  }
+}
+
+/** Stamp transactionId (and paidAt) on a short code after a successful sale. */
+export async function markInvoicePaid(idOrToken, extra = {}, poolImpl) {
+  const key = String(idOrToken || "").trim();
+  if (!isShortPayCode(key)) {
     return { ok: false, error: "not a short code" };
   }
   try {
-    const pool = getPool();
+    const pool = storePool(poolImpl);
     await ensureTable(pool);
     const r = await pool.query(
       `SELECT payload FROM nesher_pay_invoices WHERE id = $1`,
@@ -165,7 +244,7 @@ export async function markInvoicePaid(idOrToken, extra = {}) {
       row.payload && typeof row.payload === "object" ? row.payload : {};
     const payload = {
       ...prev,
-      paidAt: extra.paidAt || new Date().toISOString(),
+      paidAt: extra.paidAt || prev.paidAt || new Date().toISOString(),
       transactionId: extra.transactionId || prev.transactionId || null,
     };
     await pool.query(
