@@ -141,9 +141,9 @@ export function humanizePayError(err) {
 }
 
 /**
- * Mercury invoices are always bank/ACH-only. No card processor exists for this
- * business (Stripe closed 2026-08-11, Square closed 2026-08-16) — never
- * re-enable creditCardEnabled.
+ * Mercury invoices are always bank/ACH-only. Card (Pinpoint/NMI) is minted
+ * separately in nmi-card.js and offered on the guest invoice page. Never
+ * re-enable Mercury creditCardEnabled (that was Stripe/Square).
  * @returns {Promise<{ ok: boolean, res: Response, bodyText: string }>}
  */
 async function postBankOnlyInvoice(fetchImpl, url, headers, baseBody) {

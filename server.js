@@ -7,11 +7,17 @@ import {
   humanizePayError,
 } from "./mercury.js";
 import {
+  mintCardCheckout,
+  agentPaste,
+  chargeGuestInvoice,
+  nmiPublicKey,
+} from "./nmi-card.js";
+import {
   buildCombinedPayUrl,
   renderInvoiceHtml,
   renderInvoiceErrorHtml,
 } from "./invoice-page.js";
-import { storeInvoice, loadInvoice } from "./invoice-store.js";
+import { storeInvoice, loadInvoice, markInvoicePaid } from "./invoice-store.js";
 import { injectPayButtons, injectPaidBadges } from "./inject.js";
 import { injectWhatsAppUi } from "./whatsapp-ui.js";
 import { injectIntakeUi, INTAKE_UI_PATH_RE, loadIntakeFeed } from "./intake-ui.js";
@@ -306,12 +312,35 @@ async function handlePayApi(req, res, kind, id, query) {
       mercuryOptsFromDraft(token, draftBundle)
     );
 
-    // No card processor exists anymore (Stripe closed 8/11, Square closed 8/16).
-    // Mercury invoices are bank/ACH-only, and the guest page offers bank only.
-    const paymentMethodsLabel = "Bank transfer / ACH only";
-
-    // One short guest invoice URL (bank-only, one clean page).
     const d = draftBundle.draft;
+    let cardMint = {
+      ok: false,
+      cardUrl: null,
+      brand: null,
+      error: "not_attempted",
+    };
+    try {
+      cardMint = await mintCardCheckout({
+        amountUsd: d.amountUsd,
+        invoiceNumber: d.invoiceNumber,
+        kind,
+        customerName: d.customerName,
+        customerEmail: d.customerEmail,
+        summary: d.summary || d.lineItemName,
+      });
+    } catch (e) {
+      console.warn("nmi card mint failed", e.message);
+      cardMint = { ok: false, cardUrl: null, error: e.message };
+    }
+
+    const hostedCard = Boolean(cardMint.ok && cardMint.cardUrl);
+    const collectCard = Boolean(cardMint.ok && cardMint.capture === "collectjs");
+    const hasCard = hostedCard || collectCard;
+    const paymentMethodsLabel = hasCard
+      ? "Card (Pinpoint/NMI) + bank transfer / ACH"
+      : "Bank transfer / ACH only";
+
+    // One short guest invoice URL (bank + optional NMI card).
     let combinedPayUrl = null;
     try {
       const stored = await storeInvoice({
@@ -321,6 +350,9 @@ async function handlePayApi(req, res, kind, id, query) {
         summary: d.summary || d.lineItemName,
         lineName: d.lineItemName,
         mercuryUrl: result.payUrl,
+        cardUrl: hostedCard ? cardMint.cardUrl : "",
+        capture: cardMint.capture || (hostedCard ? "invoice" : ""),
+        brandId: cardMint.brand?.id || "",
       });
       const origin = `https://${publicHostFor(req)}`;
       if (stored.ok && stored.code) {
@@ -336,11 +368,25 @@ async function handlePayApi(req, res, kind, id, query) {
     }
 
     const shareUrl = combinedPayUrl || result.payUrl;
+    const paste = agentPaste({
+      brand: cardMint.brand,
+      invoiceNumber: d.invoiceNumber,
+      amountUsd: d.amountUsd,
+      cardUrl: shareUrl,
+      mercuryUrl: result.payUrl,
+    });
 
     // CRM note
     try {
       const ph = d.emailPlaceholder ? " (placeholder email)" : "";
-      const note = `[Automated Mercury] ${result.updated ? "Updated" : result.reused ? "Reused" : "Created"} invoice ${shareUrl} | mercury ${result.payUrl} | ${d.summary} | ${d.invoiceNumber} | ${paymentMethodsLabel} | bank/ACH only${ph}`;
+      const cardBit = hostedCard
+        ? ` | nmi ${cardMint.cardUrl} | ${cardMint.descriptor || ""}`
+        : collectCard
+          ? ` | nmi collectjs ${cardMint.descriptor || ""}`
+          : cardMint.error
+            ? ` | card skipped (${cardMint.error})`
+            : "";
+      const note = `[Automated Mercury] ${result.updated ? "Updated" : result.reused ? "Reused" : "Created"} invoice ${shareUrl} | mercury ${result.payUrl}${cardBit} | ${d.summary} | ${d.invoiceNumber} | ${paymentMethodsLabel}${ph}`;
       if (kind === "reservation") {
         await appendReservationNote(ctx.reservation.id, note);
       } else if (ctx.request?.id) {
@@ -358,12 +404,18 @@ async function handlePayApi(req, res, kind, id, query) {
       payUrl: shareUrl,
       combinedPayUrl: shareUrl,
       mercuryPayUrl: result.payUrl,
+      cardUrl: hostedCard ? cardMint.cardUrl : null,
+      cardCapture: cardMint.capture || (hostedCard ? "invoice" : null),
+      cardBlockedReason: hasCard
+        ? null
+        : cardMint.blockedReason || cardMint.error || null,
+      agentPaste: paste,
       invoiceNumber: draftBundle.draft.invoiceNumber,
       amountUsd: draftBundle.draft.amountUsd,
       slug: result.invoice.slug,
       invoiceId: result.invoice.id,
-      creditCardEnabled: false,
-      cardProcessor: "none",
+      creditCardEnabled: hasCard,
+      cardProcessor: hasCard ? "nmi" : "none",
       achDebitEnabled: result.achDebitEnabled !== false,
       paymentMethodsLabel,
       emailPlaceholder: draftBundle.draft.emailPlaceholder,
@@ -859,6 +911,58 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Public guest card capture — CRM amount from the store, token only.
+  const payChargeMatch =
+    url.pathname.match(/^\/pay\/([^/]+)\/charge\/?$/) ||
+    url.pathname.match(/^\/__nesher_pay\/i\/([^/]+)\/charge\/?$/);
+  if (payChargeMatch && (req.method || "GET") === "POST") {
+    const code = decodeURIComponent(payChargeMatch[1]);
+    const verified = await loadInvoice(code);
+    if (!verified.ok || !verified.data) {
+      sendJson(res, 410, { ok: false, error: "invalid" });
+      return;
+    }
+    let body = {};
+    try {
+      body = await readJson(req);
+    } catch {
+      body = {};
+    }
+    if (body.ccnumber || body.cc_number || body.cvv || body.ccexp) {
+      sendJson(res, 400, { ok: false, error: "raw_card_rejected" });
+      return;
+    }
+    const result = await chargeGuestInvoice({
+      invoice: verified.data,
+      paymentToken: body.payment_token || body.paymentToken || body.token || "",
+    });
+    if (result.ok) {
+      await markInvoicePaid(code, { transactionId: result.transactionId });
+      sendJson(res, 200, {
+        ok: true,
+        transactionId: result.transactionId || null,
+      });
+      return;
+    }
+    const status =
+      result.error === "raw_card_rejected" ||
+      result.error === "payment_token required"
+        ? 400
+        : result.error === "already_paid"
+          ? 409
+          : result.error === "second_dba_pending"
+            ? 403
+            : result.error === "keys_missing"
+              ? 503
+              : 200;
+    sendJson(res, status, {
+      ok: false,
+      error: result.error,
+      message: result.blockedReason || result.error,
+    });
+    return;
+  }
+
   // Public guest invoice — short code or long token (no staff auth)
   const payPageMatch =
     url.pathname.match(/^\/pay\/([^/]+)\/?$/) ||
@@ -878,8 +982,12 @@ const server = http.createServer(async (req, res) => {
       );
       return;
     }
+    const pageData = { ...verified.data };
+    if (pageData.capture === "collectjs") {
+      pageData.collectPublicKey = nmiPublicKey();
+    }
     res.writeHead(200);
-    res.end(renderInvoiceHtml(verified.data));
+    res.end(renderInvoiceHtml(pageData));
     return;
   }
 
@@ -902,7 +1010,7 @@ const server = http.createServer(async (req, res) => {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-09-02-wa-send-error-scan",
+      build: "2026-09-08-nmi-card-mint",
       snapEngage: {
         enabled: SNAPENGAGE_ENABLED,
         widgetId: SNAPENGAGE_WIDGET_ID,
@@ -921,6 +1029,7 @@ const server = http.createServer(async (req, res) => {
       hasMercury: Boolean(
         process.env.MERCURY_TOKEN_NESHER || process.env.MERCURY_TOKEN
       ),
+      hasNmi: Boolean(String(process.env.NMI_PRIVATE_KEY || "").trim()),
       hasDb: Boolean(process.env.DATABASE_URL || process.env.DATABASE_PUBLIC_URL),
       hasWhatsApp: wa.configured,
       hasMercuryRelay: (process.env.MERCURY_RELAY_KEY || "").length >= 24,

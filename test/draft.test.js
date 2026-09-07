@@ -239,5 +239,7 @@ describe("inject modal assets", () => {
     assert.ok(out.includes(BUTTON_MARKER));
     assert.ok(out.includes("nesher-pay-modal"));
     assert.ok(out.includes("Complete invoice details") || out.includes("nesher-f-amount") || out.includes("What still needs attention") || out.includes("nesher-pay-create"));
+    assert.match(out, /data\.agentPaste/);
+    assert.doesNotMatch(out, /square\.link|checkout\.stripe/);
   });
 });

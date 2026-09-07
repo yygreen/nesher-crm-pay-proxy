@@ -6,6 +6,7 @@
 import crypto from "node:crypto";
 import { getPool } from "./db.js";
 import { mintInvoiceToken, verifyInvoiceToken } from "./invoice-page.js";
+import { isAllowedCardUrl } from "./nmi-card.js";
 
 let tableReady = false;
 
@@ -40,12 +41,20 @@ async function ensureTable(pool) {
  * @returns {Promise<{ ok: true, code: string } | { ok: false, error: string, longToken?: string }>}
  */
 export async function storeInvoice(data) {
+  const cardUrl = isAllowedCardUrl(data.cardUrl)
+    ? String(data.cardUrl).trim()
+    : "";
   const payload = {
     amountUsd: Number(data.amountUsd),
     invoiceNumber: String(data.invoiceNumber || ""),
     customerName: String(data.customerName || ""),
     summary: String(data.summary || data.lineName || ""),
     mercuryUrl: String(data.mercuryUrl || ""),
+    cardUrl,
+    brandId: String(data.brandId || ""),
+    capture: String(data.capture || ""),
+    paidAt: data.paidAt || null,
+    transactionId: data.transactionId || null,
   };
   const expiresAt = new Date(Date.now() + 45 * 24 * 60 * 60 * 1000);
 
@@ -73,7 +82,14 @@ export async function storeInvoice(data) {
     // Fallback: long signed token still works without DB
     try {
       const longToken = mintInvoiceToken({
-        ...payload,
+        amountUsd: payload.amountUsd,
+        invoiceNumber: payload.invoiceNumber,
+        customerName: payload.customerName,
+        summary: payload.summary,
+        mercuryUrl: payload.mercuryUrl,
+        cardUrl: payload.cardUrl,
+        brandId: payload.brandId,
+        capture: payload.capture,
         ttlSec: 45 * 24 * 60 * 60,
       });
       return { ok: false, error: e.message, longToken };
@@ -113,6 +129,11 @@ export async function loadInvoice(idOrToken) {
           customerName: p.customerName || "",
           summary: p.summary || "",
           mercuryUrl: p.mercuryUrl || "",
+          cardUrl: isAllowedCardUrl(p.cardUrl) ? p.cardUrl : undefined,
+          brandId: p.brandId || "",
+          capture: p.capture || "",
+          paidAt: p.paidAt || null,
+          transactionId: p.transactionId || null,
         },
       };
     } catch (e) {
@@ -123,4 +144,37 @@ export async function loadInvoice(idOrToken) {
 
   // Long signed token path (fallback / older links)
   return verifyInvoiceToken(key);
+}
+
+/** Best-effort: stamp paidAt so a second Collect.js submit cannot re-charge. */
+export async function markInvoicePaid(idOrToken, extra = {}) {
+  const key = String(idOrToken || "").trim();
+  if (!key || key.includes(".") || key.length > 16) {
+    return { ok: false, error: "not a short code" };
+  }
+  try {
+    const pool = getPool();
+    await ensureTable(pool);
+    const r = await pool.query(
+      `SELECT payload FROM nesher_pay_invoices WHERE id = $1`,
+      [key.toLowerCase()]
+    );
+    const row = r.rows[0];
+    if (!row) return { ok: false, error: "not found" };
+    const prev =
+      row.payload && typeof row.payload === "object" ? row.payload : {};
+    const payload = {
+      ...prev,
+      paidAt: extra.paidAt || new Date().toISOString(),
+      transactionId: extra.transactionId || prev.transactionId || null,
+    };
+    await pool.query(
+      `UPDATE nesher_pay_invoices SET payload = $2::jsonb WHERE id = $1`,
+      [key.toLowerCase(), JSON.stringify(payload)]
+    );
+    return { ok: true };
+  } catch (e) {
+    console.warn("markInvoicePaid failed", e.message);
+    return { ok: false, error: e.message };
+  }
 }

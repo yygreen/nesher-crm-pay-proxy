@@ -358,4 +358,11 @@ describe("injectPayButtons", () => {
     const count = (twice.match(/nesher-mercury-pay-js/g) || []).length;
     assert.equal(count, 1);
   });
+
+  it("agent paste uses the server agentPaste field and never Square", () => {
+    const html = `<html><body><a href="/jrm/hotels/1/">x</a></body></html>`;
+    const out = injectPayButtons(html, "/jrm/hotels/");
+    assert.match(out, /if \(data\.agentPaste\) return data\.agentPaste/);
+    assert.doesNotMatch(out, /square\.link|squareup\.com|checkout\.stripe/);
+  });
 });

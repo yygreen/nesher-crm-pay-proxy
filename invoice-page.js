@@ -4,6 +4,13 @@
  */
 
 import crypto from "node:crypto";
+import {
+  isAllowedCardUrl,
+  brandFromInvoiceNumber,
+  stripDeadCardFields,
+  collectScriptUrl,
+  descriptorFor,
+} from "./nmi-card.js";
 
 const DEFAULT_TTL_SEC = 60 * 60 * 24 * 45;
 
@@ -50,15 +57,28 @@ export function mintInvoiceToken(data) {
   if (!/^https:\/\//i.test(mercuryUrl)) {
     throw new Error("mercuryUrl required");
   }
+  const clean = stripDeadCardFields(data);
+  const cardUrl = isAllowedCardUrl(clean.cardUrl)
+    ? String(clean.cardUrl).trim().slice(0, 500)
+    : "";
+  const inv = String(data.invoiceNumber || "").slice(0, 80);
+  const brandId = String(clean.brandId || brandFromInvoiceNumber(inv).id).slice(
+    0,
+    16
+  );
   const payload = {
     v: 1,
     a: amountUsd,
-    n: String(data.invoiceNumber || "").slice(0, 80),
+    n: inv,
     c: String(data.customerName || "").slice(0, 120),
     s: String(data.summary || data.lineName || "").slice(0, 240),
     m: mercuryUrl.slice(0, 500),
     exp: Math.floor(Date.now() / 1000) + (Number(data.ttlSec) || DEFAULT_TTL_SEC),
   };
+  if (cardUrl) payload.k = cardUrl;
+  if (brandId) payload.b = brandId;
+  if (data.capture === "collectjs") payload.t = "c";
+  else if (data.capture === "invoice") payload.t = "i";
   const body = b64urlJson(payload);
   return `${body}.${sign(body)}`;
 }
@@ -93,6 +113,7 @@ export function verifyInvoiceToken(token) {
     return { ok: false, error: "missing pay url" };
   }
   // Older tokens may carry q/p (dead Square card fields) — deliberately ignored.
+  const cardUrl = isAllowedCardUrl(payload.k) ? payload.k : undefined;
   return {
     ok: true,
     data: {
@@ -101,6 +122,10 @@ export function verifyInvoiceToken(token) {
       customerName: payload.c || "",
       summary: payload.s || "",
       mercuryUrl: payload.m,
+      cardUrl,
+      brandId: payload.b || brandFromInvoiceNumber(payload.n).id,
+      capture:
+        payload.t === "c" ? "collectjs" : payload.t === "i" ? "invoice" : "",
       exp: payload.exp,
     },
   };
@@ -134,6 +159,72 @@ function money(n) {
   );
 }
 
+function renderCollectJsForm(collectKey) {
+  const src = esc(collectScriptUrl());
+  const key = esc(collectKey);
+  return `<div id="card-form">
+      <p class="card-field-label">Card number</p>
+      <div id="ccnumber" class="card-field"></div>
+      <p class="card-field-label">Expiration</p>
+      <div id="ccexp" class="card-field"></div>
+      <p class="card-field-label">CVV</p>
+      <div id="cvv" class="card-field"></div>
+      <p id="card-err" class="card-err" hidden></p>
+      <button type="button" class="btn btn-primary" id="pay-card-btn">Pay with card</button>
+      <script src="${src}" data-tokenization-key="${key}"></script>
+      <script>
+      (function(){
+        function showErr(m){
+          var e=document.getElementById("card-err");
+          if(!e) return;
+          e.hidden=false;
+          e.textContent=m;
+        }
+        function go(){
+          if(!window.CollectJS) return;
+          CollectJS.configure({
+            variant:"inline",
+            paymentSelector:"#pay-card-btn",
+            fields:{
+              ccnumber:{selector:"#ccnumber",placeholder:"Card number"},
+              ccexp:{selector:"#ccexp",placeholder:"MM / YY"},
+              cvv:{selector:"#cvv",placeholder:"CVV"}
+            },
+            callback:function(response){
+              var token=response&&response.token;
+              var btn=document.getElementById("pay-card-btn");
+              if(!token){showErr("Card could not be tokenized. Try again or pay with bank.");return;}
+              if(btn) btn.disabled=true;
+              fetch(location.pathname.replace(/\\/$/,"")+"/charge",{
+                method:"POST",
+                headers:{"Content-Type":"application/json"},
+                body:JSON.stringify({payment_token:token})
+              }).then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j};});})
+              .then(function(x){
+                if(x.j&&x.j.ok){
+                  var form=document.getElementById("card-form");
+                  if(form) form.innerHTML="<p class='hint'>Card payment received. Thank you.</p>";
+                } else {
+                  if(btn) btn.disabled=false;
+                  showErr((x.j&&(x.j.message||x.j.error))||"Card was declined. Try another card or pay with bank.");
+                }
+              }).catch(function(){
+                if(btn) btn.disabled=false;
+                showErr("Could not reach the card processor. Pay with bank, or try again.");
+              });
+            }
+          });
+        }
+        if(window.CollectJS) go();
+        else {
+          var s=document.querySelector("script[data-tokenization-key]");
+          if(s) s.addEventListener("load", go);
+        }
+      })();
+      </script>
+    </div>`;
+}
+
 /**
  * Clean guest invoice — white, calm, two clear actions max.
  */
@@ -143,12 +234,41 @@ export function renderInvoiceHtml(data) {
   const name = esc(data.customerName || "");
   const summary = esc(data.summary || "");
   const mercuryUrl = esc(data.mercuryUrl);
+  const brand = brandFromInvoiceNumber(data.invoiceNumber);
+  const brandLabel =
+    data.brandId === "jrm" || brand.id === "jrm"
+      ? "JRM Hotels"
+      : "Nesher · FlyNesher";
+  const paid = Boolean(data.paidAt);
+  const hostedCardUrl =
+    !paid && isAllowedCardUrl(data.cardUrl) ? esc(data.cardUrl) : "";
+  const collectKey = String(data.collectPublicKey || "").trim();
+  const collectOn = Boolean(
+    !paid &&
+      !hostedCardUrl &&
+      collectKey &&
+      data.capture === "collectjs" &&
+      descriptorFor(brand)
+  );
+  const hasCard = Boolean(hostedCardUrl || collectOn);
 
-  // Bank-only by design: no card processor exists (stored/tokenized card URLs
-  // from the Square era must never render — that account is closed).
+  const cardBtn = hostedCardUrl
+    ? `<a class="btn btn-primary" href="${hostedCardUrl}">Pay with card</a>`
+    : collectOn
+      ? renderCollectJsForm(collectKey)
+      : "";
+  const bankBtn = paid
+    ? ""
+    : `<a class="btn ${hasCard ? "btn-secondary" : "btn-primary"}" href="${mercuryUrl}">Pay with bank</a>`;
+  const hint = paid
+    ? `<p class="hint">Paid. Thank you.</p>`
+    : hasCard
+      ? `<p class="hint">Card is processed by Pinpoint/NMI. Bank transfer stays on Mercury.</p>`
+      : `<p class="hint">Secure bank transfer on the next screen.</p>`;
   const actions = `
-      <a class="btn btn-primary" href="${mercuryUrl}">Pay with bank</a>
-      <p class="hint">Secure bank transfer on the next screen.</p>`;
+      ${cardBtn}
+      ${bankBtn}
+      ${hint}`;
 
   return `<!doctype html>
 <html lang="en">
@@ -192,6 +312,14 @@ export function renderInvoiceHtml(data) {
       border-radius: 12px; padding: 14px 16px; font-size: 16px; font-weight: 600;
       margin-bottom: 10px;
     }
+    button.btn { cursor: pointer; border: 0; font-family: inherit; }
+    button.btn[disabled] { opacity: .6; cursor: wait; }
+    .card-field-label { font-size: 12px; color: #888; margin: 0 0 6px; }
+    .card-field {
+      border: 1px solid #ddd; border-radius: 12px; min-height: 44px;
+      padding: 10px 12px; margin: 0 0 10px; background: #fff;
+    }
+    .card-err { margin: 0 0 10px; font-size: 13px; color: #b91c1c; text-align: center; }
     .btn-primary { background: #0f766e; color: #fff; }
     .btn-primary:hover { background: #0d6a63; }
     .btn-secondary {
@@ -210,7 +338,7 @@ export function renderInvoiceHtml(data) {
 </head>
 <body>
   <div class="sheet">
-    <p class="logo">Nesher · JRM Hotels</p>
+    <p class="logo">${esc(brandLabel)}</p>
     <p class="label">Amount due</p>
     <p class="amount">${amount}</p>
     ${name ? `<p class="meta">For <strong>${name}</strong></p>` : ""}

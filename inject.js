@@ -847,14 +847,17 @@ const SCRIPT = `
     var amount = Number(data.amountUsd || draft.amountUsd);
     var name = String(draft.customerName || "").trim().split(/\\s+/)[0] || "there";
     var pay = data.combinedPayUrl || data.payUrl || "";
+    var inv = data.invoiceNumber || draft.invoiceNumber || "";
+    var brand = String(inv).indexOf("JRM-") === 0 ? "JRM Hotels" : "Nesher";
+    if (data.agentPaste) return data.agentPaste;
     return [
       "Hi " + name + ",",
       "",
-      "Please pay " + money(amount) + " for your booking:",
+      "Please pay " + money(amount) + " for your " + brand + " booking" + (inv ? " (" + inv + ")" : "") + ":",
       pay,
       "",
       "Thank you",
-      "Nesher / JRM Hotels"
+      brand
     ].join("\\n");
   }
 

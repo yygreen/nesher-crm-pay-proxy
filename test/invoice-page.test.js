@@ -64,7 +64,21 @@ describe("unified invoice token", () => {
     assert.match(html, /Pay with bank/);
     assert.match(html, /mercury\.com\/pay\/a/);
     assert.match(html, /\$100\.00/);
+    assert.match(html, /Nesher/);
     assert.doesNotMatch(html, /Pay with card/);
+  });
+
+  it("brands a JRM invoice as JRM Hotels even without a card URL", () => {
+    const html = renderInvoiceHtml({
+      amountUsd: 189,
+      invoiceNumber: "JRM-189-O50",
+      mercuryUrl: "https://app.mercury.com/pay/a",
+      brandId: "jrm",
+    });
+    assert.match(html, /JRM Hotels/);
+    assert.doesNotMatch(html, /Nesher · JRM Hotels/);
+    assert.doesNotMatch(html, /Pay with card/);
+    assert.match(html, /Pay with bank/);
   });
 
   it("never renders a card button even from a legacy Square-era record", () => {
@@ -80,5 +94,133 @@ describe("unified invoice token", () => {
     assert.doesNotMatch(html, /Pay with card/);
     assert.doesNotMatch(html, /square\.link/);
     assert.match(html, /Pay with bank/);
+  });
+
+  it("renders Pay with card for an NMI hosted URL and keeps Mercury bank", () => {
+    const html = renderInvoiceHtml({
+      amountUsd: 2604.5,
+      invoiceNumber: "RES-9FSGMN",
+      customerName: "Ada",
+      summary: "Flights",
+      mercuryUrl: "https://app.mercury.com/pay/a",
+      cardUrl:
+        "https://pinpointpayments.transactiongateway.com/cart/invoicing.php?invoice_id=5550199",
+      brandId: "nesher",
+    });
+    assert.match(html, /Pay with card/);
+    assert.match(html, /pinpointpayments\.transactiongateway\.com/);
+    assert.match(html, /Pay with bank/);
+    assert.match(html, /mercury\.com\/pay\/a/);
+    assert.match(html, /Nesher/);
+    assert.doesNotMatch(html, /square\.link/);
+  });
+
+  it("round-trips an NMI card URL on the signed token and drops Square", () => {
+    process.env.PAY_PAGE_SECRET = "test-secret-for-invoice-page";
+    const token = mintInvoiceToken({
+      amountUsd: 50,
+      invoiceNumber: "RES-CARD",
+      mercuryUrl: "https://app.mercury.com/pay/a",
+      cardUrl:
+        "https://pinpointpayments.transactiongateway.com/cart/invoicing.php?invoice_id=9",
+      squareUrl: "https://square.link/u/dead",
+    });
+    const v = verifyInvoiceToken(token);
+    assert.equal(v.ok, true);
+    assert.match(v.data.cardUrl, /pinpointpayments\.transactiongateway\.com/);
+    assert.equal(v.data.squareUrl, undefined);
+    assert.ok(!token.includes("square"));
+  });
+
+  it("renders Collect.js on the branded guest page when invoices are not hosted", () => {
+    const html = renderInvoiceHtml({
+      amountUsd: 12.34,
+      invoiceNumber: "RES-555QA",
+      customerName: "Ada",
+      mercuryUrl: "https://app.mercury.com/pay/a",
+      capture: "collectjs",
+      collectPublicKey: "pk_test_collect",
+      brandId: "nesher",
+    });
+    assert.match(html, /Pay with card/);
+    assert.match(html, /token\/Collect\.js/);
+    assert.match(html, /data-tokenization-key="pk_test_collect"/);
+    assert.match(html, /Pay with bank/);
+    assert.match(html, /mercury\.com\/pay\/a/);
+    assert.match(html, /Nesher/);
+    assert.match(html, /\/charge/);
+    assert.match(html, /payment_token/);
+    assert.doesNotMatch(html, /square\.link|squareup|checkout\.stripe/i);
+    assert.doesNotMatch(html, /NESHER-PAY|JRM-PAY/);
+    assert.doesNotMatch(html, /customPayment/);
+    assert.doesNotMatch(html, /<input[^>]*(amount|ccnumber)/i);
+    assert.doesNotMatch(html, /NMI_PRIVATE/);
+  });
+
+  it("does not render Collect.js for JRM while second DBA is pending", () => {
+    const prev = process.env.NMI_JRM_DESCRIPTOR;
+    delete process.env.NMI_JRM_DESCRIPTOR;
+    try {
+      const html = renderInvoiceHtml({
+        amountUsd: 189,
+        invoiceNumber: "JRM-189-O50",
+        mercuryUrl: "https://app.mercury.com/pay/a",
+        capture: "collectjs",
+        collectPublicKey: "pk_test_collect",
+        brandId: "jrm",
+      });
+      assert.doesNotMatch(html, /Collect\.js/);
+      assert.doesNotMatch(html, /Pay with card/);
+      assert.match(html, /Pay with bank/);
+      assert.match(html, /JRM Hotels/);
+    } finally {
+      if (prev !== undefined) process.env.NMI_JRM_DESCRIPTOR = prev;
+      else delete process.env.NMI_JRM_DESCRIPTOR;
+    }
+  });
+
+  it("prefers a hosted NMI invoice URL over Collect.js", () => {
+    const html = renderInvoiceHtml({
+      amountUsd: 50,
+      invoiceNumber: "RES-9FSGMN",
+      mercuryUrl: "https://app.mercury.com/pay/a",
+      cardUrl:
+        "https://pinpointpayments.transactiongateway.com/cart/invoicing.php?invoice_id=1",
+      capture: "collectjs",
+      collectPublicKey: "pk_test_collect",
+    });
+    assert.match(html, /invoicing\.php/);
+    assert.match(html, /Pay with card/);
+    assert.match(html, /Pay with bank/);
+    assert.doesNotMatch(html, /Collect\.js/);
+  });
+
+  it("hides card capture after paidAt", () => {
+    const html = renderInvoiceHtml({
+      amountUsd: 10,
+      invoiceNumber: "RES-1",
+      mercuryUrl: "https://app.mercury.com/pay/a",
+      capture: "collectjs",
+      collectPublicKey: "pk_test_collect",
+      paidAt: "2026-09-08T00:00:00Z",
+    });
+    assert.doesNotMatch(html, /Collect\.js/);
+    assert.doesNotMatch(html, /Pay with card/);
+    assert.doesNotMatch(html, /Pay with bank/);
+    assert.match(html, /Paid/);
+  });
+
+  it("round-trips collectjs capture on the signed token", () => {
+    process.env.PAY_PAGE_SECRET = "test-secret-for-invoice-page";
+    const token = mintInvoiceToken({
+      amountUsd: 50,
+      invoiceNumber: "RES-CARD",
+      mercuryUrl: "https://app.mercury.com/pay/a",
+      capture: "collectjs",
+    });
+    const v = verifyInvoiceToken(token);
+    assert.equal(v.ok, true);
+    assert.equal(v.data.capture, "collectjs");
+    assert.doesNotMatch(token, /pk_test|NMI_PUBLIC|collectPublicKey/);
   });
 });
