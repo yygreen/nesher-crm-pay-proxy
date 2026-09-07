@@ -38,6 +38,7 @@ import {
 } from "./snapengage.js";
 import { injectPublicHomeUi } from "./public-ui.js";
 import { injectStatusExtra, handleStatusPost, STATUS_POST_RE } from "./status-extra.js";
+import { injectNeedsAxis } from "./needs-axis.js";
 import { handleBoardPage, handleBoardDone } from "./board.js";
 import {
   getPool,
@@ -808,6 +809,8 @@ function proxyWithInject(req, res) {
                 injected = await injectPaidBadges(injected, pathOnly, badgePool());
                 // the one extra JRM status — see status-extra.js
                 injected = await injectStatusExtra(injected, pathOnly, badgePool());
+                // read-only kashrus / travel-party / Shabbos-Yom-Tov badges — see needs-axis.js
+                injected = await injectNeedsAxis(injected, pathOnly, badgePool());
               }
               // JRM Inbox bell/badge on every staff page (skips the login page by itself)
               injected = injectIntakeUi(injected, pathOnly, { staffCheckHtml: text });
@@ -1010,7 +1013,7 @@ const server = http.createServer(async (req, res) => {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-09-08-nmi-card-mint",
+      build: "2026-09-08-needs-axis-badges",
       snapEngage: {
         enabled: SNAPENGAGE_ENABLED,
         widgetId: SNAPENGAGE_WIDGET_ID,

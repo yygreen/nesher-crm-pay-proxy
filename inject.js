@@ -68,6 +68,13 @@ const CSS = `
   }
   .nesher-paid-badge.part { background: #fef9c3; border-color: #fde047; color: #a16207; }
   .nesher-paid-badge.part::before { background: #eab308; }
+  .nesher-needs-badge {
+    display: inline-flex; align-items: center;
+    background: #eef2ff; border: 1px solid #c7d2fe; color: #4338ca;
+    font: 600 12px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    padding: 2px 10px; border-radius: 999px; margin: 2px 6px;
+    max-width: 100%; white-space: normal; vertical-align: middle;
+  }
   .nesher-mercury-quote {
     display: block;
     width: 100%;
