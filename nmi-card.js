@@ -50,17 +50,53 @@ export function brandFromKind(kind, invoiceNumber) {
   return brandFromInvoiceNumber(invoiceNumber);
 }
 
+export function brandFromRecord(opts = {}) {
+  const id = String(opts.brandId || "").toLowerCase();
+  if (id === "jrm") return BRANDS.jrm;
+  if (id === "nesher") return BRANDS.nesher;
+  return brandFromKind(opts.kind, opts.invoiceNumber);
+}
+
+/** Guest /pay URL origin for this brand. Card statement is a different field. */
+export function guestPayOrigin(brand) {
+  const b = brand && brand.id ? brand : BRANDS.nesher;
+  return String(b.successOrigin || BRANDS.nesher.successOrigin).replace(
+    /\/$/,
+    ""
+  );
+}
+
+/**
+ * v5 POST /payments/sale `payment_descriptor` (docs.nmi.com PaymentDescriptor).
+ * Classic transact.php `descriptor` is the same idea and is processor-dependent.
+ * Pinpoint has not confirmed they honor it on this MID — JRM mint stays
+ * gated on NMI_JRM_DESCRIPTOR. Dots allowed: boarded DBA is flynesher.com.
+ */
+const DESCRIPTOR_RE = /^[A-Za-z0-9._\- &]{1,60}$/;
+
+export function sanitizeDescriptor(value) {
+  const s = String(value || "").trim().slice(0, 60);
+  return DESCRIPTOR_RE.test(s) ? s : null;
+}
+
 /** Statement descriptor actually configured for this brand, or null if blocked. */
 export function descriptorFor(brand) {
   const b = brand && brand.id ? brand : BRANDS.nesher;
   if (b.id === "jrm") {
     const explicit = String(process.env.NMI_JRM_DESCRIPTOR || "").trim();
-    return explicit || null;
+    return sanitizeDescriptor(explicit);
   }
-  return (
+  return sanitizeDescriptor(
     String(process.env.NMI_NESHER_DESCRIPTOR || "").trim() ||
-    b.defaultDescriptor
+      b.defaultDescriptor
   );
+}
+
+/** Body fragment for v5 sale. Null when this brand must not charge. */
+export function paymentDescriptorPayload(brand) {
+  const descriptor = descriptorFor(brand);
+  if (!descriptor) return null;
+  return { descriptor, url: guestPayOrigin(brand) };
 }
 
 export function isAllowedCardUrl(url) {
@@ -396,6 +432,8 @@ export async function chargeWithToken(opts = {}) {
         : {}),
     },
   };
+  const pd = paymentDescriptorPayload(brand);
+  if (pd) body.payment_descriptor = pd;
   const fetchImpl = opts.fetchImpl || fetch;
   const res = await fetchImpl(`${NMI_HOST}/api/v5/payments/sale`, {
     method: "POST",

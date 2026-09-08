@@ -2,9 +2,13 @@ import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import {
+  BRANDS,
   brandFromInvoiceNumber,
   brandFromKind,
+  brandFromRecord,
   descriptorFor,
+  guestPayOrigin,
+  paymentDescriptorPayload,
   isAllowedCardUrl,
   hostedInvoiceUrl,
   mintCardCheckout,
@@ -45,6 +49,45 @@ describe("brand + descriptor mapping", () => {
         descriptorFor(brandFromInvoiceNumber("RES-1")),
         "FLYNESHER.COM"
       );
+    } finally {
+      if (prev !== undefined) process.env.NMI_JRM_DESCRIPTOR = prev;
+      else delete process.env.NMI_JRM_DESCRIPTOR;
+    }
+  });
+
+  it("maps record kind then brandId then invoice prefix", () => {
+    assert.equal(brandFromRecord({ kind: "hotel" }).id, "jrm");
+    assert.equal(brandFromRecord({ brandId: "jrm", kind: "reservation" }).id, "jrm");
+    assert.equal(brandFromRecord({ invoiceNumber: "RES-1" }).id, "nesher");
+  });
+
+  it("guest origins are the matching website, never mixed", () => {
+    assert.equal(guestPayOrigin(BRANDS.nesher), "https://www.flynesher.com");
+    assert.equal(guestPayOrigin(BRANDS.jrm), "https://www.jrmhotels.com");
+    assert.equal(
+      guestPayOrigin(brandFromKind("hotel", "x")),
+      "https://www.jrmhotels.com"
+    );
+    assert.equal(
+      guestPayOrigin(brandFromKind("reservation", "x")),
+      "https://www.flynesher.com"
+    );
+  });
+
+  it("v5 payment_descriptor is Nesher until JRM DBA is set", () => {
+    const prev = process.env.NMI_JRM_DESCRIPTOR;
+    delete process.env.NMI_JRM_DESCRIPTOR;
+    try {
+      assert.deepEqual(paymentDescriptorPayload(BRANDS.nesher), {
+        descriptor: "FLYNESHER.COM",
+        url: "https://www.flynesher.com",
+      });
+      assert.equal(paymentDescriptorPayload(BRANDS.jrm), null);
+      process.env.NMI_JRM_DESCRIPTOR = "JRM HOTELS";
+      assert.deepEqual(paymentDescriptorPayload(BRANDS.jrm), {
+        descriptor: "JRM HOTELS",
+        url: "https://www.jrmhotels.com",
+      });
     } finally {
       if (prev !== undefined) process.env.NMI_JRM_DESCRIPTOR = prev;
       else delete process.env.NMI_JRM_DESCRIPTOR;
@@ -311,6 +354,10 @@ describe("chargeWithToken", () => {
     assert.equal(body.merchant_defined_fields.field_4, "Ada Lovelace");
     assert.notEqual(body.merchant_defined_fields.field_1, "RES-9FSGMN");
     assert.notEqual(body.merchant_defined_fields.field_3, "FLYNESHER.COM");
+    assert.deepEqual(body.payment_descriptor, {
+      descriptor: "FLYNESHER.COM",
+      url: "https://www.flynesher.com",
+    });
   });
 
   it("does not charge JRM until a second descriptor is configured", async () => {
@@ -638,6 +685,10 @@ describe("chargePayCode", () => {
       assert.equal(hotels[0].id, 189);
       assert.match(hotels[0].note, /mark the Mercury invoice PAID, never cancel\./);
       assert.equal(resNotes.length, 0);
+      assert.deepEqual(sale.lastBody().payment_descriptor, {
+        descriptor: "JRM HOTELS",
+        url: "https://www.jrmhotels.com",
+      });
       const nmiSrc = fs.readFileSync(new URL("../nmi-card.js", import.meta.url), "utf8");
       assert.doesNotMatch(nmiSrc, /core_payment/);
       assert.equal(
@@ -650,6 +701,47 @@ describe("chargePayCode", () => {
       if (prev !== undefined) process.env.NMI_JRM_DESCRIPTOR = prev;
       else delete process.env.NMI_JRM_DESCRIPTOR;
     }
+  });
+
+  it("charges the stored CRM amount even if the caller passes amountUsd: 1", async () => {
+    const sale = saleFetch();
+    const out = await chargePayCode({
+      code: "abc12xyz",
+      paymentToken: "tok_collect",
+      amountUsd: 1,
+      loadInvoice: async () => ({ ok: true, data: invoice }),
+      claimInvoicePaid: async () => ({ ok: true, paidAt: "t" }),
+      markInvoicePaid: async () => ({ ok: true }),
+      fetchImpl: sale.fetchImpl,
+      privateKey: "test-private-key",
+    });
+    assert.equal(out.ok, true);
+    assert.equal(sale.lastBody().amount, "55.55");
+    assert.notEqual(Number(sale.lastBody().amount), 1);
+    assert.equal(sale.lastBody().order_details.id, "RES-555TRAIN");
+    assert.doesNotMatch(JSON.stringify(sale.lastBody()), /NESHER-PAY|JRM-PAY/);
+  });
+
+  it("mint JSON and guest charge live on the brand website origin", () => {
+    const src = fs.readFileSync(new URL("../server.js", import.meta.url), "utf8");
+    assert.match(src, /guestPayOrigin\(/);
+    assert.match(src, /build: "2026-09-08-brand-pay-origins"/);
+    assert.doesNotMatch(
+      src.slice(src.indexOf("const stored = await storeInvoice"), src.indexOf("const shareUrl")),
+      /publicHostFor\(req\)/
+    );
+  });
+
+  it("HTTP charge handler never reads amount from the POST body", () => {
+    const src = fs.readFileSync(new URL("../server.js", import.meta.url), "utf8");
+    const start = src.indexOf("Public guest card capture");
+    const end = src.indexOf("Public guest invoice");
+    assert.ok(start > 0 && end > start);
+    const charge = src.slice(start, end);
+    assert.match(charge, /paymentToken: body\.payment_token/);
+    assert.doesNotMatch(charge, /body\.amount/);
+    assert.doesNotMatch(charge, /amountUsd:/);
+    assert.match(charge, /chargePayCode\(\{/);
   });
 
   it("releases the paidAt claim when the NMI sale fails", async () => {
@@ -684,11 +776,12 @@ describe("agent paste leftover", () => {
       brand: brandFromInvoiceNumber("JRM-189-O50"),
       invoiceNumber: "JRM-189-O50",
       amountUsd: 189,
-      cardUrl: "https://www.flynesher.com/pay/abc12xyz",
+      cardUrl: "https://www.jrmhotels.com/pay/abc12xyz",
     });
     assert.match(text, /JRM Hotels/);
     assert.match(text, /JRM-189-O50/);
-    assert.match(text, /https:\/\/www\.flynesher\.com\/pay\/abc12xyz/);
+    assert.match(text, /https:\/\/www\.jrmhotels\.com\/pay\/abc12xyz/);
+    assert.doesNotMatch(text, /flynesher\.com/);
     assert.doesNotMatch(text, /square|stripe/i);
   });
 });

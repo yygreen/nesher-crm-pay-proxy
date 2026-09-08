@@ -83,6 +83,19 @@ const CSS = `
     color: #475569;
     font-weight: 500;
   }
+  .nesher-brand-line {
+    margin: 0 0 14px;
+    padding: 10px 12px;
+    border-radius: 10px;
+    background: #f8fafc;
+    border: 1px solid #e2e8f0;
+    font-size: 13px;
+    line-height: 1.45;
+    color: #334155;
+  }
+  .nesher-brand-line b { color: #0f172a; }
+  .nesher-brand-line.jrm { background: #FAF6EC; border-color: #e8dcc4; }
+  .nesher-brand-line.jrm b { color: #5C4528; }
 
   /* ── Modal shell ── */
   #nesher-pay-modal-root {
@@ -743,7 +756,7 @@ const SCRIPT = `
       ? '<span class="nesher-chip warn">Needs input</span>'
       : '<span class="nesher-chip ok">Ready</span>'));
 
-    var html = "";
+    var html = brandLineHtml(data);
 
     // One calm banner, max. Field-level hints carry the specifics.
     var extraReq = missing.filter(function (m) { return m.required && !formFields[m.field]; });
@@ -849,13 +862,35 @@ const SCRIPT = `
     else createBtn.focus();
   }
 
+  function isJrmRecord(data) {
+    var k = String((data && data.kind) || modalState.kind || "");
+    if (k === "hotel" || k === "hotel-offer") return true;
+    var id = data && data.brand && data.brand.id;
+    if (id === "jrm") return true;
+    var inv = String((data && (data.invoiceNumber || (data.draft && data.draft.invoiceNumber))) || "");
+    return inv.indexOf("JRM-") === 0;
+  }
+
+  function brandLineHtml(data) {
+    var jrm = isJrmRecord(data);
+    var blocked = data && data.cardBlockedReason === "second_dba_pending";
+    if (jrm) {
+      return '<div class="nesher-brand-line jrm" id="nesher-brand-line"><b>JRM Hotels</b> · guest link on jrmhotels.com. ' +
+        (blocked || !data || data.preview
+          ? "Card waits on a Pinpoint second DBA so a JRM stay does not print flynesher.com on the statement. Bank still works."
+          : "Card + bank on this JRM link.") +
+        "</div>";
+    }
+    return '<div class="nesher-brand-line" id="nesher-brand-line"><b>Nesher</b> · guest link on flynesher.com. Card (Pinpoint) + bank.</div>';
+  }
+
   function buildGuestMessage(data) {
     var draft = data.draft || {};
     var amount = Number(data.amountUsd || draft.amountUsd);
     var name = String(draft.customerName || "").trim().split(/\\s+/)[0] || "there";
     var pay = data.combinedPayUrl || data.payUrl || "";
     var inv = data.invoiceNumber || draft.invoiceNumber || "";
-    var brand = String(inv).indexOf("JRM-") === 0 ? "JRM Hotels" : "Nesher";
+    var brand = (data.brand && data.brand.name) || (isJrmRecord(data) ? "JRM Hotels" : "Nesher");
     if (data.agentPaste) return data.agentPaste;
     return [
       "Hi " + name + ",",
@@ -893,7 +928,8 @@ const SCRIPT = `
         '<div class="nesher-success-check">' + ICON_CHECK + "</div>" +
         '<div class="nesher-success-amt">' + money(amount) + "</div>" +
         (who ? '<div class="nesher-success-meta">' + esc(who) + "</div>" : "") +
-        '<p style="margin:16px 0 0;font-size:13.5px;color:#64748b;line-height:1.45">Guest message is on your clipboard. Paste into WhatsApp or email.</p>' +
+        brandLineHtml(data) +
+        '<p style="margin:16px 0 0;font-size:13.5px;color:#64748b;line-height:1.45">Guest message is on your clipboard. Paste into WhatsApp or email. Give the team this URL: Nesher stays use flynesher.com, JRM stays use jrmhotels.com.</p>' +
         '<div class="nesher-guest-box" style="margin-top:14px">' +
           '<pre id="nesher-guest-msg" style="max-height:120px">' + esc(guestMsg) + "</pre>" +
         "</div>" +

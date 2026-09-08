@@ -7,6 +7,7 @@ import crypto from "node:crypto";
 import {
   isAllowedCardUrl,
   brandFromInvoiceNumber,
+  brandFromRecord,
   stripDeadCardFields,
   collectScriptUrl,
   descriptorFor,
@@ -136,6 +137,9 @@ export function buildCombinedPayUrl(publicOrigin, codeOrToken) {
     /\/$/,
     ""
   );
+  if (!/^https:\/\/(www\.)?(flynesher\.com|jrmhotels\.com)$/i.test(origin)) {
+    return `https://www.flynesher.com/pay/${encodeURIComponent(codeOrToken)}`;
+  }
   return `${origin}/pay/${encodeURIComponent(codeOrToken)}`;
 }
 
@@ -234,11 +238,13 @@ export function renderInvoiceHtml(data) {
   const name = esc(data.customerName || "");
   const summary = esc(data.summary || "");
   const mercuryUrl = esc(data.mercuryUrl);
-  const brand = brandFromInvoiceNumber(data.invoiceNumber);
-  const brandLabel =
-    data.brandId === "jrm" || brand.id === "jrm"
-      ? "JRM Hotels"
-      : "Nesher · FlyNesher";
+  const brand = brandFromRecord({
+    brandId: data.brandId,
+    invoiceNumber: data.invoiceNumber,
+    kind: data.kind,
+  });
+  const isJrm = brand.id === "jrm";
+  const brandLabel = isJrm ? "JRM Hotels" : "Nesher · FlyNesher";
   const paid = Boolean(data.paidAt);
   const hostedCardUrl =
     !paid && isAllowedCardUrl(data.cardUrl) ? esc(data.cardUrl) : "";
@@ -320,8 +326,8 @@ export function renderInvoiceHtml(data) {
       padding: 10px 12px; margin: 0 0 10px; background: #fff;
     }
     .card-err { margin: 0 0 10px; font-size: 13px; color: #b91c1c; text-align: center; }
-    .btn-primary { background: #0f766e; color: #fff; }
-    .btn-primary:hover { background: #0d6a63; }
+    .btn-primary { background: #3D7A99; color: #fff; }
+    .btn-primary:hover { background: #336882; }
     .btn-secondary {
       background: #fff; color: #111;
       border: 1px solid #ddd;
@@ -334,9 +340,13 @@ export function renderInvoiceHtml(data) {
     .foot {
       margin-top: 28px; font-size: 12px; color: #aaa; text-align: center;
     }
+    body.pay-brand-jrm { background: #FAF6EC; }
+    body.pay-brand-jrm .logo { color: #5C4528; }
+    body.pay-brand-jrm .btn-primary { background: #5C4528; }
+    body.pay-brand-jrm .btn-primary:hover { background: #3D3229; }
   </style>
 </head>
-<body>
+<body class="pay-brand-${esc(brand.id)}">
   <div class="sheet">
     <p class="logo">${esc(brandLabel)}</p>
     <p class="label">Amount due</p>

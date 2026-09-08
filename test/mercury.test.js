@@ -365,4 +365,14 @@ describe("injectPayButtons", () => {
     assert.match(out, /if \(data\.agentPaste\) return data\.agentPaste/);
     assert.doesNotMatch(out, /square\.link|squareup\.com|checkout\.stripe/);
   });
+
+  it("staff modal names the brand website and keeps JRM card off until DBA", () => {
+    const html = `<html><body><a href="/jrm/hotels/1/">x</a></body></html>`;
+    const out = injectPayButtons(html, "/jrm/hotels/");
+    assert.match(out, /nesher-brand-line/);
+    assert.match(out, /guest link on jrmhotels\.com/);
+    assert.match(out, /guest link on flynesher\.com/);
+    assert.match(out, /second DBA/);
+    assert.match(out, /does not print flynesher\.com on the statement/);
+  });
 });

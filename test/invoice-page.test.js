@@ -237,4 +237,34 @@ describe("unified invoice token", () => {
     assert.equal(v.data.capture, "collectjs");
     assert.doesNotMatch(token, /pk_test|NMI_PUBLIC|collectPublicKey/);
   });
+
+  it("builds Nesher guest URLs on flynesher.com and JRM on jrmhotels.com", () => {
+    assert.equal(
+      buildCombinedPayUrl("https://www.flynesher.com", "abc12xyz"),
+      "https://www.flynesher.com/pay/abc12xyz"
+    );
+    assert.equal(
+      buildCombinedPayUrl("https://www.jrmhotels.com", "jrm12xyz"),
+      "https://www.jrmhotels.com/pay/jrm12xyz"
+    );
+    assert.equal(
+      buildCombinedPayUrl("https://evil.example", "x"),
+      "https://www.flynesher.com/pay/x"
+    );
+  });
+
+  it("paints JRM guest chrome without Collect.js while DBA is pending", () => {
+    const html = renderInvoiceHtml({
+      amountUsd: 189,
+      invoiceNumber: "JRM-189-O50",
+      mercuryUrl: "https://app.mercury.com/pay/a",
+      brandId: "jrm",
+      kind: "hotel",
+    });
+    assert.match(html, /pay-brand-jrm/);
+    assert.match(html, /JRM Hotels/);
+    assert.match(html, /#5C4528/);
+    assert.doesNotMatch(html, /Collect\.js/);
+    assert.doesNotMatch(html, /Nesher · FlyNesher/);
+  });
 });

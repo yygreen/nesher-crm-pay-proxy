@@ -13,6 +13,9 @@ import {
   chargePayCode,
   staffCardFields,
   isShortPayCode,
+  brandFromKind,
+  guestPayOrigin,
+  descriptorFor,
 } from "./nmi-card.js";
 import {
   buildCombinedPayUrl,
@@ -276,10 +279,19 @@ async function handlePayApi(req, res, kind, id, query) {
       req.method === "POST" && body.create !== false && query.get("create") !== "0";
 
     if (req.method === "GET" || !wantsCreate) {
+      const previewBrand = brandFromKind(kind, draftBundle.draft.invoiceNumber);
       sendJson(res, 200, {
         ok: true,
         preview: true,
         ...draftBundle,
+        kind: kind === "reservation" ? "reservation" : "hotel",
+        brand: { id: previewBrand.id, name: previewBrand.name },
+        guestOrigin: guestPayOrigin(previewBrand),
+        cardBlockedReason: descriptorFor(previewBrand)
+          ? null
+          : previewBrand.id === "jrm"
+            ? "second_dba_pending"
+            : null,
         quote: {
           summary: draftBundle.draft.summary,
           amountUsd: draftBundle.draft.amountUsd,
@@ -367,7 +379,9 @@ async function handlePayApi(req, res, kind, id, query) {
         recordId:
           kind === "reservation" ? ctx.reservation?.id : ctx.request?.id,
       });
-      const origin = `https://${publicHostFor(req)}`;
+      const origin = guestPayOrigin(
+        cardMint.brand || brandFromKind(kind, d.invoiceNumber)
+      );
       if (stored.ok && stored.code) {
         combinedPayUrl = buildCombinedPayUrl(origin, stored.code);
       } else if (stored.longToken) {
@@ -420,6 +434,12 @@ async function handlePayApi(req, res, kind, id, query) {
       cardUrl: cardFields.cardUrl,
       cardCapture: cardFields.cardCapture,
       cardBlockedReason: cardFields.cardBlockedReason,
+      brand: cardMint.brand
+        ? { id: cardMint.brand.id, name: cardMint.brand.name }
+        : null,
+      guestOrigin: guestPayOrigin(
+        cardMint.brand || brandFromKind(kind, d.invoiceNumber)
+      ),
       agentPaste: paste,
       invoiceNumber: draftBundle.draft.invoiceNumber,
       amountUsd: draftBundle.draft.amountUsd,
@@ -1013,7 +1033,7 @@ const server = http.createServer(async (req, res) => {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-09-08-needs-axis-badges",
+      build: "2026-09-08-brand-pay-origins",
       snapEngage: {
         enabled: SNAPENGAGE_ENABLED,
         widgetId: SNAPENGAGE_WIDGET_ID,
