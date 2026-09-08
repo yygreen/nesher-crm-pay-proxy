@@ -17,6 +17,8 @@ import {
   chargePayCode,
   looksLikePan,
   agentPaste,
+  processedByFacts,
+  processedByPasteLine,
   stripDeadCardFields,
   staffCardFields,
   isShortPayCode,
@@ -466,8 +468,12 @@ describe("agent paste", () => {
     assert.match(text, /Nesher/);
     assert.match(text, /RES-9FSGMN/);
     assert.match(text, CARD_HOST);
+    assert.match(text, /Card processed by Air Today Travel Inc/);
+    assert.match(text, /Statement shows FLYNESHER\.COM/);
+    assert.match(text, /Bank: Air Today Travel \(Mercury \/ Bank Hapoalim\)/);
     assert.doesNotMatch(text, /square|stripe/i);
-    assert.equal(text.split("\n").filter(Boolean).length, 2);
+    assert.doesNotMatch(text, /Pinpoint\/NMI/);
+    assert.equal(text.split("\n").filter(Boolean).length, 3);
     assert.equal(hostedInvoiceUrl("1").includes("invoice_id=1"), true);
   });
 
@@ -725,7 +731,7 @@ describe("chargePayCode", () => {
   it("mint JSON and guest charge live on the brand website origin", () => {
     const src = fs.readFileSync(new URL("../server.js", import.meta.url), "utf8");
     assert.match(src, /guestPayOrigin\(/);
-    assert.match(src, /build: "2026-09-08-brand-pay-origins"/);
+    assert.match(src, /build: "2026-09-08-processed-by"/);
     assert.doesNotMatch(
       src.slice(src.indexOf("const stored = await storeInvoice"), src.indexOf("const shareUrl")),
       /publicHostFor\(req\)/
@@ -781,7 +787,66 @@ describe("agent paste leftover", () => {
     assert.match(text, /JRM Hotels/);
     assert.match(text, /JRM-189-O50/);
     assert.match(text, /https:\/\/www\.jrmhotels\.com\/pay\/abc12xyz/);
-    assert.doesNotMatch(text, /flynesher\.com/);
+    assert.match(text, /Bank: Air Today Travel \(Mercury \/ Bank Hapoalim\)/);
+    assert.doesNotMatch(text, /Card processed/);
+    assert.doesNotMatch(text, /flynesher\.com/i);
+    assert.doesNotMatch(text, /FLYNESHER/);
+    assert.doesNotMatch(text, /Pinpoint|NMI/);
     assert.doesNotMatch(text, /square|stripe/i);
+  });
+});
+
+describe("processed-by copy", () => {
+  it("Nesher card-on names Air Today and the live descriptor", () => {
+    const f = processedByFacts({
+      brand: brandFromInvoiceNumber("RES-1"),
+      hasCard: true,
+    });
+    assert.equal(f.showCard, true);
+    assert.equal(f.merchant, "Air Today Travel Inc");
+    assert.equal(f.dba, "Nesher Travel");
+    assert.equal(f.descriptor, "FLYNESHER.COM");
+    assert.equal(f.bankBeneficiary, "Air Today Travel");
+    assert.match(
+      processedByPasteLine({
+        brand: brandFromInvoiceNumber("RES-1"),
+        hasCard: true,
+      }),
+      /FLYNESHER\.COM/
+    );
+  });
+
+  it("JRM never prints a card processor or flynesher.com descriptor", () => {
+    const prev = process.env.NMI_JRM_DESCRIPTOR;
+    process.env.NMI_JRM_DESCRIPTOR = "JRM HOTELS";
+    try {
+      const f = processedByFacts({
+        brand: brandFromInvoiceNumber("JRM-1"),
+        hasCard: true,
+      });
+      assert.equal(f.showCard, false);
+      assert.equal(f.descriptor, null);
+      const line = processedByPasteLine({
+        brand: brandFromInvoiceNumber("JRM-1"),
+        hasCard: true,
+      });
+      assert.match(line, /Bank: Air Today Travel/);
+      assert.doesNotMatch(line, /Card processed/);
+      assert.doesNotMatch(line, /flynesher/i);
+      assert.doesNotMatch(line, /JRM HOTELS/);
+    } finally {
+      if (prev !== undefined) process.env.NMI_JRM_DESCRIPTOR = prev;
+      else delete process.env.NMI_JRM_DESCRIPTOR;
+    }
+  });
+
+  it("Nesher bank-only drops the card statement line", () => {
+    const f = processedByFacts({
+      brand: brandFromInvoiceNumber("RES-1"),
+      hasCard: false,
+    });
+    assert.equal(f.showCard, false);
+    assert.equal(processedByPasteLine({ brand: brandFromInvoiceNumber("RES-1"), hasCard: false }),
+      "Bank: Air Today Travel (Mercury / Bank Hapoalim).");
   });
 });

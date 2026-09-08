@@ -253,6 +253,57 @@ describe("unified invoice token", () => {
     );
   });
 
+  it("Nesher card-on page names Air Today, the statement descriptor, and the bank", () => {
+    const html = renderInvoiceHtml({
+      amountUsd: 55.55,
+      invoiceNumber: "RES-555TRAIN",
+      customerName: "Ada",
+      mercuryUrl: "https://app.mercury.com/pay/a",
+      capture: "collectjs",
+      collectPublicKey: "pk_test_collect",
+      brandId: "nesher",
+    });
+    assert.match(html, /processed-by/);
+    assert.match(html, /Card processed by <strong>Air Today Travel Inc<\/strong>/);
+    assert.match(html, /\(Nesher Travel\)/);
+    assert.match(html, /Your card statement shows <strong>FLYNESHER\.COM<\/strong>/);
+    assert.match(html, /Bank transfer is Mercury \/ Bank Hapoalim, beneficiary <strong>Air Today Travel<\/strong>/);
+    assert.doesNotMatch(html, /beneficiary <strong>Air Today Travel Inc/);
+    assert.doesNotMatch(html, /Pinpoint\/NMI/);
+    assert.doesNotMatch(html, /JRM HOTELS/);
+  });
+
+  it("JRM bank-only page has the bank line and no card processed-by", () => {
+    const html = renderInvoiceHtml({
+      amountUsd: 189,
+      invoiceNumber: "JRM-189-O50",
+      mercuryUrl: "https://app.mercury.com/pay/a",
+      brandId: "jrm",
+      kind: "hotel",
+    });
+    assert.match(html, /processed-by/);
+    assert.match(html, /Bank transfer is Mercury \/ Bank Hapoalim, beneficiary <strong>Air Today Travel<\/strong>/);
+    assert.doesNotMatch(html, /Card processed/);
+    assert.doesNotMatch(html, /FLYNESHER/);
+    assert.doesNotMatch(html, /flynesher\.com/i);
+    assert.doesNotMatch(html, /Pinpoint|NMI/);
+    assert.doesNotMatch(html, /Nesher Travel/);
+    assert.doesNotMatch(html, /statement shows/i);
+  });
+
+  it("Nesher bank-only drops the card statement line", () => {
+    const html = renderInvoiceHtml({
+      amountUsd: 100,
+      invoiceNumber: "RES-1",
+      mercuryUrl: "https://app.mercury.com/pay/a",
+      brandId: "nesher",
+    });
+    assert.match(html, /Bank transfer is Mercury \/ Bank Hapoalim, beneficiary <strong>Air Today Travel<\/strong>/);
+    assert.doesNotMatch(html, /Card processed/);
+    assert.doesNotMatch(html, /statement shows/i);
+    assert.doesNotMatch(html, /Pinpoint\/NMI/);
+  });
+
   it("paints JRM guest chrome without Collect.js while DBA is pending", () => {
     const html = renderInvoiceHtml({
       amountUsd: 189,

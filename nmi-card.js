@@ -99,6 +99,43 @@ export function paymentDescriptorPayload(brand) {
   return { descriptor, url: guestPayOrigin(brand) };
 }
 
+/** Legal merchant / bank copy. JRM never gets a card statement line. */
+export const MERCHANT = {
+  legal: "Air Today Travel Inc",
+  dba: "Nesher Travel",
+  bankBeneficiary: "Air Today Travel",
+  bankRail: "Mercury / Bank Hapoalim",
+};
+
+/**
+ * One truth for guest-page + staff-paste processed-by copy.
+ * JRM stays bank-only in this copy even if a second DBA later paints Collect.js
+ * — never invent a JRM card descriptor, never print flynesher.com on a JRM page.
+ */
+export function processedByFacts({ brand, hasCard } = {}) {
+  const b = brand && brand.id ? brand : BRANDS.nesher;
+  const isJrm = b.id === "jrm";
+  const descriptor = descriptorFor(b);
+  const showCard = !isJrm && Boolean(hasCard) && Boolean(descriptor);
+  return {
+    brandId: b.id,
+    showCard,
+    descriptor: showCard ? descriptor : null,
+    merchant: MERCHANT.legal,
+    dba: MERCHANT.dba,
+    bankBeneficiary: MERCHANT.bankBeneficiary,
+    bankRail: MERCHANT.bankRail,
+  };
+}
+
+export function processedByPasteLine(opts = {}) {
+  const f = processedByFacts(opts);
+  if (f.showCard) {
+    return `Card processed by ${f.merchant} (${f.dba}). Statement shows ${f.descriptor}. Bank: ${f.bankBeneficiary} (${f.bankRail}).`;
+  }
+  return `Bank: ${f.bankBeneficiary} (${f.bankRail}).`;
+}
+
 export function isAllowedCardUrl(url) {
   const u = String(url || "").trim();
   if (!/^https:\/\//i.test(u)) return false;
@@ -112,7 +149,14 @@ export function hostedInvoiceUrl(invoiceId) {
   return `${NMI_HOST}/cart/invoicing.php?invoice_id=${encodeURIComponent(id)}`;
 }
 
-export function agentPaste({ brand, invoiceNumber, amountUsd, cardUrl, mercuryUrl }) {
+export function agentPaste({
+  brand,
+  invoiceNumber,
+  amountUsd,
+  cardUrl,
+  mercuryUrl,
+  hasCard,
+} = {}) {
   const b = brand && brand.name ? brand : BRANDS.nesher;
   const amt = Number(amountUsd);
   const money = Number.isFinite(amt)
@@ -127,6 +171,11 @@ export function agentPaste({ brand, invoiceNumber, amountUsd, cardUrl, mercuryUr
   ];
   if (cardUrl) lines.push(String(cardUrl).trim());
   else if (mercuryUrl) lines.push(String(mercuryUrl).trim());
+  const cardOn =
+    hasCard == null
+      ? b.id !== "jrm" && Boolean(descriptorFor(b))
+      : Boolean(hasCard);
+  lines.push(processedByPasteLine({ brand: b, hasCard: cardOn }));
   return lines.join("\n");
 }
 

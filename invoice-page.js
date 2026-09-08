@@ -11,6 +11,7 @@ import {
   stripDeadCardFields,
   collectScriptUrl,
   descriptorFor,
+  processedByFacts,
 } from "./nmi-card.js";
 
 const DEFAULT_TTL_SEC = 60 * 60 * 24 * 45;
@@ -229,6 +230,15 @@ function renderCollectJsForm(collectKey) {
     </div>`;
 }
 
+function processedByHintHtml({ paid, hasCard, brand }) {
+  if (paid) return `<p class="hint">Paid. Thank you.</p>`;
+  const f = processedByFacts({ brand, hasCard });
+  if (f.showCard) {
+    return `<p class="hint processed-by">Card processed by <strong>${esc(f.merchant)}</strong> (${esc(f.dba)}).<br>Your card statement shows <strong>${esc(f.descriptor)}</strong>.<br>Bank transfer is ${esc(f.bankRail)}, beneficiary <strong>${esc(f.bankBeneficiary)}</strong>.</p>`;
+  }
+  return `<p class="hint processed-by">Bank transfer is ${esc(f.bankRail)}, beneficiary <strong>${esc(f.bankBeneficiary)}</strong>.</p>`;
+}
+
 /**
  * Clean guest invoice — white, calm, two clear actions max.
  */
@@ -266,11 +276,7 @@ export function renderInvoiceHtml(data) {
   const bankBtn = paid
     ? ""
     : `<a class="btn ${hasCard ? "btn-secondary" : "btn-primary"}" href="${mercuryUrl}">Pay with bank</a>`;
-  const hint = paid
-    ? `<p class="hint">Paid. Thank you.</p>`
-    : hasCard
-      ? `<p class="hint">Card is processed by Pinpoint/NMI. Bank transfer stays on Mercury.</p>`
-      : `<p class="hint">Secure bank transfer on the next screen.</p>`;
+  const hint = processedByHintHtml({ paid, hasCard, brand });
   const actions = `
       ${cardBtn}
       ${bankBtn}
@@ -337,6 +343,8 @@ export function renderInvoiceHtml(data) {
       margin: 14px 0 0; font-size: 12.5px; color: #888;
       text-align: center; line-height: 1.45;
     }
+    .hint.processed-by { text-align: left; }
+    .hint.processed-by strong { color: #555; font-weight: 600; }
     .foot {
       margin-top: 28px; font-size: 12px; color: #aaa; text-align: center;
     }
