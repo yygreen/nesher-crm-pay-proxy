@@ -191,6 +191,11 @@ describe("unified invoice token", () => {
     assert.match(html, /\.card-field:focus-within/);
     assert.match(html, /body\.pay-brand-jrm \.card-field:focus-within/);
     assert.match(html, /JSON\.stringify\(\{payment_token:token\}\)/);
+    assert.match(html, /charAt\(0\)==="\{"/);
+    assert.match(html, /Nothing is wrong on our side/);
+    assert.match(html, /We're missing something: card details/);
+    assert.match(html, /problem on our side/);
+    assert.doesNotMatch(html, /x\.j\.error/);
     assert.doesNotMatch(html, /placeholder:"Card number"/);
     assert.doesNotMatch(html, /placeholder:"CVV"/);
     assert.doesNotMatch(html, /<input\b/i);

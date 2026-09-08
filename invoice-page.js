@@ -10,6 +10,9 @@ import {
   brandFromRecord,
   stripDeadCardFields,
   collectScriptUrl,
+  GUEST_DECLINE_DEFAULT,
+  GUEST_OURS,
+  GUEST_MISSING_CARD,
 } from "./nmi-card.js";
 
 const DEFAULT_TTL_SEC = 60 * 60 * 24 * 45;
@@ -201,8 +204,12 @@ function renderCollectJsForm(collectKey) {
         function showErr(m){
           var e=document.getElementById("card-err");
           if(!e) return;
+          var s=String(m||"").trim();
+          if(!s || s.charAt(0)==="{" || s.indexOf('"object"')>=0){
+            s=${JSON.stringify(GUEST_DECLINE_DEFAULT)};
+          }
           e.hidden=false;
-          e.textContent=m;
+          e.textContent=s;
         }
         function go(){
           if(!window.CollectJS) return;
@@ -222,7 +229,7 @@ function renderCollectJsForm(collectKey) {
             callback:function(response){
               var token=response&&response.token;
               var btn=document.getElementById("pay-card-btn");
-              if(!token){showErr("Card could not be tokenized. Try again or pay with bank.");return;}
+              if(!token){showErr(${JSON.stringify(GUEST_MISSING_CARD)});return;}
               if(btn) btn.disabled=true;
               fetch(location.pathname.replace(/\\/$/,"")+"/charge",{
                 method:"POST",
@@ -235,11 +242,11 @@ function renderCollectJsForm(collectKey) {
                   if(form) form.innerHTML="<p class='hint'>Card payment received. Thank you.</p>";
                 } else {
                   if(btn) btn.disabled=false;
-                  showErr((x.j&&(x.j.message||x.j.error))||"Card was declined. Try another card or pay with bank.");
+                  showErr((x.j&&x.j.message)||${JSON.stringify(GUEST_DECLINE_DEFAULT)});
                 }
               }).catch(function(){
                 if(btn) btn.disabled=false;
-                showErr("Could not reach the card processor. Pay with bank, or try again.");
+                showErr(${JSON.stringify(GUEST_OURS)});
               });
             }
           });

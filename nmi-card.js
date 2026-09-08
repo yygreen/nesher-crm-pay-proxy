@@ -209,6 +209,16 @@ function splitName(full) {
   };
 }
 
+/** Portal MDF / billing name. Empty omitted — never invent "Guest". */
+export function recordName(value, max = 80) {
+  const n = Number(max);
+  const cap = Number.isFinite(n) && n > 0 ? Math.min(Math.floor(n), 255) : 80;
+  return String(value || "")
+    .replace(/[\r\n\t]+/g, " ")
+    .trim()
+    .slice(0, cap);
+}
+
 function nmiPrivateKey() {
   return String(process.env.NMI_PRIVATE_KEY || "").trim();
 }
@@ -227,6 +237,179 @@ export function looksLikePan(value) {
     .trim()
     .replace(/[\s-]/g, "");
   return /^\d{12,19}$/.test(compact);
+}
+
+const GUEST_NOT_US_TAIL =
+  "That often means the bank blocked a large charge, the card needs a call to activate it, or they should try another card. Call the customer, try again, or have them call the number on the back of the card.";
+
+function notUs(reason) {
+  const named = reason
+    ? ` The customer's bank declined the card (${reason}).`
+    : " The customer's bank declined the card.";
+  return `Nothing is wrong on our side.${named} ${GUEST_NOT_US_TAIL}`;
+}
+
+/** Bucket 1 default — bank declined, not us. */
+export const GUEST_DECLINE_DEFAULT = notUs("");
+
+export const GUEST_DECLINE_DO_NOT_HONOR = notUs("Do Not Honor");
+
+export const GUEST_OURS =
+  "This looks like a problem on our side (card processor / our setup), not the customer's card. Do not keep retrying the same card. Tell the office.";
+
+export const GUEST_MISSING_AMOUNT =
+  "We're missing something: amount. Fill that in, then Pay with card again.";
+
+export const GUEST_MISSING_CARD =
+  "We're missing something: card details. Fill that in, then Pay with card again.";
+
+export const GUEST_MISSING_CVV =
+  "We're missing something: security code. Fill that in, then Pay with card again.";
+
+export const GUEST_MISSING_DEFAULT =
+  "We're missing something: amount / card details / security code. Fill that in, then Pay with card again.";
+
+const OURS_CODES = new Set(["300", "410", "411", "420", "430"]);
+const MISSING_ERRORS = new Set([
+  "amount_required",
+  "amount_invalid",
+  "amount_too_small",
+  "amount_too_large",
+  "amountusd required",
+]);
+const MISSING_CARD_ERRORS = new Set([
+  "payment_token required",
+  "raw_card_rejected",
+  "short_code_required",
+  "invoicenumber required",
+  "open_ref_required",
+]);
+
+function isUglyDump(value) {
+  const s = String(value || "").trim();
+  if (!s) return true;
+  if (s.startsWith("{") || s.startsWith("[") || s.startsWith("<")) return true;
+  if (/"object"\s*:\s*"transaction"/i.test(s)) return true;
+  if (/"cc_number"|"ccnumber"|["']cvv["']/i.test(s)) return true;
+  if (looksLikePan(s)) return true;
+  return false;
+}
+
+function nmiDeclineSignals(src) {
+  const out = { phrase: "", codes: [], error: "", httpStatus: 0, response: "" };
+  if (src == null) return out;
+  if (typeof src === "string") {
+    const t = src.trim();
+    if (isUglyDump(t)) return out;
+    out.phrase = t;
+    out.error = t.toLowerCase();
+    return out;
+  }
+  if (typeof src !== "object") return out;
+  out.error = String(src.error || "").trim().toLowerCase();
+  const hs = Number(src.httpStatus);
+  if (Number.isFinite(hs) && hs > 0) out.httpStatus = hs;
+  const json =
+    src.json && typeof src.json === "object" && !Array.isArray(src.json)
+      ? src.json
+      : src;
+  const phraseKeys = [
+    "response_text",
+    "processor_response_text",
+    "responsetext",
+    "processor_response_description",
+  ];
+  for (const k of phraseKeys) {
+    const v = json[k];
+    if (typeof v === "string" && v.trim() && !isUglyDump(v)) {
+      out.phrase = v.trim();
+      break;
+    }
+  }
+  if (
+    !out.phrase &&
+    typeof json.message === "string" &&
+    json.message.trim() &&
+    !isUglyDump(json.message)
+  ) {
+    out.phrase = json.message.trim();
+  }
+  if (
+    !out.phrase &&
+    typeof src.blockedReason === "string" &&
+    src.blockedReason.trim() &&
+    !isUglyDump(src.blockedReason)
+  ) {
+    out.phrase = src.blockedReason.trim();
+  }
+  if (
+    !out.phrase &&
+    typeof json.raw === "string" &&
+    json.raw.trim() &&
+    !isUglyDump(json.raw)
+  ) {
+    out.phrase = json.raw.trim();
+  }
+  for (const k of ["response_code", "processor_response_code"]) {
+    const v = json[k];
+    if (v != null && String(v).trim() !== "") out.codes.push(String(v).trim());
+  }
+  out.response = String(json.response ?? "").trim();
+  return out;
+}
+
+/**
+ * Guest-facing card line in three buckets. Never JSON, never PAN, never txn dump.
+ */
+export function guestCardMessage(saleOrNmiJson) {
+  const { phrase, codes, error, httpStatus, response } =
+    nmiDeclineSignals(saleOrNmiJson);
+  if (MISSING_ERRORS.has(error)) return GUEST_MISSING_AMOUNT;
+  if (MISSING_CARD_ERRORS.has(error)) return GUEST_MISSING_CARD;
+  if (error === "cvv" || error === "security code") return GUEST_MISSING_CVV;
+
+  const codeStr = new Set(codes.map((c) => String(c).toLowerCase()));
+  const ints = codes
+    .map((c) => Number(String(c).trim()))
+    .filter((n) => Number.isFinite(n));
+  const oursByCode = [...codeStr].some((c) => OURS_CODES.has(c));
+  if (
+    error === "keys_missing" ||
+    error === "store_missing" ||
+    error === "processor_error" ||
+    httpStatus >= 500 ||
+    oursByCode ||
+    /communication|timeout|network|econnreset|fetch failed/i.test(
+      `${phrase} ${error}`
+    )
+  ) {
+    return GUEST_OURS;
+  }
+
+  const blob = `${phrase} ${codes.join(" ")}`.toLowerCase();
+  if (/do not honor/.test(blob) || codeStr.has("201") || codeStr.has("05")) {
+    return GUEST_DECLINE_DO_NOT_HONOR;
+  }
+  if (
+    /insufficient|not sufficient|\bnsf\b/.test(blob) ||
+    codeStr.has("202")
+  ) {
+    return notUs("insufficient funds");
+  }
+  if (/expired/.test(blob) || codeStr.has("204")) {
+    return notUs("expired");
+  }
+  if (/over.?limit/.test(blob) || codeStr.has("203")) {
+    return notUs("over limit");
+  }
+  if (
+    response === "2" ||
+    ints.some((n) => n >= 200 && n <= 299) ||
+    /pick\s*up|stolen|lost card|lost\/stolen/.test(blob)
+  ) {
+    return GUEST_DECLINE_DEFAULT;
+  }
+  return GUEST_DECLINE_DEFAULT;
 }
 
 /** Short pay codes can stamp paidAt. Long JWT tokens (they contain `.`) cannot. */
@@ -352,8 +535,8 @@ export async function mintCardCheckout(opts = {}) {
       field_1: brand.id,
       field_2: orderId,
       field_3: orderId,
-      ...(String(opts.customerName || "").trim()
-        ? { field_4: String(opts.customerName).trim().slice(0, 80) }
+      ...(recordName(opts.customerName)
+        ? { field_4: recordName(opts.customerName) }
         : {}),
     },
   };
@@ -443,43 +626,56 @@ export async function chargeWithToken(opts = {}) {
     amountUsd: amount ? Number(amount) : 0,
   };
   if (!amount) {
-    return { ok: false, error: "amountUsd required", ...base };
+    const message = guestCardMessage({ error: "amountUsd required" });
+    return { ok: false, error: "amountUsd required", message, ...base };
   }
   if (!orderId) {
-    return { ok: false, error: "invoiceNumber required", ...base };
+    const message = guestCardMessage({ error: "invoiceNumber required" });
+    return { ok: false, error: "invoiceNumber required", message, ...base };
   }
   if (!token) {
-    return { ok: false, error: "payment_token required", ...base };
+    const message = guestCardMessage({ error: "payment_token required" });
+    return { ok: false, error: "payment_token required", message, ...base };
   }
   const key = String(opts.privateKey || nmiPrivateKey()).trim();
   if (!key) {
-    return { ok: false, error: "keys_missing", ...base };
+    const message = guestCardMessage({ error: "keys_missing" });
+    return { ok: false, error: "keys_missing", message, ...base };
   }
-  const names = splitName(opts.customerName);
+  const customerName = recordName(opts.customerName);
+  const staffName = recordName(opts.staffName);
+  const notes = recordName(opts.notes || opts.moreInfo, 255);
+  const names = customerName ? splitName(customerName) : null;
+  const descBase = String(opts.summary || `${brand.name} ${orderId}`);
+  const orderDescription = staffName
+    ? `${descBase} · ${staffName}`.slice(0, 100)
+    : descBase.slice(0, 100);
   // No payment_descriptor / Classic descriptor: this MID refuses custom DBA.
+  // field_4 Guest / field_5 Processor / field_6 More info — records only.
   const body = {
     amount,
     currency: "USD",
     payment_details: { payment_token: token },
-    billing_address: {
-      first_name: names.first_name,
-      last_name: names.last_name,
-    },
+    ...(names
+      ? {
+          billing_address: {
+            first_name: names.first_name,
+            last_name: names.last_name,
+          },
+        }
+      : {}),
     order_details: {
       id: orderId,
-      order_description: String(opts.summary || `${brand.name} ${orderId}`).slice(
-        0,
-        100
-      ),
+      order_description: orderDescription,
     },
-    // Portal MDFs must match mint: 1 Brand, 2 CRM Ref, 3 Invoice.
+    // Portal MDFs: 1 Brand, 2 CRM/open ref, 3 Invoice, 4 Guest, 5 Processor, 6 Notes.
     merchant_defined_fields: {
       field_1: brand.id,
       field_2: orderId,
       field_3: orderId,
-      ...(String(opts.customerName || "").trim()
-        ? { field_4: String(opts.customerName).trim().slice(0, 80) }
-        : {}),
+      ...(customerName ? { field_4: customerName } : {}),
+      ...(staffName ? { field_5: staffName } : {}),
+      ...(notes ? { field_6: notes } : {}),
     },
   };
   const fetchImpl = opts.fetchImpl || fetch;
@@ -501,10 +697,17 @@ export async function chargeWithToken(opts = {}) {
   }
   const approved = String(json.response ?? json.action?.success ?? "") === "1";
   if (!res.ok || !approved) {
+    const message = guestCardMessage({
+      ...json,
+      json,
+      error: "declined",
+      httpStatus: res.status,
+    });
     return {
       ok: false,
-      error: `nmi_sale_${res.status}`,
-      blockedReason: json.message || json.responsetext || text.slice(0, 180),
+      error: message === GUEST_OURS ? "processor_error" : "declined",
+      message,
+      blockedReason: message,
       ...base,
     };
   }
@@ -548,17 +751,26 @@ export async function chargeGuestInvoice(opts = {}) {
 export async function chargePayCode(opts = {}) {
   const code = String(opts.code || "").trim();
   if (!isShortPayCode(code)) {
-    return { ok: false, error: "short_code_required", httpStatus: 400 };
+    const message = guestCardMessage({ error: "short_code_required" });
+    return { ok: false, error: "short_code_required", message, httpStatus: 400 };
   }
   const token = String(opts.paymentToken || "").trim();
   if (looksLikePan(token)) {
-    return { ok: false, error: "raw_card_rejected", httpStatus: 400 };
+    const message = guestCardMessage({ error: "raw_card_rejected" });
+    return { ok: false, error: "raw_card_rejected", message, httpStatus: 400 };
   }
   if (!token) {
-    return { ok: false, error: "payment_token required", httpStatus: 400 };
+    const message = guestCardMessage({ error: "payment_token required" });
+    return {
+      ok: false,
+      error: "payment_token required",
+      message,
+      httpStatus: 400,
+    };
   }
   if (typeof opts.loadInvoice !== "function" || typeof opts.claimInvoicePaid !== "function") {
-    return { ok: false, error: "store_missing", httpStatus: 503 };
+    const message = guestCardMessage({ error: "store_missing" });
+    return { ok: false, error: "store_missing", message, httpStatus: 503 };
   }
 
   const verified = await opts.loadInvoice(code);
@@ -603,11 +815,13 @@ export async function chargePayCode(opts = {}) {
         console.warn("releaseInvoicePaidClaim failed", e.message);
       }
     }
-    const err = sale.error;
+    const err = sale.error || "declined";
+    const message = sale.message || guestCardMessage(sale);
     return {
       ok: false,
       error: err,
-      blockedReason: sale.blockedReason,
+      message,
+      blockedReason: message || sale.blockedReason,
       httpStatus:
         err === "second_dba_pending"
           ? 403

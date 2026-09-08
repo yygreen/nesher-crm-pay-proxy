@@ -163,11 +163,32 @@ describe("renderOpenPayHtml", () => {
     assert.match(html, /alt="Nesher Travel"/);
     assert.match(html, /height="40"/);
     assert.match(html, /Pay with card/);
-    assert.match(html, /JSON\.stringify\(\{payment_token:token,amountUsd:amt\}\)/);
+    assert.match(html, /id="staff-name"/);
+    assert.match(html, /id="customer-name"/);
+    assert.match(html, /id="more-info"/);
+    assert.match(html, />Processor</);
+    assert.match(html, />Customer name</);
+    assert.match(html, />More info</);
+    assert.doesNotMatch(html, /id="staff-name"[^>]*required/);
+    assert.doesNotMatch(html, /id="customer-name"[^>]*required/);
+    assert.doesNotMatch(html, /id="more-info"[^>]*required/);
+    assert.match(html, /var payload=\{payment_token:token,amountUsd:amt\}/);
+    assert.match(html, /if\(customerName\) payload\.customerName=customerName/);
+    assert.match(html, /if\(staffName\) payload\.staffName=staffName/);
+    assert.match(html, /if\(notes\) payload\.notes=notes/);
+    assert.match(html, /JSON\.stringify\(payload\)/);
+    assert.match(html, /charAt\(0\)==="\{"/);
+    assert.match(html, /Nothing is wrong on our side/);
+    assert.match(html, /We're missing something: amount/);
+    assert.match(html, /We're missing something: card details/);
+    assert.match(html, /problem on our side/);
+    assert.doesNotMatch(html, /x\.j\.error/);
     assert.match(html, /fetch\("\/pay\/open\/charge"/);
     assert.doesNotMatch(html, /Card processed by/);
     assert.doesNotMatch(html, /Air Today Travel/);
     assert.doesNotMatch(html, /Your card statement shows/);
+    assert.doesNotMatch(html, /FLYNESHER\.COM/);
+    assert.doesNotMatch(html, /Stripe/i);
     assert.doesNotMatch(html, /Pay with bank/);
     assert.doesNotMatch(html, /mercury\.com/);
     assert.doesNotMatch(html, /JRM/);
@@ -252,6 +273,9 @@ describe("chargeOpenPay", () => {
     assert.equal(sale.lastBody().payment_details.payment_token, "tok_collect");
     assert.equal(sale.lastBody().order_details.id, "OPEN-20260908-test01");
     assert.equal(sale.lastBody().merchant_defined_fields.field_1, "nesher");
+    assert.equal(sale.lastBody().merchant_defined_fields.field_4, undefined);
+    assert.equal(sale.lastBody().merchant_defined_fields.field_5, undefined);
+    assert.equal(sale.lastBody().merchant_defined_fields.field_6, undefined);
     assert.equal(sale.lastBody().payment_descriptor, undefined);
     assert.equal(
       Object.prototype.hasOwnProperty.call(sale.lastBody(), "payment_descriptor"),
@@ -259,8 +283,63 @@ describe("chargeOpenPay", () => {
     );
     assert.doesNotMatch(JSON.stringify(sale.lastBody()), /payment_descriptor/);
     assert.doesNotMatch(JSON.stringify(sale.lastBody()), /NESHER-PAY|JRM-PAY/);
-    assert.equal(sale.lastBody().billing_address.email, undefined);
+    assert.doesNotMatch(JSON.stringify(sale.lastBody()), /Guest/);
+    assert.equal(sale.lastBody().billing_address, undefined);
     assert.match(NMI_HOST, /pinpointpayments/);
+  });
+
+  it("empty names still charge and do not invent Guest", async () => {
+    const sale = saleFetch();
+    const out = await chargeOpenPay({
+      amountUsd: 10,
+      paymentToken: "tok_collect",
+      invoiceNumber: "OPEN-20260908-blank1",
+      customerName: "",
+      staffName: "   ",
+      fetchImpl: sale.fetchImpl,
+    });
+    assert.equal(out.ok, true);
+    assert.equal(out.httpStatus, 200);
+    assert.equal(sale.calls(), 1);
+    const body = sale.lastBody();
+    assert.equal(body.merchant_defined_fields.field_4, undefined);
+    assert.equal(body.merchant_defined_fields.field_5, undefined);
+    assert.equal(body.merchant_defined_fields.field_6, undefined);
+    assert.equal(body.billing_address, undefined);
+    assert.doesNotMatch(JSON.stringify(body), /Guest/);
+    assert.doesNotMatch(JSON.stringify(body), /payment_descriptor/);
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(body, "payment_descriptor"),
+      false
+    );
+  });
+
+  it("names go to field_4 and field_5, never payment_descriptor", async () => {
+    const sale = saleFetch();
+    const out = await chargeOpenPay({
+      amountUsd: 12.5,
+      paymentToken: "tok_collect",
+      invoiceNumber: "OPEN-20260908-named1",
+      customerName: "Chaim Cohen",
+      staffName: "Sruly",
+      fetchImpl: sale.fetchImpl,
+    });
+    assert.equal(out.ok, true);
+    const body = sale.lastBody();
+    assert.equal(body.merchant_defined_fields.field_1, "nesher");
+    assert.equal(body.merchant_defined_fields.field_4, "Chaim Cohen");
+    assert.equal(body.merchant_defined_fields.field_5, "Sruly");
+    assert.equal(body.merchant_defined_fields.field_6, undefined);
+    assert.equal(body.billing_address.first_name, "Chaim");
+    assert.equal(body.billing_address.last_name, "Cohen");
+    assert.match(body.order_details.order_description, /Sruly/);
+    assert.equal(body.payment_descriptor, undefined);
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(body, "payment_descriptor"),
+      false
+    );
+    assert.doesNotMatch(JSON.stringify(body), /payment_descriptor/);
+    assert.doesNotMatch(JSON.stringify(body), /"descriptor"/);
   });
 
   it("rejects amount too small without hitting NMI", async () => {
@@ -276,6 +355,7 @@ describe("chargeOpenPay", () => {
     assert.equal(out.ok, false);
     assert.equal(out.error, "amount_too_small");
     assert.equal(out.httpStatus, 400);
+    assert.match(out.message, /missing something: amount/);
     assert.equal(called, 0);
   });
 
@@ -336,6 +416,58 @@ describe("chargeOpenPay", () => {
     });
     assert.equal(out.ok, false);
     assert.equal(out.error, "payment_token required");
+    assert.match(out.message, /missing something: card details/);
+  });
+
+  it("notes go to field_6 when provided", async () => {
+    const sale = saleFetch();
+    const out = await chargeOpenPay({
+      amountUsd: 12.5,
+      paymentToken: "tok_collect",
+      invoiceNumber: "OPEN-20260908-note1",
+      notes: "Window seat",
+      fetchImpl: sale.fetchImpl,
+    });
+    assert.equal(out.ok, true);
+    assert.equal(sale.lastBody().merchant_defined_fields.field_6, "Window seat");
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(sale.lastBody(), "payment_descriptor"),
+      false
+    );
+  });
+
+  it("Do Not Honor decline is a clear sentence, not JSON", async () => {
+    const hershy = {
+      object: "transaction",
+      id: "12532467411",
+      response: "2",
+      response_code: "201",
+      response_text: "Do Not Honor",
+      processor_response_code: "05",
+      processor_response_text: "DECLINE",
+    };
+    const out = await chargeOpenPay({
+      amountUsd: 4100,
+      paymentToken: "tok_collect",
+      invoiceNumber: "OPEN-20260908-c09c18",
+      fetchImpl: async () => ({
+        ok: true,
+        status: 200,
+        async text() {
+          return JSON.stringify(hershy);
+        },
+      }),
+    });
+    assert.equal(out.ok, false);
+    assert.equal(out.error, "declined");
+    assert.equal(out.httpStatus, 200);
+    assert.match(out.message, /Nothing is wrong on our side/);
+    assert.match(out.message, /Do Not Honor/);
+    assert.match(out.message, /Call the customer/);
+    assert.doesNotMatch(out.message, /"object"/);
+    assert.doesNotMatch(out.message, /12532467411/);
+    assert.doesNotMatch(out.message, /\{/);
+    assert.equal(out.blockedReason, out.message);
   });
 });
 
@@ -388,8 +520,13 @@ describe("CRM amount lock is unchanged", () => {
     const open = src.slice(openAt, captureAt);
     assert.match(open, /chargeOpenPay\(\{/);
     assert.match(open, /amountUsd:/);
+    assert.match(open, /customerName:/);
+    assert.match(open, /staffName:/);
+    assert.match(open, /notes:/);
+    assert.match(open, /guestFailBody/);
     assert.match(open, /openPayRequestAllowed\(req\.headers\)/);
     assert.doesNotMatch(open, /openPayHostForbidden/);
+    assert.doesNotMatch(open, /payment_descriptor/);
     assert.doesNotMatch(src, /NMI_JRM_DESCRIPTOR/);
   });
 });
@@ -400,7 +537,7 @@ describe("wiring", () => {
     assert.match(docker, /\bopen-pay\.js\b/);
     const src = fs.readFileSync(new URL("../server.js", import.meta.url), "utf8");
     assert.match(src, /from "\.\/open-pay\.js"/);
-    assert.match(src, /build: "2026-09-09-no-custom-descriptor"/);
+    assert.match(src, /build: "2026-09-09-open-guest-copy"/);
     assert.match(src, /isOpenPayPath\(url\.pathname\)/);
     assert.match(src, /openPayRequestAllowed\(req\.headers\)/);
     assert.match(src, /\/pay\/open/);

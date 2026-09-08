@@ -24,6 +24,12 @@ import {
   isShortPayCode,
   nmiPaidStaffNote,
   NMI_HOST,
+  guestCardMessage,
+  GUEST_DECLINE_DEFAULT,
+  GUEST_DECLINE_DO_NOT_HONOR,
+  GUEST_OURS,
+  GUEST_MISSING_AMOUNT,
+  GUEST_MISSING_CARD,
 } from "../nmi-card.js";
 
 const CARD_HOST = /pinpointpayments\.transactiongateway\.com/;
@@ -427,11 +433,87 @@ describe("chargeWithToken", () => {
     assert.equal(body.amount, "189.00");
     assert.equal(body.order_details.id, "JRM-189-O50");
     assert.equal(body.merchant_defined_fields.field_1, "jrm");
+    assert.equal(body.merchant_defined_fields.field_4, undefined);
+    assert.equal(body.merchant_defined_fields.field_5, undefined);
+    assert.equal(body.billing_address, undefined);
     assert.equal(body.payment_details.payment_token, "tok_collect");
     assert.equal(body.payment_descriptor, undefined);
     assert.equal(Object.prototype.hasOwnProperty.call(body, "payment_descriptor"), false);
     assert.doesNotMatch(captured.init.body, /payment_descriptor/);
     assert.doesNotMatch(captured.init.body, /JRM HOTELS/);
+    assert.doesNotMatch(captured.init.body, /Guest/);
+  });
+
+  it("maps customer and processor names to field_4 and field_5, never descriptor", async () => {
+    process.env.NMI_PRIVATE_KEY = "test-private-key";
+    let captured;
+    const fetchImpl = async (url, init) => {
+      captured = { url, init };
+      return {
+        ok: true,
+        status: 200,
+        async text() {
+          return JSON.stringify({ response: "1", id: "txn_names" });
+        },
+      };
+    };
+    const out = await chargeWithToken({
+      amountUsd: 10,
+      invoiceNumber: "OPEN-20260908-mdf",
+      kind: "open",
+      customerName: "Ada Lovelace",
+      staffName: "Sruly",
+      paymentToken: "tok_collect",
+      fetchImpl,
+    });
+    assert.equal(out.ok, true);
+    const body = JSON.parse(captured.init.body);
+    assert.equal(body.merchant_defined_fields.field_4, "Ada Lovelace");
+    assert.equal(body.merchant_defined_fields.field_5, "Sruly");
+    assert.equal(body.billing_address.first_name, "Ada");
+    assert.equal(body.billing_address.last_name, "Lovelace");
+    assert.match(body.order_details.order_description, /Sruly/);
+    assert.equal(body.merchant_defined_fields.field_6, undefined);
+    assert.equal(body.payment_descriptor, undefined);
+    assert.equal(Object.prototype.hasOwnProperty.call(body, "payment_descriptor"), false);
+    assert.doesNotMatch(captured.init.body, /payment_descriptor/);
+  });
+
+  it("maps More info to field_6 when provided, omitted when blank", async () => {
+    process.env.NMI_PRIVATE_KEY = "test-private-key";
+    let captured;
+    const fetchImpl = async (_url, init) => {
+      captured = init;
+      return {
+        ok: true,
+        status: 200,
+        async text() {
+          return JSON.stringify({ response: "1", id: "txn_notes" });
+        },
+      };
+    };
+    const out = await chargeWithToken({
+      amountUsd: 10,
+      invoiceNumber: "OPEN-20260908-note",
+      kind: "open",
+      notes: "Room 12, arriving Thursday",
+      paymentToken: "tok_collect",
+      fetchImpl,
+    });
+    assert.equal(out.ok, true);
+    const body = JSON.parse(captured.body);
+    assert.equal(body.merchant_defined_fields.field_6, "Room 12, arriving Thursday");
+    assert.equal(body.payment_descriptor, undefined);
+    const blank = await chargeWithToken({
+      amountUsd: 10,
+      invoiceNumber: "OPEN-20260908-note2",
+      kind: "open",
+      notes: "  ",
+      paymentToken: "tok_collect",
+      fetchImpl,
+    });
+    assert.equal(blank.ok, true);
+    assert.equal(JSON.parse(captured.body).merchant_defined_fields.field_6, undefined);
   });
 
   it("requires a payment token", async () => {
@@ -445,6 +527,125 @@ describe("chargeWithToken", () => {
     });
     assert.equal(out.ok, false);
     assert.equal(out.error, "payment_token required");
+    assert.equal(out.message, GUEST_MISSING_CARD);
+  });
+
+  it("Hershy Do Not Honor decline is a clear sentence, not JSON", async () => {
+    process.env.NMI_PRIVATE_KEY = "test-private-key";
+    const hershy = {
+      object: "transaction",
+      id: "12532467411",
+      response: "2",
+      response_code: "201",
+      response_text: "Do Not Honor",
+      processor_response_code: "05",
+      processor_response_text: "DECLINE",
+      cvv_response: "M",
+    };
+    const out = await chargeWithToken({
+      amountUsd: 4100,
+      invoiceNumber: "OPEN-20260908-c09c18",
+      kind: "open",
+      paymentToken: "tok_collect",
+      fetchImpl: async () => ({
+        ok: true,
+        status: 200,
+        async text() {
+          return JSON.stringify(hershy);
+        },
+      }),
+    });
+    assert.equal(out.ok, false);
+    assert.equal(out.error, "declined");
+    assert.equal(out.message, GUEST_DECLINE_DO_NOT_HONOR);
+    assert.match(out.message, /Nothing is wrong on our side/);
+    assert.match(out.message, /Do Not Honor/);
+    assert.match(out.message, /Call the customer/);
+    assert.doesNotMatch(out.message, /"object"/);
+    assert.doesNotMatch(out.message, /12532467411/);
+    assert.doesNotMatch(out.message, /\{/);
+    assert.equal(out.blockedReason, out.message);
+  });
+});
+
+describe("guestCardMessage", () => {
+  const hershy = {
+    object: "transaction",
+    id: "12532467411",
+    response: "2",
+    response_code: "201",
+    response_text: "Do Not Honor",
+    processor_response_code: "05",
+    processor_response_text: "DECLINE",
+    cvv_response: "M",
+  };
+
+  it("Hershy JSON → Do Not Honor sentence, no dump", () => {
+    const msg = guestCardMessage(hershy);
+    assert.equal(msg, GUEST_DECLINE_DO_NOT_HONOR);
+    assert.match(msg, /Nothing is wrong on our side/);
+    assert.match(msg, /Do Not Honor/);
+    assert.match(msg, /Call the customer/);
+    assert.doesNotMatch(msg, /"object"/);
+    assert.doesNotMatch(msg, /12532467411/);
+    assert.doesNotMatch(msg, /\{/);
+  });
+
+  it("insufficient funds fixture names that", () => {
+    const msg = guestCardMessage({
+      response: "2",
+      response_text: "Insufficient funds",
+    });
+    assert.match(msg, /Nothing is wrong on our side/);
+    assert.match(msg, /insufficient funds/i);
+    assert.match(msg, /Call the customer/);
+    assert.doesNotMatch(msg, /\{/);
+  });
+
+  it("expired card fixture names that", () => {
+    const msg = guestCardMessage({ response_text: "Expired card" });
+    assert.match(msg, /Nothing is wrong on our side/);
+    assert.match(msg, /expired/i);
+    assert.doesNotMatch(msg, /\{/);
+  });
+
+  it("pickup / stolen stays generic not-us, no stolen word", () => {
+    const msg = guestCardMessage({ response_text: "Pick up card" });
+    assert.equal(msg, GUEST_DECLINE_DEFAULT);
+    assert.match(msg, /Nothing is wrong on our side/);
+    assert.doesNotMatch(msg, /stolen|pick up/i);
+  });
+
+  it("JSON-only body → not-us default, no brace", () => {
+    const raw = JSON.stringify(hershy);
+    const msg = guestCardMessage(raw);
+    assert.equal(msg, GUEST_DECLINE_DEFAULT);
+    assert.match(msg, /Nothing is wrong on our side/);
+    assert.doesNotMatch(msg, /\{/);
+    assert.doesNotMatch(msg, /12532467411/);
+    assert.doesNotMatch(msg, /"object"/);
+  });
+
+  it("keys_missing and 410 are our side", () => {
+    assert.equal(guestCardMessage({ error: "keys_missing" }), GUEST_OURS);
+    assert.equal(guestCardMessage({ response_code: "410" }), GUEST_OURS);
+    assert.equal(guestCardMessage({ httpStatus: 500 }), GUEST_OURS);
+    assert.match(GUEST_OURS, /problem on our side/);
+    assert.doesNotMatch(GUEST_OURS, /\{/);
+  });
+
+  it("amount_required and payment_token required are missing", () => {
+    assert.equal(
+      guestCardMessage({ error: "amount_required" }),
+      GUEST_MISSING_AMOUNT
+    );
+    assert.equal(
+      guestCardMessage({ error: "payment_token required" }),
+      GUEST_MISSING_CARD
+    );
+    assert.match(GUEST_MISSING_AMOUNT, /amount/);
+    assert.match(GUEST_MISSING_CARD, /card details/);
+    assert.doesNotMatch(GUEST_MISSING_AMOUNT, /\{/);
   });
 });
 
@@ -843,7 +1044,7 @@ describe("chargePayCode", () => {
   it("mint JSON and guest charge live on the brand website origin", () => {
     const src = fs.readFileSync(new URL("../server.js", import.meta.url), "utf8");
     assert.match(src, /guestPayOrigin\(/);
-    assert.match(src, /build: "2026-09-09-no-custom-descriptor"/);
+    assert.match(src, /build: "2026-09-09-open-guest-copy"/);
     assert.doesNotMatch(
       src.slice(src.indexOf("const stored = await storeInvoice"), src.indexOf("const shareUrl")),
       /publicHostFor\(req\)/
@@ -860,6 +1061,8 @@ describe("chargePayCode", () => {
     assert.doesNotMatch(charge, /body\.amount/);
     assert.doesNotMatch(charge, /amountUsd:/);
     assert.match(charge, /chargePayCode\(\{/);
+    assert.match(charge, /guestFailBody/);
+    assert.doesNotMatch(charge, /blockedReason \|\| result\.error/);
   });
 
   it("releases the paidAt claim when the NMI sale fails", async () => {

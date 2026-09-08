@@ -15,6 +15,7 @@ import {
   isShortPayCode,
   brandFromKind,
   guestPayOrigin,
+  guestCardMessage,
 } from "./nmi-card.js";
 import {
   nmiWebhookSecret,
@@ -197,6 +198,19 @@ function readJson(req) {
     });
     req.on("error", reject);
   });
+}
+
+function guestFailBody(result = {}) {
+  const error = result.error || "declined";
+  let message = String(result.message || "").trim();
+  if (
+    !message ||
+    message.startsWith("{") ||
+    message.includes('"object"')
+  ) {
+    message = guestCardMessage(result);
+  }
+  return { ok: false, error, message };
 }
 
 function sendJson(res, status, obj) {
@@ -1060,6 +1074,13 @@ const server = http.createServer(async (req, res) => {
           openBody.token ||
           "",
         amountUsd: openBody.amountUsd,
+        customerName: openBody.customerName || openBody.customer_name || "",
+        staffName:
+          openBody.staffName ||
+          openBody.staff_name ||
+          openBody.processor ||
+          "",
+        notes: openBody.notes || openBody.moreInfo || openBody.more_info || "",
         kind: "open",
       });
       if (openResult.ok) {
@@ -1069,11 +1090,7 @@ const server = http.createServer(async (req, res) => {
         });
         return;
       }
-      sendJson(res, openResult.httpStatus || 200, {
-        ok: false,
-        error: openResult.error,
-        message: openResult.blockedReason || openResult.error,
-      });
+      sendJson(res, openResult.httpStatus || 200, guestFailBody(openResult));
       return;
     }
     if ((req.method || "GET") !== "GET") {
@@ -1121,11 +1138,7 @@ const server = http.createServer(async (req, res) => {
       });
       return;
     }
-    sendJson(res, result.httpStatus || 200, {
-      ok: false,
-      error: result.error,
-      message: result.blockedReason || result.error,
-    });
+    sendJson(res, result.httpStatus || 200, guestFailBody(result));
     return;
   }
 
@@ -1177,7 +1190,7 @@ const server = http.createServer(async (req, res) => {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-09-09-no-custom-descriptor",
+      build: "2026-09-09-open-guest-copy",
       snapEngage: {
         enabled: SNAPENGAGE_ENABLED,
         widgetId: SNAPENGAGE_WIDGET_ID,

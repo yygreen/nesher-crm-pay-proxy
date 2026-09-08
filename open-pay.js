@@ -1,7 +1,9 @@
 /**
  * Nesher open-amount guest card page.
- * Staff paste https://www.flynesher.com/pay/open — the guest types USD, then
- * Collect.js tokenizes, then POST /pay/open/charge {payment_token, amountUsd}.
+ * Staff paste https://www.flynesher.com/pay/open — amount + optional Processor,
+ * Customer name, and More info, then Collect.js tokenizes, then POST
+ * /pay/open/charge {payment_token, amountUsd, customerName?, staffName?, notes?}.
+ * Empty records omitted. Decline copy is guestCardMessage, never raw JSON.
  *
  * Not the CRM-priced /pay/<8-char> path (that amount stays store-locked).
  * Not JRM. Not Collect Checkout customPayment. No Mercury mint (no amount
@@ -13,6 +15,12 @@ import {
   chargeWithToken,
   collectScriptUrl,
   looksLikePan,
+  recordName,
+  guestCardMessage,
+  GUEST_DECLINE_DEFAULT,
+  GUEST_OURS,
+  GUEST_MISSING_AMOUNT,
+  GUEST_MISSING_CARD,
 } from "./nmi-card.js";
 
 export const OPEN_PAY_PATH = "/pay/open";
@@ -176,54 +184,94 @@ function httpStatusFor(error) {
     return 403;
   }
   if (error === "keys_missing") return 503;
-  if (String(error || "").startsWith("nmi_sale_")) return 200;
+  if (
+    error === "declined" ||
+    error === "processor_error" ||
+    String(error || "").startsWith("nmi_sale_")
+  ) {
+    return 200;
+  }
   return 200;
 }
 
 /**
  * Open-amount capture. Amount comes from the guest POST (validated here).
  * CRM /pay/:code/charge must keep ignoring body.amount — this is the only
- * route that reads amountUsd from the client.
+ * route that reads amountUsd from the client. Processor / customer names
+ * are optional records (NMI field_4 / field_5 / field_6) — never a charge
+ * gate, never payment_descriptor, never invented as "Guest".
  */
 export async function chargeOpenPay(opts = {}) {
   const kind = String(opts.kind || "open").toLowerCase();
   const brandId = String(opts.brandId || "").toLowerCase();
   if (brandId === "jrm" || kind === "hotel" || kind === "hotel-offer") {
-    return { ok: false, error: "jrm_not_supported", httpStatus: 403 };
+    const message = guestCardMessage({ error: "keys_missing" });
+    return { ok: false, error: "jrm_not_supported", message, httpStatus: 403 };
   }
   const parsed = parseOpenAmountUsd(opts.amountUsd);
   if (!parsed.ok) {
-    return { ok: false, error: parsed.error, httpStatus: 400 };
+    const message = guestCardMessage({ error: parsed.error });
+    return {
+      ok: false,
+      error: parsed.error,
+      message,
+      httpStatus: 400,
+    };
   }
   const token = String(opts.paymentToken || "").trim();
   if (looksLikePan(token)) {
-    return { ok: false, error: "raw_card_rejected", httpStatus: 400 };
+    const message = guestCardMessage({ error: "raw_card_rejected" });
+    return {
+      ok: false,
+      error: "raw_card_rejected",
+      message,
+      httpStatus: 400,
+    };
   }
   if (!token) {
-    return { ok: false, error: "payment_token required", httpStatus: 400 };
+    const message = guestCardMessage({ error: "payment_token required" });
+    return {
+      ok: false,
+      error: "payment_token required",
+      message,
+      httpStatus: 400,
+    };
   }
   const invoiceNumber = String(
     opts.invoiceNumber || mintOpenInvoiceNumber()
   ).trim();
   if (!/^OPEN-/i.test(invoiceNumber)) {
-    return { ok: false, error: "open_ref_required", httpStatus: 400 };
+    const message = guestCardMessage({ error: "open_ref_required" });
+    return {
+      ok: false,
+      error: "open_ref_required",
+      message,
+      httpStatus: 400,
+    };
   }
+  const customerName = recordName(opts.customerName);
+  const staffName = recordName(opts.staffName);
+  const notes = recordName(opts.notes || opts.moreInfo, 255);
   const sale = await chargeWithToken({
     amountUsd: parsed.amountUsd,
     invoiceNumber,
     kind: "open",
-    customerName: opts.customerName || "Guest",
+    ...(customerName ? { customerName } : {}),
+    ...(staffName ? { staffName } : {}),
+    ...(notes ? { notes } : {}),
     summary: opts.summary || "Open amount",
     paymentToken: token,
     fetchImpl: opts.fetchImpl,
     privateKey: opts.privateKey,
   });
   if (!sale.ok) {
-    const err = sale.error || "nmi_sale_failed";
+    const err = sale.error || "declined";
+    const message = sale.message || guestCardMessage(sale);
     return {
       ok: false,
       error: err,
-      blockedReason: sale.blockedReason,
+      message,
+      blockedReason: message || sale.blockedReason,
       httpStatus: httpStatusFor(err),
     };
   }
@@ -276,8 +324,12 @@ function renderCollectJsForm(collectKey) {
         function showErr(m){
           var e=document.getElementById("card-err");
           if(!e) return;
+          var s=String(m||"").trim();
+          if(!s || s.charAt(0)==="{" || s.indexOf('"object"')>=0){
+            s=${JSON.stringify(GUEST_DECLINE_DEFAULT)};
+          }
           e.hidden=false;
-          e.textContent=m;
+          e.textContent=s;
         }
         function readAmt(){
           var el=document.getElementById("amount-usd");
@@ -287,6 +339,12 @@ function renderCollectJsForm(collectKey) {
           var n=Number(v);
           if(!isFinite(n)||n<1||n>25000) return null;
           return n;
+        }
+        function readName(id,max){
+          var el=document.getElementById(id);
+          if(!el) return "";
+          var n=max||80;
+          return String(el.value||"").replace(/[\\r\\n\\t]+/g," ").trim().slice(0,n);
         }
         function go(){
           if(!window.CollectJS) return;
@@ -307,13 +365,20 @@ function renderCollectJsForm(collectKey) {
               var token=response&&response.token;
               var btn=document.getElementById("pay-card-btn");
               var amt=readAmt();
-              if(!token){showErr("Card could not be tokenized. Try again.");return;}
-              if(amt==null){showErr("Enter an amount between $1.00 and $25,000.00.");return;}
+              if(!token){showErr(${JSON.stringify(GUEST_MISSING_CARD)});return;}
+              if(amt==null){showErr(${JSON.stringify(GUEST_MISSING_AMOUNT)});return;}
+              var payload={payment_token:token,amountUsd:amt};
+              var customerName=readName("customer-name");
+              var staffName=readName("staff-name");
+              var notes=readName("more-info",255);
+              if(customerName) payload.customerName=customerName;
+              if(staffName) payload.staffName=staffName;
+              if(notes) payload.notes=notes;
               if(btn) btn.disabled=true;
               fetch("/pay/open/charge",{
                 method:"POST",
                 headers:{"Content-Type":"application/json"},
-                body:JSON.stringify({payment_token:token,amountUsd:amt})
+                body:JSON.stringify(payload)
               }).then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j};});})
               .then(function(x){
                 if(x.j&&x.j.ok){
@@ -323,11 +388,11 @@ function renderCollectJsForm(collectKey) {
                   if(form) form.innerHTML="<p class='hint'>Card payment received. Thank you.</p>";
                 } else {
                   if(btn) btn.disabled=false;
-                  showErr((x.j&&(x.j.message||x.j.error))||"Card was declined. Try another card.");
+                  showErr((x.j&&x.j.message)||${JSON.stringify(GUEST_DECLINE_DEFAULT)});
                 }
               }).catch(function(){
                 if(btn) btn.disabled=false;
-                showErr("Could not reach the card processor. Try again.");
+                showErr(${JSON.stringify(GUEST_OURS)});
               });
             }
           });
@@ -377,6 +442,22 @@ export function renderOpenPayHtml(data = {}) {
     .logo { margin: 0 0 22px; }
     .logo img { display: block; height: 40px; width: auto; }
     .label { font-size: 13px; color: #888; margin: 0 0 6px; }
+    .meta-field { margin: 12px 0 0; }
+    .meta-field input {
+      width: 100%; font-size: 15px; font-family: inherit; color: #111;
+      border: 1px solid #D8DEE4; border-radius: 10px; padding: 10px 12px;
+      background: #fff;
+    }
+    .meta-field input:focus, .meta-field textarea:focus {
+      outline: none; border-color: #3D7A99;
+      box-shadow: 0 0 0 3px rgba(61,122,153,.18);
+    }
+    .meta-field textarea {
+      width: 100%; min-height: 64px; resize: vertical;
+      font-size: 15px; font-family: inherit; color: #111;
+      border: 1px solid #D8DEE4; border-radius: 10px; padding: 10px 12px;
+      background: #fff;
+    }
     .amount-row {
       display: flex; align-items: center; gap: 8px; margin: 0 0 8px;
     }
@@ -438,6 +519,18 @@ export function renderOpenPayHtml(data = {}) {
       <div class="amount-row">
         <span class="amount-prefix">$</span>
         <input id="amount-usd" type="number" inputmode="decimal" min="1" max="25000" step="0.01" autocomplete="off" />
+      </div>
+      <div class="meta-field">
+        <p class="label">Processor</p>
+        <input id="staff-name" type="text" maxlength="80" autocomplete="off" />
+      </div>
+      <div class="meta-field">
+        <p class="label">Customer name</p>
+        <input id="customer-name" type="text" maxlength="80" autocomplete="name" />
+      </div>
+      <div class="meta-field">
+        <p class="label">More info</p>
+        <textarea id="more-info" maxlength="255" rows="2"></textarea>
       </div>
     </div>
     <div class="line"></div>
