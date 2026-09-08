@@ -46,6 +46,7 @@ import {
   claimNmiNote,
 } from "./invoice-store.js";
 import { injectPayButtons, injectPaidBadges } from "./inject.js";
+import { stripStripeUi } from "./strip-stripe.js";
 import { injectWhatsAppUi } from "./whatsapp-ui.js";
 import { injectIntakeUi, INTAKE_UI_PATH_RE, loadIntakeFeed } from "./intake-ui.js";
 import {
@@ -64,6 +65,8 @@ import {
   loadHotelPayContext,
   loadHotelOfferPayContext,
   loadReservationPayContext,
+  loadCustomerPayContext,
+  loadCustomerPayTarget,
   appendHotelNote,
   appendReservationNote,
 } from "./db.js";
@@ -72,6 +75,7 @@ import { validateStaffSession, extractSessionId } from "./auth.js";
 import {
   buildReservationDraft,
   buildHotelDraft,
+  buildCustomerDraft,
   mercuryOptsFromDraft,
 } from "./draft.js";
 import {
@@ -274,6 +278,7 @@ async function handlePayApi(req, res, kind, id, query) {
 
     let draftBundle;
     let ctx;
+    let mintKind = kind;
 
     if (kind === "hotel-offer") {
       ctx = await loadHotelOfferPayContext(id);
@@ -285,22 +290,51 @@ async function handlePayApi(req, res, kind, id, query) {
     } else if (kind === "reservation") {
       ctx = await loadReservationPayContext(id);
       draftBundle = buildReservationDraft(ctx, overrides);
+    } else if (kind === "customer") {
+      const target = await loadCustomerPayTarget(id);
+      if (target.kind === "reservation") {
+        mintKind = "reservation";
+        ctx = await loadReservationPayContext(target.id);
+        draftBundle = buildReservationDraft(ctx, overrides);
+      } else if (target.kind === "hotel-offer") {
+        mintKind = "hotel-offer";
+        ctx = await loadHotelOfferPayContext(target.id);
+        ctx.resolution = "explicit_offer";
+        draftBundle = await buildHotelDraft(ctx, overrides);
+      } else {
+        mintKind = "customer";
+        ctx = await loadCustomerPayContext(id);
+        draftBundle = buildCustomerDraft(ctx, overrides);
+      }
     } else {
       sendJson(res, 404, { error: "Unknown kind" });
       return;
     }
+
+    const payFamily =
+      mintKind === "reservation"
+        ? "reservation"
+        : mintKind === "customer"
+          ? "customer"
+          : "hotel";
+    const recordId =
+      mintKind === "reservation"
+        ? ctx.reservation?.id
+        : mintKind === "customer"
+          ? ctx.customer?.id
+          : ctx.request?.id;
 
     // GET always previews. POST with create:false previews. Otherwise try create (soft if incomplete).
     const wantsCreate =
       req.method === "POST" && body.create !== false && query.get("create") !== "0";
 
     if (req.method === "GET" || !wantsCreate) {
-      const previewBrand = brandFromKind(kind, draftBundle.draft.invoiceNumber);
+      const previewBrand = brandFromKind(mintKind, draftBundle.draft.invoiceNumber);
       sendJson(res, 200, {
         ok: true,
         preview: true,
         ...draftBundle,
-        kind: kind === "reservation" ? "reservation" : "hotel",
+        kind: payFamily,
         brand: { id: previewBrand.id, name: previewBrand.name },
         guestOrigin: guestPayOrigin(previewBrand),
         cardBlockedReason: descriptorFor(previewBrand)
@@ -360,7 +394,7 @@ async function handlePayApi(req, res, kind, id, query) {
       cardMint = await mintCardCheckout({
         amountUsd: d.amountUsd,
         invoiceNumber: d.invoiceNumber,
-        kind,
+        kind: mintKind,
         customerName: d.customerName,
         customerEmail: d.customerEmail,
         summary: d.summary || d.lineItemName,
@@ -391,12 +425,11 @@ async function handlePayApi(req, res, kind, id, query) {
         cardUrl: hostedCard ? cardMint.cardUrl : "",
         capture: cardMint.capture || (hostedCard ? "invoice" : ""),
         brandId: cardMint.brand?.id || "",
-        kind: kind === "reservation" ? "reservation" : "hotel",
-        recordId:
-          kind === "reservation" ? ctx.reservation?.id : ctx.request?.id,
+        kind: payFamily,
+        recordId,
       });
       const origin = guestPayOrigin(
-        cardMint.brand || brandFromKind(kind, d.invoiceNumber)
+        cardMint.brand || brandFromKind(mintKind, d.invoiceNumber)
       );
       if (stored.ok && stored.code) {
         combinedPayUrl = buildCombinedPayUrl(origin, stored.code);
@@ -430,7 +463,7 @@ async function handlePayApi(req, res, kind, id, query) {
             ? ` | card skipped (${cardMint.error})`
             : "";
       const note = `[Automated Mercury] ${result.updated ? "Updated" : result.reused ? "Reused" : "Created"} invoice ${shareUrl} | mercury ${result.payUrl}${cardBit} | ${d.summary} | ${d.invoiceNumber} | ${paymentMethodsLabel}${ph}`;
-      if (kind === "reservation") {
+      if (mintKind === "reservation" && ctx.reservation?.id) {
         await appendReservationNote(ctx.reservation.id, note);
       } else if (ctx.request?.id) {
         await appendHotelNote(ctx.request.id, note);
@@ -454,7 +487,7 @@ async function handlePayApi(req, res, kind, id, query) {
         ? { id: cardMint.brand.id, name: cardMint.brand.name }
         : null,
       guestOrigin: guestPayOrigin(
-        cardMint.brand || brandFromKind(kind, d.invoiceNumber)
+        cardMint.brand || brandFromKind(mintKind, d.invoiceNumber)
       ),
       agentPaste: paste,
       invoiceNumber: draftBundle.draft.invoiceNumber,
@@ -772,15 +805,24 @@ function proxyWithInject(req, res) {
   const pathOnly = (req.url || "/").split("?")[0];
   // Pages that get the pay modal / WhatsApp UI / PAID badges (these injectors are NOT path-gated
   // themselves — keep this set tight; see the 8/12 outage note in memory).
+  // /customers/ list + /customers/<id>/ detail only — not add/edit/delete.
   const staffCore =
     /^\/jrm\/hotels(\/|$)/.test(pathOnly) ||
     /^\/reservations(\/|$)/.test(pathOnly) ||
     /^\/whatsapp(\/|$)/.test(pathOnly) ||
+    /^\/customers\/?$/.test(pathOnly) ||
     /^\/customers\/\d+\/?$/.test(pathOnly);
+  const stripeFormPath =
+    /\/payments?(\/|$)/i.test(pathOnly) ||
+    /^\/(organizations|customer-payments|customer-ledger-payments)(\/|$)/.test(
+      pathOnly
+    );
   const shouldInject =
     staffCore ||
     // wider staff surface: only the JRM Inbox bell/badge is injected here
     INTAKE_UI_PATH_RE.test(pathOnly) ||
+    // payment forms that carry the dead Stripe include (not staffCore)
+    stripeFormPath ||
     // public marketing pages — SnapEngage live chat
     isPublicMarketingPath(pathOnly);
 
@@ -839,6 +881,8 @@ function proxyWithInject(req, res) {
             // pages — injectPayButtons has no path gate of its own and would
             // drop the internal payment-link modal onto flynesher.com.
             if (!isPublicMarketingPath(pathOnly)) {
+              // Stripe is dead — drop the Django include from every staff page.
+              injected = stripStripeUi(injected);
               if (staffCore) {
                 injected = injectPayButtons(injected, pathOnly);
                 injected = injectWhatsAppUi(injected, pathOnly);
@@ -853,6 +897,7 @@ function proxyWithInject(req, res) {
             } else if (looksLikeStaffPage(text)) {
               // "/" is a public marketing path for visitors but the CRM dashboard for a
               // logged-in agent — decide on the ORIGINAL upstream HTML.
+              injected = stripStripeUi(injected);
               injected = injectIntakeUi(injected, pathOnly, { staffCheckHtml: text });
             }
             // Staff-page check reads the ORIGINAL upstream HTML: the injectors
@@ -1115,7 +1160,7 @@ const server = http.createServer(async (req, res) => {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-09-08-pay-add-link",
+      build: "2026-09-08-customer-pay",
       snapEngage: {
         enabled: SNAPENGAGE_ENABLED,
         widgetId: SNAPENGAGE_WIDGET_ID,
@@ -1405,7 +1450,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   const payMatch = url.pathname.match(
-    /^\/__nesher_pay\/(hotel-offer|hotel|reservation)\/(\d+)\/?$/
+    /^\/__nesher_pay\/(hotel-offer|hotel|reservation|customer)\/(\d+)\/?$/
   );
   if (payMatch) {
     await handlePayApi(req, res, payMatch[1], payMatch[2], url.searchParams);

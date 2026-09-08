@@ -4,6 +4,7 @@
  */
 
 export const BUTTON_MARKER = "data-nesher-mercury-pay";
+export { stripStripeUi } from "./strip-stripe.js";
 
 const CSS = `
 <style id="nesher-mercury-pay-css">
@@ -452,7 +453,21 @@ const SCRIPT = `
     if (kind === "hotel-offer") return "/__nesher_pay/hotel-offer/" + id + "/";
     if (kind === "hotel") return "/__nesher_pay/hotel/" + id + "/";
     if (kind === "reservation") return "/__nesher_pay/reservation/" + id + "/";
+    if (kind === "customer") return "/__nesher_pay/customer/" + id + "/";
     return null;
+  }
+
+  function kindLabelOf(kind) {
+    if (kind === "reservation") return "Reservation";
+    if (kind === "customer") return "Customer";
+    if (kind === "hotel" || kind === "hotel-offer") return "Hotel";
+    return "";
+  }
+
+  function familyOf(kind) {
+    if (kind === "reservation") return "reservation";
+    if (kind === "customer") return "customer";
+    return "hotel";
   }
 
   var ICON_WARN = '<svg class="ic" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>';
@@ -622,7 +637,7 @@ const SCRIPT = `
 
   function subFor(data, statusChip) {
     var draft = data.draft || {};
-    var kindLabel = data.kind === "hotel" ? "Hotel" : (data.kind === "reservation" ? "Reservation" : "");
+    var kindLabel = kindLabelOf(data.kind);
     var amt = Number(draft.amountUsd) > 0 ? money(draft.amountUsd) : "amount TBD";
     var mid = [];
     var ref = bookingRef(data);
@@ -736,7 +751,7 @@ const SCRIPT = `
     root.querySelector(".nesher-pay-panel").classList.remove("success");
     modalState.success = null;
     document.getElementById("nesher-pay-title").textContent = "Create payment link";
-    var kindLabel = kind === "reservation" ? "Reservation" : "Hotel";
+    var kindLabel = kindLabelOf(kind);
     setSub('<span class="nesher-chip mut">' + esc(kindLabel) + "</span><span>Loading booking details\\u2026</span>");
     document.getElementById("nesher-pay-body").innerHTML =
       '<div class="nesher-skel lg"></div><div class="nesher-skel md"></div>' +
@@ -930,7 +945,7 @@ const SCRIPT = `
 
     document.getElementById("nesher-pay-title").textContent = "Ready to send";
     setSub(subFor(
-      { kind: data.kind || (modalState.kind === "reservation" ? "reservation" : "hotel"), draft: draft },
+      { kind: data.kind || familyOf(modalState.kind), draft: draft },
       '<span class="nesher-chip ok">Copied</span>'
     ));
 
@@ -1138,7 +1153,7 @@ const SCRIPT = `
       if (modalStillOn(kind, id)) {
         // Open a manual-entry form so staff can still create a link
         renderModal({
-          kind: kind === "reservation" ? "reservation" : "hotel",
+          kind: familyOf(kind),
           needsInput: true,
           advice: [
             "Could not fully load CRM details (" + msg + "). Enter amount and email below to create a payment link anyway."
@@ -1151,7 +1166,7 @@ const SCRIPT = `
             customerName: "Customer",
             customerEmail: "",
             amountUsd: 0,
-            invoiceNumber: kind === "reservation" ? ("RES-ID" + id) : ("JRM-1" + id),
+            invoiceNumber: kind === "reservation" ? ("RES-ID" + id) : (kind === "customer" ? ("CUST-" + id) : ("JRM-1" + id)),
             lineItemName: "Payment",
             payerMemo: "",
             lineItems: []
@@ -1305,6 +1320,43 @@ export function injectPayButtons(html, path) {
     );
   }
 
+  // Customer detail: one button on the name / action bar. API prefers an
+  // unpaid reservation or hotel quote, else a person-attached Nesher link.
+  const custDetail = p.match(/^\/customers\/(\d+)\/?$/);
+  if (custDetail) {
+    const id = custDetail[1];
+    const btn = buttonHtml("customer", id, "Mercury Pay Link");
+    if (/customers\/\d+\/payment\/add\//i.test(out)) {
+      out = out.replace(
+        /(<a[^>]+href="\/customers\/\d+\/payment\/add\/"[^>]*>[\s\S]*?<\/a>)/i,
+        (full) => `${full} ${btn}`
+      );
+    } else {
+      out = out.replace(/<\/h1>/i, () => `</h1> ${btn}`);
+      if (!out.includes(BUTTON_MARKER)) {
+        out = out.replace(/<\/body>/i, () => `${btn}</body>`);
+      }
+      if (!out.includes(BUTTON_MARKER)) {
+        out = out + btn;
+      }
+    }
+  }
+
+  // Customer list: next to the name cell only (not View / Edit / Delete).
+  if (/^\/customers\/?$/.test(p)) {
+    out = out.replace(
+      /(<a[^>]*href="\/customers\/(\d+)\/"[^>]*>)([\s\S]*?)(<\/a>)/gi,
+      (full, open, id, text, close) => {
+        if (full.includes(BUTTON_MARKER)) return full;
+        if (/\bact-btn\b/i.test(open)) return full;
+        if (/\/(edit|delete|payment|statement|services|commission)/i.test(open)) {
+          return full;
+        }
+        return `${open}${text}${close} ${buttonHtml("customer", id, "Pay due")}`;
+      }
+    );
+  }
+
   // Replacer functions so "$"-sequences inside CSS/SCRIPT are never
   // interpreted as String.replace substitution patterns.
   if (!out.includes("nesher-mercury-pay-css")) {
@@ -1442,5 +1494,6 @@ export async function injectPaidBadges(html, path, pool) {
   }
   return html;
 }
+
 
 export { buttonHtml, CSS, SCRIPT };

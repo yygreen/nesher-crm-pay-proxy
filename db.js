@@ -393,6 +393,116 @@ export async function loadReservationPayContext(reservationId) {
   };
 }
 
+function roundUsd(n) {
+  return Math.round(Number(n) * 100) / 100;
+}
+
+/**
+ * Pure pick: unpaid reservation first (Nesher card+bank), then unpaid JRM
+ * hotel offer (bank only until second DBA), else the person themselves.
+ */
+export function pickUnpaidCustomerPayTarget({
+  customerId,
+  reservations = [],
+  hotelOffers = [],
+} = {}) {
+  const cid = Number(customerId);
+  for (const r of reservations) {
+    const header = Number(r.customer_price) || 0;
+    const journey = Number(r.journey_sum) || 0;
+    const price = header > 0 ? header : journey;
+    const paid = Number(r.amount_paid) || 0;
+    const due = roundUsd(price - paid);
+    if (due > 0.01 && Number(r.id) > 0) {
+      return {
+        kind: "reservation",
+        id: Number(r.id),
+        customerId: cid > 0 ? cid : null,
+        amountUsd: due,
+      };
+    }
+  }
+  for (const o of hotelOffers) {
+    const price = Number(o.customer_price) || 0;
+    const paid = Number(o.paid) || 0;
+    const due = roundUsd(price - paid);
+    const offerId = Number(o.offer_id || o.id);
+    if (due > 0.01 && offerId > 0) {
+      return {
+        kind: "hotel-offer",
+        id: offerId,
+        requestId: Number(o.request_id) || null,
+        customerId: cid > 0 ? cid : null,
+        amountUsd: due,
+      };
+    }
+  }
+  return {
+    kind: "customer",
+    id: cid > 0 ? cid : null,
+    customerId: cid > 0 ? cid : null,
+    amountUsd: 0,
+  };
+}
+
+export async function loadCustomerPayContext(customerId) {
+  const p = getPool();
+  const id = Number(customerId);
+  if (!Number.isFinite(id) || id <= 0) throw new Error("Invalid customer id");
+  const r = await p.query(
+    `SELECT id, full_name, email, phone FROM core_customer WHERE id = $1`,
+    [id]
+  );
+  if (!r.rows.length) throw new Error(`Customer ${id} not found`);
+  return { customer: r.rows[0] };
+}
+
+/**
+ * Prefer an unpaid reservation or JRM hotel quote for this CRM person.
+ * Soft: a missing table/column returns the person-only target.
+ */
+export async function loadCustomerPayTarget(customerId) {
+  const id = Number(customerId);
+  if (!Number.isFinite(id) || id <= 0) throw new Error("Invalid customer id");
+  const reservations = await softQuery(
+    `SELECT res.id,
+            COALESCE(res.customer_price, 0) AS customer_price,
+            COALESCE(res.amount_paid, 0) AS amount_paid,
+            COALESCE((
+              SELECT SUM(j.customer_price) FROM core_journey j
+              WHERE j.reservation_id = res.id
+            ), 0) AS journey_sum
+     FROM core_reservation res
+     WHERE res.customer_id = $1
+       AND COALESCE(res.is_closed, false) = false
+     ORDER BY res.id DESC
+     LIMIT 20`,
+    [id]
+  );
+  const hotelOffers = await softQuery(
+    `SELECT o.id AS offer_id, o.id, r.id AS request_id,
+            o.customer_price::numeric AS customer_price,
+            COALESCE((
+              SELECT SUM(p.amount) FROM core_jrmhotelpayment p
+              WHERE p.request_id = r.id
+                AND UPPER(TRIM(COALESCE(p.currency, ''))) IN ('USD','US$','$')
+            ), 0) AS paid
+     FROM core_jrmhoteloffer o
+     JOIN core_jrmhotelrequest r ON r.id = o.request_id
+     WHERE r.customer_id = $1
+       AND o.customer_price IS NOT NULL
+       AND o.customer_price::numeric > 0
+     ORDER BY o.id DESC
+     LIMIT 20`,
+    [id]
+  );
+  return pickUnpaidCustomerPayTarget({
+    customerId: id,
+    reservations,
+    hotelOffers,
+  });
+}
+
 export async function appendHotelNote(requestId, note, userId = null) {
   const p = getPool();
   await p.query(

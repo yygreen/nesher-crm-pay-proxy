@@ -40,6 +40,8 @@ describe("brand + descriptor mapping", () => {
     assert.equal(brandFromInvoiceNumber("FLY-12").id, "nesher");
     assert.equal(brandFromKind("reservation", "RES-9FSGMN").sku, "NESHER-PAY");
     assert.equal(brandFromKind("reservation", "FLY-12").id, "nesher");
+    assert.equal(brandFromKind("customer", "CUST-12").id, "nesher");
+    assert.equal(guestPayOrigin(brandFromKind("customer", "CUST-12")), "https://www.flynesher.com");
   });
 
   it("blocks JRM card mint until a second descriptor is configured", () => {
@@ -739,7 +741,7 @@ describe("chargePayCode", () => {
   it("mint JSON and guest charge live on the brand website origin", () => {
     const src = fs.readFileSync(new URL("../server.js", import.meta.url), "utf8");
     assert.match(src, /guestPayOrigin\(/);
-    assert.match(src, /build: "2026-09-08-pay-add-link"/);
+    assert.match(src, /build: "2026-09-08-customer-pay"/);
     assert.doesNotMatch(
       src.slice(src.indexOf("const stored = await storeInvoice"), src.indexOf("const shareUrl")),
       /publicHostFor\(req\)/

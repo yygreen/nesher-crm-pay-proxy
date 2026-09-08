@@ -8,6 +8,7 @@ import { resolveCustomerEmail, formatStay, toIsoDate } from "./quote.js";
 import {
   hotelInvoiceNumber,
   reservationInvoiceNumber,
+  customerInvoiceNumber,
   toUsdAmount,
   defaultIlsSpot,
 } from "./mercury.js";
@@ -621,6 +622,140 @@ export async function buildHotelDraft(ctx, overridesIn = {}) {
 /**
  * Build Mercury create opts from a finished draft payload.
  */
+/**
+ * Person-attached Nesher draft when there is no unpaid reservation or hotel
+ * quote. Staff types USD; canCreate stays false until amount is set.
+ */
+export function buildCustomerDraft(ctx, overridesIn = {}) {
+  const overrides = parseOverrides(overridesIn);
+  const { customer } = ctx;
+  const id = Number(customer && customer.id);
+  const realEmail =
+    overrides.customerEmail !== undefined
+      ? overrides.customerEmail
+      : customer && customer.email;
+  const resolved = resolveCustomerEmail(
+    realEmail,
+    Number.isFinite(id) && id > 0 ? `cust${id}` : "cust"
+  );
+  const name =
+    String(
+      overrides.customerName !== undefined
+        ? overrides.customerName
+        : (customer && customer.full_name) || ""
+    ).trim() || "Customer";
+
+  let amountUsd =
+    overrides.amountUsd !== undefined ? Number(overrides.amountUsd) : NaN;
+  if (!Number.isFinite(amountUsd) || amountUsd <= 0) amountUsd = 0;
+
+  const missing = [];
+  if (!(amountUsd > 0)) {
+    missing.push(
+      missingField(
+        "amountUsd",
+        "Amount due (USD)",
+        "No unpaid reservation or hotel quote on this person — enter the amount to charge.",
+        true
+      )
+    );
+  }
+  if (resolved.placeholder) {
+    missing.push(
+      missingField(
+        "customerEmail",
+        "Customer email",
+        "CRM has no email — a placeholder will be used unless you enter a real one. Prefer a real customer email.",
+        false
+      )
+    );
+  }
+
+  const invoiceNumber =
+    overrides.invoiceNumber ||
+    customerInvoiceNumber(id) ||
+    (Number.isFinite(id) && id > 0 ? `CUST-${id}` : "CUST");
+
+  const lineItems =
+    amountUsd > 0
+      ? [
+          {
+            name: String(
+              overrides.lineItemName || `Payment — ${name}`
+            ).slice(0, 180),
+            unitPrice: amountUsd,
+            quantity: 1,
+          },
+        ]
+      : [];
+
+  const summary = [
+    Number.isFinite(id) && id > 0 ? `CUST ${id}` : "CUST",
+    amountUsd > 0 ? `due $${amountUsd.toFixed(2)}` : "amount TBD",
+    name,
+    resolved.email,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+
+  const advice = [];
+  if (missing.some((m) => m.required)) {
+    advice.push(
+      "No unpaid booking on this person. Enter the USD amount to create a Nesher pay link for them."
+    );
+  } else if (missing.length) {
+    advice.push(
+      "You can create the link now. Optional fields below improve the invoice for the customer."
+    );
+  } else {
+    advice.push(
+      "Review the invoice preview, then create the payment link."
+    );
+  }
+
+  const memoLines = [
+    "Nesher — payment",
+    name && name !== "Customer" ? `For: ${name}` : null,
+    Number.isFinite(id) && id > 0 ? `Customer #${id}` : null,
+    `Invoice ${invoiceNumber}`,
+    amountUsd > 0 ? `Amount due: $${amountUsd.toFixed(2)}` : null,
+  ].filter(Boolean);
+
+  const internalNote = [
+    Number.isFinite(id) && id > 0 ? `CRM customer ${id}` : "CRM customer",
+    resolved.email ? `email: ${resolved.email}` : null,
+  ]
+    .filter(Boolean)
+    .join(" · ")
+    .slice(0, 1000);
+
+  return {
+    kind: "customer",
+    canCreate: amountUsd > 0 && Boolean(resolved.email),
+    needsInput: missing.some((m) => m.required),
+    missing,
+    advice,
+    draft: {
+      customerName: name,
+      customerEmail: resolved.email,
+      emailPlaceholder: resolved.placeholder,
+      amountUsd,
+      currency: "USD",
+      invoiceNumber,
+      lineItems,
+      payerMemo: memoLines.join("\n").slice(0, 1800),
+      lineItemName: lineItems[0]?.name || `Payment — ${name}`,
+      poNumber: Number.isFinite(id) && id > 0 ? `CUST-${id}` : undefined,
+      internalNote,
+      summary,
+      details: {
+        customerId: Number.isFinite(id) && id > 0 ? id : null,
+        phone: (customer && customer.phone) || null,
+      },
+    },
+  };
+}
+
 export function mercuryOptsFromDraft(token, draftPayload) {
   const d = draftPayload.draft || draftPayload;
   return {

@@ -46,7 +46,7 @@ export function brandFromInvoiceNumber(invoiceNumber) {
 
 export function brandFromKind(kind, invoiceNumber) {
   if (kind === "hotel" || kind === "hotel-offer") return BRANDS.jrm;
-  if (kind === "reservation") return BRANDS.nesher;
+  if (kind === "reservation" || kind === "customer") return BRANDS.nesher;
   return brandFromInvoiceNumber(invoiceNumber);
 }
 

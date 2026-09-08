@@ -42,6 +42,13 @@ export function reservationInvoiceNumber(code) {
   return clean ? `RES-${clean}` : null;
 }
 
+/** Person-attached Nesher invoice when there is no unpaid booking to hang the charge on. */
+export function customerInvoiceNumber(customerId) {
+  const id = Number(customerId);
+  if (!Number.isFinite(id) || id <= 0) return null;
+  return `CUST-${id}`;
+}
+
 /**
  * Convert amount to USD if needed (ILS → USD at spot * 1.03).
  * @param {number} amount

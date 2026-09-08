@@ -36,7 +36,7 @@ So "change the CRM" almost always means: edit an injector or add a route here,
 
 ### Which pages get injected (server.js `proxyWithInject`)
 
-- **staffCore** = `/jrm/hotels*`, `/reservations*`, `/whatsapp*`, `/customers/<id>` → pay buttons, WhatsApp UI, paid badges, status-extra.
+- **staffCore** = `/jrm/hotels*`, `/reservations*`, `/whatsapp*`, `/customers/` list, `/customers/<id>` → pay buttons, WhatsApp UI, paid badges, status-extra. Not `/customers/add` or edit/delete.
 - Every other staff page (`INTAKE_UI_PATH_RE`) → only the JRM Inbox bell.
 - Public marketing paths → SnapEngage / public UI only. **Never** let staff injectors run there.
 - Only `GET` HTML responses are rewritten; everything else is streamed through untouched.
