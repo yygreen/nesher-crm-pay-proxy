@@ -199,7 +199,7 @@ describe("unified invoice token", () => {
     assert.doesNotMatch(html, /googlePay|applePay|vault/i);
   });
 
-  it("does not render Collect.js for JRM while second DBA is pending", () => {
+  it("renders Collect.js for JRM-189 on Nesher FLYNESHER.COM without a guest sermon (Joseph 2026-09-08)", () => {
     const prev = process.env.NMI_JRM_DESCRIPTOR;
     delete process.env.NMI_JRM_DESCRIPTOR;
     try {
@@ -210,11 +210,18 @@ describe("unified invoice token", () => {
         capture: "collectjs",
         collectPublicKey: "pk_test_collect",
         brandId: "jrm",
+        kind: "hotel",
       });
-      assert.doesNotMatch(html, /Collect\.js/);
-      assert.doesNotMatch(html, /Pay with card/);
+      assert.match(html, /Collect\.js/);
       assert.match(html, /Pay with bank/);
-      assert.match(html, /JRM Hotels/);
+      assert.match(html, /alt="JRM Hotels"/);
+      assert.match(html, /src="https:\/\/jrmhotels\.com\/images\/logos\/jrm-logo\.png"/);
+      assert.doesNotMatch(html, /Card processed by/);
+      assert.doesNotMatch(html, /Your card statement shows/);
+      assert.doesNotMatch(html, /FLYNESHER\.COM/);
+      assert.doesNotMatch(html, /Nesher Travel/);
+      assert.doesNotMatch(html, /JRM HOTELS/);
+      assert.doesNotMatch(html, /<input\b/i);
     } finally {
       if (prev !== undefined) process.env.NMI_JRM_DESCRIPTOR = prev;
       else delete process.env.NMI_JRM_DESCRIPTOR;
@@ -370,7 +377,7 @@ describe("unified invoice token", () => {
     assert.doesNotMatch(html, /Bank transfer is Mercury/);
   });
 
-  it("paints JRM guest chrome without Collect.js while DBA is pending", () => {
+  it("paints JRM guest chrome without Collect.js when capture is off", () => {
     const html = renderInvoiceHtml({
       amountUsd: 189,
       invoiceNumber: "JRM-189-O50",
@@ -384,6 +391,7 @@ describe("unified invoice token", () => {
     assert.match(html, /body\.pay-brand-jrm \.card-field:focus-within/);
     assert.doesNotMatch(html, /Collect\.js/);
     assert.doesNotMatch(html, /Nesher · FlyNesher/);
+    assert.doesNotMatch(html, /FLYNESHER\.COM/);
     assert.doesNotMatch(html, /<p class="logo">JRM Hotels<\/p>/);
   });
 });

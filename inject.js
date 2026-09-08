@@ -900,13 +900,8 @@ const SCRIPT = `
 
   function brandLineHtml(data) {
     var jrm = isJrmRecord(data);
-    var blocked = data && data.cardBlockedReason === "second_dba_pending";
     if (jrm) {
-      return '<div class="nesher-brand-line jrm" id="nesher-brand-line"><b>JRM Hotels</b> · guest link on jrmhotels.com. ' +
-        (blocked || !data || data.preview
-          ? "Card waits on a Pinpoint second DBA so a JRM stay does not print flynesher.com on the statement. Bank still works."
-          : "Card + bank on this JRM link.") +
-        "</div>";
+      return '<div class="nesher-brand-line jrm" id="nesher-brand-line"><b>JRM Hotels</b> · guest link on jrmhotels.com. Card works on Nesher for now. Statement shows FLYNESHER.COM — tell the guest.</div>';
     }
     return '<div class="nesher-brand-line" id="nesher-brand-line"><b>Nesher</b> · guest link on flynesher.com. Card (Pinpoint) + bank.</div>';
   }

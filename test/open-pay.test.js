@@ -252,10 +252,12 @@ describe("chargeOpenPay", () => {
     assert.equal(sale.lastBody().payment_details.payment_token, "tok_collect");
     assert.equal(sale.lastBody().order_details.id, "OPEN-20260908-test01");
     assert.equal(sale.lastBody().merchant_defined_fields.field_1, "nesher");
-    assert.deepEqual(sale.lastBody().payment_descriptor, {
-      descriptor: "FLYNESHER.COM",
-      url: "https://www.flynesher.com",
-    });
+    assert.equal(sale.lastBody().payment_descriptor, undefined);
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(sale.lastBody(), "payment_descriptor"),
+      false
+    );
+    assert.doesNotMatch(JSON.stringify(sale.lastBody()), /payment_descriptor/);
     assert.doesNotMatch(JSON.stringify(sale.lastBody()), /NESHER-PAY|JRM-PAY/);
     assert.equal(sale.lastBody().billing_address.email, undefined);
     assert.match(NMI_HOST, /pinpointpayments/);
@@ -398,7 +400,7 @@ describe("wiring", () => {
     assert.match(docker, /\bopen-pay\.js\b/);
     const src = fs.readFileSync(new URL("../server.js", import.meta.url), "utf8");
     assert.match(src, /from "\.\/open-pay\.js"/);
-    assert.match(src, /build: "2026-09-08-stripe-post-strip"/);
+    assert.match(src, /build: "2026-09-09-no-custom-descriptor"/);
     assert.match(src, /isOpenPayPath\(url\.pathname\)/);
     assert.match(src, /openPayRequestAllowed\(req\.headers\)/);
     assert.match(src, /\/pay\/open/);

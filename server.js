@@ -15,7 +15,6 @@ import {
   isShortPayCode,
   brandFromKind,
   guestPayOrigin,
-  descriptorFor,
 } from "./nmi-card.js";
 import {
   nmiWebhookSecret,
@@ -337,11 +336,7 @@ async function handlePayApi(req, res, kind, id, query) {
         kind: payFamily,
         brand: { id: previewBrand.id, name: previewBrand.name },
         guestOrigin: guestPayOrigin(previewBrand),
-        cardBlockedReason: descriptorFor(previewBrand)
-          ? null
-          : previewBrand.id === "jrm"
-            ? "second_dba_pending"
-            : null,
+        cardBlockedReason: null,
         quote: {
           summary: draftBundle.draft.summary,
           amountUsd: draftBundle.draft.amountUsd,
@@ -1182,7 +1177,7 @@ const server = http.createServer(async (req, res) => {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-09-08-stripe-post-strip",
+      build: "2026-09-09-no-custom-descriptor",
       snapEngage: {
         enabled: SNAPENGAGE_ENABLED,
         widgetId: SNAPENGAGE_WIDGET_ID,

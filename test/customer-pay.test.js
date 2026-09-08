@@ -211,11 +211,11 @@ describe("customer pay mint path wiring", () => {
     assert.ok(src.includes("hotel-offer|hotel|reservation|customer"));
     assert.ok(src.includes("loadCustomerPayTarget"));
     assert.ok(src.includes("buildCustomerDraft"));
-    assert.ok(src.includes('build: "2026-09-08-stripe-post-strip"'));
+    assert.ok(src.includes('build: "2026-09-09-no-custom-descriptor"'));
     assert.ok(!/NMI_JRM_DESCRIPTOR\s*=/.test(src));
   });
 
-  it("customer mint is Nesher card+bank, never JRM, never /pay/open-only", () => {
+  it("customer mint is Nesher card+bank; hotel-offer also FLYNESHER.COM until a JRM MID", () => {
     assert.equal(brandFromKind("customer", "CUST-1").id, "nesher");
     assert.equal(
       guestPayOrigin(brandFromKind("customer", "CUST-1")),
@@ -225,7 +225,7 @@ describe("customer pay mint path wiring", () => {
     delete process.env.NMI_JRM_DESCRIPTOR;
     try {
       assert.equal(descriptorFor(brandFromKind("customer", "CUST-1")), "FLYNESHER.COM");
-      assert.equal(descriptorFor(brandFromKind("hotel-offer", "JRM-1")), null);
+      assert.equal(descriptorFor(brandFromKind("hotel-offer", "JRM-1")), "FLYNESHER.COM");
     } finally {
       if (prev !== undefined) process.env.NMI_JRM_DESCRIPTOR = prev;
       else delete process.env.NMI_JRM_DESCRIPTOR;

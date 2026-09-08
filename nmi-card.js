@@ -3,10 +3,13 @@
  * One function: CRM record + amount + brand → { cardUrl, orderId, descriptor, brand }.
  * Mercury bank stays on the same guest page. Square/Stripe hosts are never returned.
  *
- * Dual-brand rule: this MID's boarded DBA is flynesher.com. A JRM statement
- * descriptor is a Pinpoint second-DBA ask. Until NMI_JRM_DESCRIPTOR is set,
- * JRM-sold records do not get a live card URL (wrong-brand charges are worse
- * than no card rail).
+ * Dual-brand rule: this MID's boarded DBA is flynesher.com. Pinpoint
+ * 2026-09-09: "Custom descriptors are not allowed for this processor" —
+ * never send v5 payment_descriptor or Classic descriptor on sale.
+ * Joseph 2026-09-08: JRM hotel quotes take cards on this Nesher MID until
+ * a new MID exists. Staff tell the guest the statement shows FLYNESHER.COM
+ * (boarded DBA, not an API field). Do not set NMI_JRM_DESCRIPTOR. Never
+ * fall back to "JRM HOTELS". Guest HTML stays sermon-free.
  */
 
 export const NMI_HOST = (
@@ -67,11 +70,11 @@ export function guestPayOrigin(brand) {
 }
 
 /**
- * v5 POST /payments/sale `payment_descriptor` (docs.nmi.com PaymentDescriptor).
- * Classic transact.php `descriptor` is the same idea and is processor-dependent.
- * Pinpoint has not confirmed they honor it on this MID — JRM mint stays
- * gated on NMI_JRM_DESCRIPTOR. Dots allowed: boarded DBA is flynesher.com.
+ * Boarded DBA on MID 30120057067. Pinpoint prints this on the statement.
+ * Not a v5 override — this processor rejects custom descriptors.
  */
+export const BOARDED_DBA = "FLYNESHER.COM";
+
 const DESCRIPTOR_RE = /^[A-Za-z0-9._\- &]{1,60}$/;
 
 export function sanitizeDescriptor(value) {
@@ -79,27 +82,32 @@ export function sanitizeDescriptor(value) {
   return DESCRIPTOR_RE.test(s) ? s : null;
 }
 
-/** Statement descriptor actually configured for this brand, or null if blocked. */
+function boardedDba() {
+  return sanitizeDescriptor(
+    String(process.env.NMI_NESHER_DESCRIPTOR || "").trim() || BOARDED_DBA
+  );
+}
+
+/**
+ * Staff/display copy of what the statement prints. Not a charge gate and
+ * not a v5 field. JRM without env uses the boarded DBA, never "JRM HOTELS".
+ */
 export function descriptorFor(brand) {
   const b = brand && brand.id ? brand : BRANDS.nesher;
   if (b.id === "jrm") {
     const explicit = String(process.env.NMI_JRM_DESCRIPTOR || "").trim();
-    return sanitizeDescriptor(explicit);
+    if (explicit) return sanitizeDescriptor(explicit);
+    return boardedDba();
   }
-  return sanitizeDescriptor(
-    String(process.env.NMI_NESHER_DESCRIPTOR || "").trim() ||
-      b.defaultDescriptor
-  );
+  return boardedDba();
 }
 
-/** Body fragment for v5 sale. Null when this brand must not charge. */
-export function paymentDescriptorPayload(brand) {
-  const descriptor = descriptorFor(brand);
-  if (!descriptor) return null;
-  return { descriptor, url: guestPayOrigin(brand) };
+/** Always null on this MID. Charge must omit payment_descriptor. */
+export function paymentDescriptorPayload(_brand) {
+  return null;
 }
 
-/** Legal merchant / bank copy. JRM never gets a card statement line. */
+/** Legal merchant / bank copy. Card statement is the boarded DBA. */
 export const MERCHANT = {
   legal: "Air Today Travel Inc",
   dba: "Nesher Travel",
@@ -108,15 +116,14 @@ export const MERCHANT = {
 };
 
 /**
- * One truth for guest-page + staff-paste processed-by copy.
- * JRM stays bank-only in this copy even if a second DBA later paints Collect.js
- * — never invent a JRM card descriptor, never print flynesher.com on a JRM page.
+ * One truth for staff-paste processed-by copy. Guest HTML does not print
+ * this (Joseph banned the sermon). Staff paste names the boarded DBA
+ * FLYNESHER.COM — that is what Pinpoint prints, not an API field.
  */
 export function processedByFacts({ brand, hasCard } = {}) {
   const b = brand && brand.id ? brand : BRANDS.nesher;
-  const isJrm = b.id === "jrm";
-  const descriptor = descriptorFor(b);
-  const showCard = !isJrm && Boolean(hasCard) && Boolean(descriptor);
+  const descriptor = boardedDba();
+  const showCard = Boolean(hasCard) && Boolean(descriptor);
   return {
     brandId: b.id,
     showCard,
@@ -172,9 +179,7 @@ export function agentPaste({
   if (cardUrl) lines.push(String(cardUrl).trim());
   else if (mercuryUrl) lines.push(String(mercuryUrl).trim());
   const cardOn =
-    hasCard == null
-      ? b.id !== "jrm" && Boolean(descriptorFor(b))
-      : Boolean(hasCard);
+    hasCard == null ? Boolean(descriptorFor(b)) : Boolean(hasCard);
   lines.push(processedByPasteLine({ brand: b, hasCard: cardOn }));
   return lines.join("\n");
 }
@@ -307,16 +312,6 @@ export async function mintCardCheckout(opts = {}) {
   }
   if (!orderId) {
     return { ok: false, error: "invoiceNumber required", ...base, cardUrl: null };
-  }
-  if (!descriptor) {
-    return {
-      ok: false,
-      error: "second_dba_pending",
-      blockedReason:
-        "JRM card links wait on a Pinpoint second DBA / statement descriptor. Nesher (FLYNESHER.COM) can mint.",
-      ...base,
-      cardUrl: null,
-    };
   }
 
   const key = String(opts.privateKey || nmiPrivateKey()).trim();
@@ -453,9 +448,6 @@ export async function chargeWithToken(opts = {}) {
   if (!orderId) {
     return { ok: false, error: "invoiceNumber required", ...base };
   }
-  if (!descriptor) {
-    return { ok: false, error: "second_dba_pending", ...base };
-  }
   if (!token) {
     return { ok: false, error: "payment_token required", ...base };
   }
@@ -464,6 +456,7 @@ export async function chargeWithToken(opts = {}) {
     return { ok: false, error: "keys_missing", ...base };
   }
   const names = splitName(opts.customerName);
+  // No payment_descriptor / Classic descriptor: this MID refuses custom DBA.
   const body = {
     amount,
     currency: "USD",
@@ -489,8 +482,6 @@ export async function chargeWithToken(opts = {}) {
         : {}),
     },
   };
-  const pd = paymentDescriptorPayload(brand);
-  if (pd) body.payment_descriptor = pd;
   const fetchImpl = opts.fetchImpl || fetch;
   const res = await fetchImpl(`${NMI_HOST}/api/v5/payments/sale`, {
     method: "POST",

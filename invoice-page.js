@@ -10,7 +10,6 @@ import {
   brandFromRecord,
   stripDeadCardFields,
   collectScriptUrl,
-  descriptorFor,
 } from "./nmi-card.js";
 
 const DEFAULT_TTL_SEC = 60 * 60 * 24 * 45;
@@ -277,8 +276,7 @@ export function renderInvoiceHtml(data) {
     !paid &&
       !hostedCardUrl &&
       collectKey &&
-      data.capture === "collectjs" &&
-      descriptorFor(brand)
+      data.capture === "collectjs"
   );
   const hasCard = Boolean(hostedCardUrl || collectOn);
 
