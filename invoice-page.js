@@ -170,10 +170,16 @@ function renderCollectJsForm(collectKey) {
   return `<div id="card-form">
       <p class="card-field-label">Card number</p>
       <div id="ccnumber" class="card-field"></div>
-      <p class="card-field-label">Expiration</p>
-      <div id="ccexp" class="card-field"></div>
-      <p class="card-field-label">CVV</p>
-      <div id="cvv" class="card-field"></div>
+      <div class="card-row">
+        <div class="card-col">
+          <p class="card-field-label">Expiration</p>
+          <div id="ccexp" class="card-field"></div>
+        </div>
+        <div class="card-col">
+          <p class="card-field-label">CVV</p>
+          <div id="cvv" class="card-field"></div>
+        </div>
+      </div>
       <p id="card-err" class="card-err" hidden></p>
       <button type="button" class="btn btn-primary" id="pay-card-btn">Pay with card</button>
       <script src="${src}" data-tokenization-key="${key}"></script>
@@ -189,11 +195,16 @@ function renderCollectJsForm(collectKey) {
           if(!window.CollectJS) return;
           CollectJS.configure({
             variant:"inline",
+            styleSniffer:true,
+            customCss:{color:"#111","font-size":"16px","font-family":"-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",padding:"12px 14px","background-color":"#fff",border:"none"},
+            placeholderCss:{color:"#9AA3AF","font-size":"16px"},
+            focusCss:{color:"#111"},
+            invalidCss:{color:"#B91C1C"},
             paymentSelector:"#pay-card-btn",
             fields:{
-              ccnumber:{selector:"#ccnumber",placeholder:"Card number"},
+              ccnumber:{selector:"#ccnumber",placeholder:"ACCT-000003"},
               ccexp:{selector:"#ccexp",placeholder:"MM / YY"},
-              cvv:{selector:"#cvv",placeholder:"CVV"}
+              cvv:{selector:"#cvv",placeholder:"123"}
             },
             callback:function(response){
               var token=response&&response.token;
@@ -326,10 +337,20 @@ export function renderInvoiceHtml(data) {
     }
     button.btn { cursor: pointer; border: 0; font-family: inherit; }
     button.btn[disabled] { opacity: .6; cursor: wait; }
-    .card-field-label { font-size: 12px; color: #888; margin: 0 0 6px; }
+    .card-field-label { font-size: 13px; color: #555; margin: 0 0 6px; }
     .card-field {
-      border: 1px solid #ddd; border-radius: 12px; min-height: 44px;
-      padding: 10px 12px; margin: 0 0 10px; background: #fff;
+      height: 48px; padding: 0; overflow: hidden; margin: 0 0 10px;
+      border: 1px solid #D8DEE4; border-radius: 10px; background: #fff;
+    }
+    .card-field iframe { width: 100%; height: 48px; border: 0; display: block; }
+    .card-row {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 0 0 10px;
+    }
+    .card-col { min-width: 0; }
+    .card-row .card-field { margin: 0; }
+    .card-field:focus-within {
+      border-color: #3D7A99;
+      box-shadow: 0 0 0 3px rgba(61,122,153,.18);
     }
     .card-err { margin: 0 0 10px; font-size: 13px; color: #b91c1c; text-align: center; }
     .btn-primary { background: #3D7A99; color: #fff; }
@@ -352,6 +373,10 @@ export function renderInvoiceHtml(data) {
     body.pay-brand-jrm .logo { color: #5C4528; }
     body.pay-brand-jrm .btn-primary { background: #5C4528; }
     body.pay-brand-jrm .btn-primary:hover { background: #3D3229; }
+    body.pay-brand-jrm .card-field:focus-within {
+      border-color: #5C4528;
+      box-shadow: 0 0 0 3px rgba(92,69,40,.18);
+    }
   </style>
 </head>
 <body class="pay-brand-${esc(brand.id)}">

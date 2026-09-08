@@ -150,11 +150,49 @@ describe("unified invoice token", () => {
     assert.match(html, /Nesher/);
     assert.match(html, /\/charge/);
     assert.match(html, /payment_token/);
+    assert.match(html, /class="card-row"/);
+    assert.match(html, /customCss:/);
     assert.doesNotMatch(html, /square\.link|squareup|checkout\.stripe/i);
     assert.doesNotMatch(html, /NESHER-PAY|JRM-PAY/);
     assert.doesNotMatch(html, /customPayment/);
-    assert.doesNotMatch(html, /<input[^>]*(amount|ccnumber)/i);
+    assert.doesNotMatch(html, /<input[^>]*(amount|ccnumber|ccexp|cvv|pan)/i);
     assert.doesNotMatch(html, /NMI_PRIVATE/);
+  });
+
+  it("Collect.js fields sit in a two-column card-row with iframe CSS, not a stacked PAN input", () => {
+    const html = renderInvoiceHtml({
+      amountUsd: 55.55,
+      invoiceNumber: "RES-555TRAIN",
+      customerName: "Ada",
+      mercuryUrl: "https://app.mercury.com/pay/a",
+      capture: "collectjs",
+      collectPublicKey: "pk_test_collect",
+      brandId: "nesher",
+    });
+    assert.match(html, /class="card-row"/);
+    assert.match(html, /class="card-col"/);
+    assert.match(html, /id="ccnumber" class="card-field"/);
+    assert.match(html, /id="ccexp" class="card-field"/);
+    assert.match(html, /id="cvv" class="card-field"/);
+    assert.match(html, /styleSniffer:\s*true/);
+    assert.match(html, /customCss:/);
+    assert.match(html, /placeholderCss:/);
+    assert.match(html, /focusCss:/);
+    assert.match(html, /invalidCss:/);
+    assert.match(html, /"font-size":"16px"/);
+    assert.match(html, /placeholder:"ACCT-000003"/);
+    assert.match(html, /placeholder:"MM \/ YY"/);
+    assert.match(html, /placeholder:"123"/);
+    assert.match(html, /grid-template-columns:\s*1fr 1fr/);
+    assert.match(html, /\.card-field:focus-within/);
+    assert.match(html, /body\.pay-brand-jrm \.card-field:focus-within/);
+    assert.match(html, /JSON\.stringify\(\{payment_token:token\}\)/);
+    assert.doesNotMatch(html, /placeholder:"Card number"/);
+    assert.doesNotMatch(html, /placeholder:"CVV"/);
+    assert.doesNotMatch(html, /<input\b/i);
+    assert.doesNotMatch(html, /name=["']ccnumber["']/i);
+    assert.doesNotMatch(html, /creditCardEnabled/);
+    assert.doesNotMatch(html, /googlePay|applePay|vault/i);
   });
 
   it("does not render Collect.js for JRM while second DBA is pending", () => {
@@ -315,6 +353,7 @@ describe("unified invoice token", () => {
     assert.match(html, /pay-brand-jrm/);
     assert.match(html, /JRM Hotels/);
     assert.match(html, /#5C4528/);
+    assert.match(html, /body\.pay-brand-jrm \.card-field:focus-within/);
     assert.doesNotMatch(html, /Collect\.js/);
     assert.doesNotMatch(html, /Nesher · FlyNesher/);
   });
