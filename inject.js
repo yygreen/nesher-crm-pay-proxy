@@ -33,6 +33,18 @@ const CSS = `
   }
   .nesher-mercury-btn:hover { background: #0c5f58; color: #fff !important; }
   .nesher-mercury-btn[disabled] { opacity: 0.6; cursor: wait; }
+  /* Add Payment form: one loud door into the existing Create payment link modal. */
+  .nesher-mercury-btn-hero {
+    padding: 12px 18px;
+    font-size: 15px;
+    font-weight: 800;
+    border-radius: 10px;
+    margin: 0;
+    box-shadow: 0 2px 0 rgba(0,0,0,.12);
+  }
+  .nesher-mercury-btn-hero::before { width: 8px; height: 8px; }
+  /* Stripe is dead. Keep the Django include hidden; do not revive it. */
+  .stripe-secure-payment-panel { display: none !important; }
   .nesher-mercury-link {
     display: inline-flex;
     align-items: center;
@@ -1167,11 +1179,14 @@ const SCRIPT = `
 </script>
 `;
 
-function buttonHtml(kind, id, label) {
+function buttonHtml(kind, id, label, extraClass) {
   const text = label || "Mercury Pay Link";
+  const cls = extraClass
+    ? `nesher-mercury-btn ${extraClass}`
+    : "nesher-mercury-btn";
   return (
     `<span class="nesher-mercury-wrap">` +
-    `<button type="button" class="nesher-mercury-btn" ${BUTTON_MARKER} ` +
+    `<button type="button" class="${cls}" ${BUTTON_MARKER} ` +
     `data-kind="${kind}" data-id="${id}" data-label="${text.replace(/"/g, "&quot;")}">${text}</button>` +
     `</span>`
   );
@@ -1248,6 +1263,33 @@ export function injectPayButtons(html, path) {
       if (!out.includes(BUTTON_MARKER)) {
         out = out.replace(/<\/body>/i, `${btn}</body>`);
       }
+    }
+  }
+
+  // Reservation Add Payment form (Django payment_create).
+  // Same mint as reservation detail: kind=reservation, CRM-priced Collect.js + Mercury.
+  // staffCore already covers /reservations/*; this only places the button.
+  // Customer-name inject is a sibling seam — do not match /customers/ here.
+  const resPayAdd = p.match(/^\/reservations\/(\d+)\/payments\/add\/?$/);
+  if (resPayAdd) {
+    const id = resPayAdd[1];
+    const btn = buttonHtml(
+      "reservation",
+      id,
+      "Send card/bank pay link",
+      "nesher-mercury-btn-hero"
+    );
+    if (/href=["']#payment-form["']/i.test(out)) {
+      out = out.replace(
+        /(<a[^>]+href=["']#payment-form["'][^>]*>[\s\S]*?<\/a>)/i,
+        (full) => `${full} ${btn}`
+      );
+    }
+    if (!out.includes(BUTTON_MARKER)) {
+      out = out.replace(/<\/h1>/i, () => `</h1> ${btn}`);
+    }
+    if (!out.includes(BUTTON_MARKER)) {
+      out = out.replace(/<\/body>/i, () => `${btn}</body>`);
     }
   }
 

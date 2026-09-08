@@ -375,4 +375,43 @@ describe("injectPayButtons", () => {
     assert.match(out, /second DBA/);
     assert.match(out, /does not print flynesher\.com on the statement/);
   });
+
+  it("injects send-pay-link on reservation payments/add next to Add First Payment", () => {
+    const html = `<!doctype html><html><head></head><body>
+      <h1>Add Payment for RES555</h1>
+      <div>Remaining Balance</div>
+      <a href="#payment-form">Add First Payment</a>
+      <a href="/reservations/99/payments/snooze/">Snooze Remaining Balance</a>
+      <div class="stripe-secure-payment-panel" hidden></div>
+      </body></html>`;
+    const out = injectPayButtons(html, "/reservations/99/payments/add/");
+    assert.match(out, new RegExp(BUTTON_MARKER));
+    assert.match(out, /data-kind="reservation"/);
+    assert.match(out, /data-id="99"/);
+    assert.match(out, /Send card\/bank pay link/);
+    assert.match(out, /nesher-mercury-btn-hero/);
+    assert.match(out, /nesher-mercury-pay-js/);
+    assert.match(out, /stripe-secure-payment-panel \{ display: none/);
+    assert.doesNotMatch(out, /data-kind="payment"/);
+    assert.equal((out.match(/data-id="99"/g) || []).length, 1);
+  });
+
+  it("payments/add still mints when the first-payment link is missing", () => {
+    const html = `<html><body><h1>Add Payment for X</h1></body></html>`;
+    const out = injectPayButtons(html, "/reservations/12/payments/add");
+    assert.match(out, /data-kind="reservation"/);
+    assert.match(out, /data-id="12"/);
+    assert.match(out, /Send card\/bank pay link/);
+  });
+
+  it("does not treat payments/add as the reservation list", () => {
+    const html = `<html><body>
+      <a href="/reservations/280/">RES-1</a>
+      <h1>Add Payment</h1>
+      <a href="#payment-form">Add First Payment</a>
+      </body></html>`;
+    const out = injectPayButtons(html, "/reservations/99/payments/add/");
+    assert.match(out, /data-id="99"/);
+    assert.doesNotMatch(out, /data-id="280"/);
+  });
 });
