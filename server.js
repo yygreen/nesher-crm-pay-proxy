@@ -826,7 +826,16 @@ function proxyWithInject(req, res) {
     // public marketing pages — SnapEngage live chat
     isPublicMarketingPath(pathOnly);
 
-  if (!shouldInject || req.method !== "GET") {
+  const method = String(req.method || "GET").toUpperCase();
+  const isGet = method === "GET";
+  const isMutatingHtml = method === "POST" || method === "PUT";
+  // POST/PUT staff HTML can re-render Django's Stripe include on validation
+  // errors (HTTP 200). Public marketing mutating requests stay streamed (8/12).
+  if (
+    !shouldInject ||
+    (!isGet && !isMutatingHtml) ||
+    (!isGet && isPublicMarketingPath(pathOnly))
+  ) {
     proxy.web(req, res);
     return;
   }
@@ -881,37 +890,50 @@ function proxyWithInject(req, res) {
             // pages — injectPayButtons has no path gate of its own and would
             // drop the internal payment-link modal onto flynesher.com.
             if (!isPublicMarketingPath(pathOnly)) {
-              // Stripe is dead — drop the Django include from every staff page.
+              // Stripe is dead — drop the Django include from every staff page,
+              // including POST/PUT validation re-renders.
               injected = stripStripeUi(injected);
-              if (staffCore) {
+              if (isGet) {
+                if (staffCore) {
+                  injected = injectPayButtons(injected, pathOnly);
+                  injected = injectWhatsAppUi(injected, pathOnly);
+                  injected = await injectPaidBadges(injected, pathOnly, badgePool());
+                  // the one extra JRM status — see status-extra.js
+                  injected = await injectStatusExtra(injected, pathOnly, badgePool());
+                  // read-only kashrus / travel-party / Shabbos-Yom-Tov badges — see needs-axis.js
+                  injected = await injectNeedsAxis(injected, pathOnly, badgePool());
+                }
+                // JRM Inbox bell/badge on every staff page (skips the login page by itself)
+                injected = injectIntakeUi(injected, pathOnly, { staffCheckHtml: text });
+              } else if (
+                staffCore &&
+                /^\/reservations\/\d+\/payments\/add\/?$/.test(pathOnly)
+              ) {
+                // Add Payment save-error: keep the teal Send card/bank pay link.
+                // Do not widen staffCore; do not run WhatsApp / badges / intake.
                 injected = injectPayButtons(injected, pathOnly);
-                injected = injectWhatsAppUi(injected, pathOnly);
-                injected = await injectPaidBadges(injected, pathOnly, badgePool());
-                // the one extra JRM status — see status-extra.js
-                injected = await injectStatusExtra(injected, pathOnly, badgePool());
-                // read-only kashrus / travel-party / Shabbos-Yom-Tov badges — see needs-axis.js
-                injected = await injectNeedsAxis(injected, pathOnly, badgePool());
               }
-              // JRM Inbox bell/badge on every staff page (skips the login page by itself)
-              injected = injectIntakeUi(injected, pathOnly, { staffCheckHtml: text });
             } else if (looksLikeStaffPage(text)) {
               // "/" is a public marketing path for visitors but the CRM dashboard for a
               // logged-in agent — decide on the ORIGINAL upstream HTML.
+              // GET-only: mutating public-marketing paths were streamed above.
               injected = stripStripeUi(injected);
               injected = injectIntakeUi(injected, pathOnly, { staffCheckHtml: text });
             }
-            // Staff-page check reads the ORIGINAL upstream HTML: the injectors
-            // above add markup that would otherwise look like the CRM.
-            injected = injectSnapEngage(injected, pathOnly, {
-              host: req.headers.host,
-              widgetId: SNAPENGAGE_WIDGET_ID,
-              enabled: SNAPENGAGE_ENABLED,
-              hosts: SNAPENGAGE_HOSTS,
-              staffCheckHtml: text,
-            });
-            injected = injectPublicHomeUi(injected, pathOnly, {
-              isPublicHost: isPublicMarketingHost(req.headers.host, SNAPENGAGE_HOSTS),
-            });
+            if (isGet) {
+              // Staff-page check reads the ORIGINAL upstream HTML: the injectors
+              // above add markup that would otherwise look like the CRM.
+              injected = injectSnapEngage(injected, pathOnly, {
+                host: req.headers.host,
+                widgetId: SNAPENGAGE_WIDGET_ID,
+                enabled: SNAPENGAGE_ENABLED,
+                hosts: SNAPENGAGE_HOSTS,
+                staffCheckHtml: text,
+              });
+              injected = injectPublicHomeUi(injected, pathOnly, {
+                isPublicHost: isPublicMarketingHost(req.headers.host, SNAPENGAGE_HOSTS),
+              });
+            }
             finish(Buffer.from(injected, "utf8"));
           } catch (e) {
             console.error("inject failed", e.message);
@@ -1160,7 +1182,7 @@ const server = http.createServer(async (req, res) => {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-09-08-customer-pay",
+      build: "2026-09-08-stripe-post-strip",
       snapEngage: {
         enabled: SNAPENGAGE_ENABLED,
         widgetId: SNAPENGAGE_WIDGET_ID,

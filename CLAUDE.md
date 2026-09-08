@@ -39,7 +39,7 @@ So "change the CRM" almost always means: edit an injector or add a route here,
 - **staffCore** = `/jrm/hotels*`, `/reservations*`, `/whatsapp*`, `/customers/` list, `/customers/<id>` → pay buttons, WhatsApp UI, paid badges, status-extra. Not `/customers/add` or edit/delete.
 - Every other staff page (`INTAKE_UI_PATH_RE`) → only the JRM Inbox bell.
 - Public marketing paths → SnapEngage / public UI only. **Never** let staff injectors run there.
-- Only `GET` HTML responses are rewritten; everything else is streamed through untouched.
+- `GET` HTML is rewritten (pay buttons, WhatsApp, badges, Stripe strip). `POST`/`PUT` HTML on the same staff `shouldInject` paths is Stripe-stripped (Django validation re-renders the dead include); `/reservations/<id>/payments/add/` also keeps the teal Send card/bank pay link. Public marketing mutating requests stay streamed (8/12). Success POSTs are 302 and pass through.
 
 ## Rules that have bitten before
 

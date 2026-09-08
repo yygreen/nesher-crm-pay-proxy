@@ -2,6 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import { stripStripeUi } from "../strip-stripe.js";
+import { injectPayButtons } from "../inject.js";
 
 const FORBIDDEN = [
   "Secure Stripe Card Payment",
@@ -116,6 +117,31 @@ describe("stripStripeUi", () => {
     const injectAt = src.indexOf("injected = stripStripeUi(injected)");
     const payAt = src.indexOf("injected = injectPayButtons(injected");
     assert.ok(injectAt > 0 && payAt > injectAt);
+  });
+
+  it("proxyWithInject strips Stripe on POST/PUT staff HTML, not only GET", () => {
+    const src = fs.readFileSync(new URL("../server.js", import.meta.url), "utf8");
+    assert.match(src, /isMutatingHtml = method === "POST" \|\| method === "PUT"/);
+    assert.doesNotMatch(src, /!shouldInject \|\| req\.method !== "GET"/);
+    assert.match(src, /!isGet && isPublicMarketingPath\(pathOnly\)/);
+    assert.match(src, /\\\/reservations\\\/\\d\+\\\/payments\\\/add/);
+    const waCount = src.split("injectWhatsAppUi(").length - 1;
+    assert.equal(waCount, 1);
+    const isGetAt = src.indexOf("if (isGet)");
+    const waAt = src.indexOf("injectWhatsAppUi(");
+    assert.ok(isGetAt > 0 && waAt > isGetAt);
+    assert.match(src, /build: "2026-09-08-stripe-post-strip"/);
+  });
+
+  it("POST save-error HTML is stripped and still gets the send-pay-link", () => {
+    const stripped = stripStripeUi(PAGE);
+    assertGone(stripped);
+    const out = injectPayButtons(stripped, "/reservations/99/payments/add/");
+    assertGone(out);
+    assert.match(out, /Send card\/bank pay link/);
+    assert.match(out, /id="id_amount"/);
+    assert.match(out, />Save Payment</);
+    assert.match(out, /Add Payment for GKT5U4/);
   });
 
   it("is on the Dockerfile COPY line", () => {
