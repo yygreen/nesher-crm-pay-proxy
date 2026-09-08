@@ -7,7 +7,9 @@ import {
   NESHER_LOGO_URL,
   isOpenPayPath,
   isOpenPayChargePath,
-  openPayHostForbidden,
+  openPayHostAllowed,
+  openPayRequestAllowed,
+  decideOpenPayPage,
   parseOpenAmountUsd,
   mintOpenInvoiceNumber,
   chargeOpenPay,
@@ -30,12 +32,80 @@ describe("open-pay paths", () => {
     assert.equal(isOpenPayPath("/pay/abc12xyz/charge"), false);
   });
 
-  it("forbids JRM hosts and allows Nesher", () => {
-    assert.equal(openPayHostForbidden("www.jrmhotels.com"), true);
-    assert.equal(openPayHostForbidden("jrmhotels.com"), true);
-    assert.equal(openPayHostForbidden("www.flynesher.com"), false);
-    assert.equal(openPayHostForbidden("crm.flynesher.com"), false);
-    assert.equal(openPayHostForbidden("flynesher.com"), false);
+  it("allowlists only flynesher.com and www.flynesher.com", () => {
+    assert.equal(openPayHostAllowed("www.flynesher.com"), true);
+    assert.equal(openPayHostAllowed("flynesher.com"), true);
+    assert.equal(openPayHostAllowed("www.flynesher.com:443"), true);
+    assert.equal(openPayHostAllowed("crm.flynesher.com"), false);
+    assert.equal(openPayHostAllowed("www.jrmhotels.com"), false);
+    assert.equal(openPayHostAllowed("jrmhotels.com"), false);
+    assert.equal(openPayHostAllowed(""), false);
+    assert.equal(openPayHostAllowed(undefined), false);
+    assert.equal(openPayHostAllowed("nesher-crm-pay-proxy.up.railway.app"), false);
+  });
+
+  it("refuses crm, JRM, empty Host, and forwarded JRM hosts", () => {
+    assert.equal(openPayRequestAllowed({ host: "www.flynesher.com" }), true);
+    assert.equal(openPayRequestAllowed({ host: "flynesher.com" }), true);
+    assert.equal(openPayRequestAllowed({ host: "crm.flynesher.com" }), false);
+    assert.equal(openPayRequestAllowed({ host: "www.jrmhotels.com" }), false);
+    assert.equal(openPayRequestAllowed({ host: "jrmhotels.com" }), false);
+    assert.equal(openPayRequestAllowed({}), false);
+    assert.equal(openPayRequestAllowed({ host: "" }), false);
+    assert.equal(
+      openPayRequestAllowed({
+        host: "crm.flynesher.com",
+        "x-forwarded-host": "www.jrmhotels.com",
+      }),
+      false
+    );
+    assert.equal(
+      openPayRequestAllowed({
+        host: "www.flynesher.com",
+        "x-forwarded-host": "www.jrmhotels.com",
+      }),
+      false
+    );
+    assert.equal(
+      openPayRequestAllowed({
+        host: "www.flynesher.com",
+        forwarded: "host=jrmhotels.com;proto=https",
+      }),
+      false
+    );
+    assert.equal(
+      openPayRequestAllowed({
+        host: "www.flynesher.com",
+        "x-forwarded-host": "www.flynesher.com",
+      }),
+      true
+    );
+  });
+
+  it("jrmhotels.com, crm.flynesher.com, and empty Host never paint Collect.js", () => {
+    const collect = { collectPublicKey: "pk_test_collect" };
+    function assertClosed(headers) {
+      const page = decideOpenPayPage(headers, collect);
+      assert.equal(page.status, 404);
+      assert.doesNotMatch(page.html, /Collect\.js/);
+      assert.doesNotMatch(page.html, /id="amount-usd"/);
+      assert.doesNotMatch(page.html, /Pay with card/);
+      assert.doesNotMatch(page.html, /data-tokenization-key/);
+    }
+    assertClosed({ host: "www.jrmhotels.com" });
+    assertClosed({ host: "jrmhotels.com" });
+    assertClosed({ host: "crm.flynesher.com" });
+    assertClosed({
+      host: "crm.flynesher.com",
+      "x-forwarded-host": "www.jrmhotels.com",
+    });
+    assertClosed({});
+    assertClosed({ host: "" });
+    const ok = decideOpenPayPage({ host: "www.flynesher.com" }, collect);
+    assert.equal(ok.status, 200);
+    assert.match(ok.html, /Collect\.js/);
+    assert.match(ok.html, /id="amount-usd"/);
+    assert.match(ok.html, /Pay with card/);
   });
 });
 
@@ -316,6 +386,8 @@ describe("CRM amount lock is unchanged", () => {
     const open = src.slice(openAt, captureAt);
     assert.match(open, /chargeOpenPay\(\{/);
     assert.match(open, /amountUsd:/);
+    assert.match(open, /openPayRequestAllowed\(req\.headers\)/);
+    assert.doesNotMatch(open, /openPayHostForbidden/);
     assert.doesNotMatch(src, /NMI_JRM_DESCRIPTOR/);
   });
 });
@@ -328,6 +400,7 @@ describe("wiring", () => {
     assert.match(src, /from "\.\/open-pay\.js"/);
     assert.match(src, /build: "2026-09-08-open-pay"/);
     assert.match(src, /isOpenPayPath\(url\.pathname\)/);
+    assert.match(src, /openPayRequestAllowed\(req\.headers\)/);
     assert.match(src, /\/pay\/open/);
   });
 });

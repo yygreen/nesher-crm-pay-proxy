@@ -25,7 +25,7 @@ import {
 import {
   isOpenPayPath,
   isOpenPayChargePath,
-  openPayHostForbidden,
+  openPayRequestAllowed,
   renderOpenPayHtml,
   renderOpenPayErrorHtml,
   chargeOpenPay,
@@ -954,7 +954,7 @@ const server = http.createServer(async (req, res) => {
 
   // Public Nesher open-amount /pay/open — guest types USD. Not a CRM invoice.
   if (isOpenPayPath(url.pathname)) {
-    if (openPayHostForbidden(req.headers.host)) {
+    if (!openPayRequestAllowed(req.headers)) {
       res.setHeader("Cache-Control", "no-store");
       res.setHeader("Content-Type", "text/html; charset=utf-8");
       res.writeHead(404);

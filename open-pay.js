@@ -43,14 +43,85 @@ export function isOpenPayChargePath(pathname) {
   return p === "/pay/open/charge" || p === "/__nesher_pay/open/charge";
 }
 
-/** JRM hosts never serve an open-amount card page. */
-export function openPayHostForbidden(host) {
-  const h = String(host || "")
+/**
+ * Guest open-amount is Nesher-origin only.
+ * Allowlist: flynesher.com and www.flynesher.com.
+ * crm.flynesher.com is the live JRM /pay/:code rewrite destination
+ * (Host becomes crm; the browser URL stays jrmhotels.com) — never serve
+ * Collect.js / FLYNESHER.COM there. Empty or unknown Host is 404.
+ */
+const OPEN_PAY_ALLOWED_HOSTS = new Set(["flynesher.com", "www.flynesher.com"]);
+
+export function normalizeOpenPayHost(value) {
+  let h = String(value || "")
     .split(",")[0]
-    .split(":")[0]
     .trim()
     .toLowerCase();
-  return /(^|\.)jrmhotels\.com$/.test(h);
+  if (!h) return "";
+  if (h.startsWith("[")) {
+    const end = h.indexOf("]");
+    if (end > 0) h = h.slice(1, end);
+  } else {
+    h = h.split(":")[0];
+  }
+  return h;
+}
+
+export function openPayHostAllowed(host) {
+  const h = normalizeOpenPayHost(host);
+  return Boolean(h) && OPEN_PAY_ALLOWED_HOSTS.has(h);
+}
+
+function forwardedHosts(raw) {
+  const out = [];
+  for (const element of String(raw || "").split(",")) {
+    const m = /(?:^|;)\s*host\s*=\s*(?:"([^"]+)"|([^;]+))/i.exec(element);
+    if (!m) continue;
+    const v = String(m[1] || m[2] || "").trim();
+    if (v) out.push(v);
+  }
+  return out;
+}
+
+function headerValue(headers, name) {
+  if (!headers || typeof headers !== "object") return "";
+  const want = String(name).toLowerCase();
+  if (headers[want] != null) return String(headers[want]);
+  for (const [k, v] of Object.entries(headers)) {
+    if (String(k).toLowerCase() === want) return v == null ? "" : String(v);
+  }
+  return "";
+}
+
+/** Host, X-Forwarded-Host, and Forwarded must each be Nesher or absent. */
+export function openPayRequestAllowed(headers = {}) {
+  if (!openPayHostAllowed(headerValue(headers, "host"))) return false;
+  const xfh = headerValue(headers, "x-forwarded-host").trim();
+  if (xfh) {
+    for (const part of xfh.split(",")) {
+      if (!openPayHostAllowed(part)) return false;
+    }
+  }
+  const fwd = headerValue(headers, "forwarded").trim();
+  if (fwd) {
+    for (const h of forwardedHosts(fwd)) {
+      if (!openPayHostAllowed(h)) return false;
+    }
+  }
+  return true;
+}
+
+export function decideOpenPayPage(headers, data = {}) {
+  if (!openPayRequestAllowed(headers)) {
+    return {
+      status: 404,
+      html: renderOpenPayErrorHtml("This payment page is not available here."),
+    };
+  }
+  return {
+    status: 200,
+    html: renderOpenPayHtml(data),
+  };
 }
 
 export function parseOpenAmountUsd(value) {
