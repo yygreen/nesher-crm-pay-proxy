@@ -387,6 +387,8 @@ describe("chargeOpenPay", () => {
     assert.equal(out.ok, false);
     assert.equal(out.error, "raw_card_rejected");
     assert.equal(out.httpStatus, 400);
+    assert.match(out.message, /We're missing something: card details/);
+    assert.doesNotMatch(out.message, /Nothing is wrong on our side/);
     assert.equal(called, 0);
   });
 
@@ -524,6 +526,11 @@ describe("CRM amount lock is unchanged", () => {
     assert.match(open, /staffName:/);
     assert.match(open, /notes:/);
     assert.match(open, /guestFailBody/);
+    assert.match(open, /guestFailBody\(\{ error: "raw_card_rejected" \}\)/);
+    assert.doesNotMatch(
+      open,
+      /sendJson\(res, 400, \{ ok: false, error: "raw_card_rejected" \}\)/
+    );
     assert.match(open, /openPayRequestAllowed\(req\.headers\)/);
     assert.doesNotMatch(open, /openPayHostForbidden/);
     assert.doesNotMatch(open, /payment_descriptor/);
@@ -537,7 +544,7 @@ describe("wiring", () => {
     assert.match(docker, /\bopen-pay\.js\b/);
     const src = fs.readFileSync(new URL("../server.js", import.meta.url), "utf8");
     assert.match(src, /from "\.\/open-pay\.js"/);
-    assert.match(src, /build: "2026-09-09-open-guest-copy"/);
+    assert.match(src, /build: "2026-09-09-nmi-code-map"/);
     assert.match(src, /isOpenPayPath\(url\.pathname\)/);
     assert.match(src, /openPayRequestAllowed\(req\.headers\)/);
     assert.match(src, /\/pay\/open/);

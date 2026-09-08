@@ -1107,7 +1107,7 @@ const SCRIPT = `
     if (err) err.textContent = "";
     btn.setAttribute("data-busy", "1");
     btn.disabled = true;
-    var defaultLabel = btn.getAttribute("data-label") || "Mercury Pay Link";
+    var defaultLabel = btn.getAttribute("data-label") || "Send pay link";
     var url = pathFor(kind, id);
     if (!url) {
       btn.disabled = false;
@@ -1190,7 +1190,7 @@ const SCRIPT = `
 `;
 
 function buttonHtml(kind, id, label, extraClass) {
-  const text = label || "Mercury Pay Link";
+  const text = label || "Send pay link";
   const cls = extraClass
     ? `nesher-mercury-btn ${extraClass}`
     : "nesher-mercury-btn";
@@ -1229,13 +1229,13 @@ export function injectPayButtons(html, path) {
         const btn = buttonHtml(
           "hotel-offer",
           offerId,
-          "Mercury Pay (this quote)"
+          "Send pay link"
         );
         return `${open}${inner} ${btn}${close}`;
       }
     );
     if (!out.includes(BUTTON_MARKER)) {
-      const btn = buttonHtml("hotel", requestId, "Mercury Pay Link");
+      const btn = buttonHtml("hotel", requestId, "Send pay link");
       if (/payment\/add\//i.test(out)) {
         out = out.replace(
           /(<a[^>]+href="\/jrm\/hotels\/\d+\/payment\/add\/"[^>]*>[\s\S]*?<\/a>)/i,
@@ -1253,7 +1253,7 @@ export function injectPayButtons(html, path) {
       /(<a[^>]*href="\/jrm\/hotels\/(\d+)\/"[^>]*>)([\s\S]*?)(<\/a>)/gi,
       (full, open, id, text, close) => {
         if (full.includes(BUTTON_MARKER)) return full;
-        return `${open}${text}${close} ${buttonHtml("hotel", id, "Pay quote")}`;
+        return `${open}${text}${close} ${buttonHtml("hotel", id, "Send pay link")}`;
       }
     );
   }
@@ -1262,7 +1262,7 @@ export function injectPayButtons(html, path) {
   const resDetail = p.match(/^\/reservations\/(\d+)\/?$/);
   if (resDetail) {
     const id = resDetail[1];
-    const btn = buttonHtml("reservation", id, "Mercury Pay (balance due)");
+    const btn = buttonHtml("reservation", id, "Send pay link");
     if (/payments\/add\//i.test(out)) {
       out = out.replace(
         /(<a[^>]+href="\/reservations\/\d+\/payments\/add\/"[^>]*>[\s\S]*?<\/a>)/i,
@@ -1286,7 +1286,7 @@ export function injectPayButtons(html, path) {
     const btn = buttonHtml(
       "reservation",
       id,
-      "Send card/bank pay link",
+      "Card or bank link",
       "nesher-mercury-btn-hero"
     );
     if (/href=["']#payment-form["']/i.test(out)) {
@@ -1310,7 +1310,7 @@ export function injectPayButtons(html, path) {
       (full, open, id, text, close) => {
         if (full.includes(BUTTON_MARKER)) return full;
         if (/\/(edit|delete)\//i.test(open)) return full;
-        return `${open}${text}${close} ${buttonHtml("reservation", id, "Pay due")}`;
+        return `${open}${text}${close} ${buttonHtml("reservation", id, "Send pay link")}`;
       }
     );
   }
@@ -1320,7 +1320,7 @@ export function injectPayButtons(html, path) {
   const custDetail = p.match(/^\/customers\/(\d+)\/?$/);
   if (custDetail) {
     const id = custDetail[1];
-    const btn = buttonHtml("customer", id, "Mercury Pay Link");
+    const btn = buttonHtml("customer", id, "Send pay link");
     if (/customers\/\d+\/payment\/add\//i.test(out)) {
       out = out.replace(
         /(<a[^>]+href="\/customers\/\d+\/payment\/add\/"[^>]*>[\s\S]*?<\/a>)/i,
@@ -1347,7 +1347,7 @@ export function injectPayButtons(html, path) {
         if (/\/(edit|delete|payment|statement|services|commission)/i.test(open)) {
           return full;
         }
-        return `${open}${text}${close} ${buttonHtml("customer", id, "Pay due")}`;
+        return `${open}${text}${close} ${buttonHtml("customer", id, "Send pay link")}`;
       }
     );
   }

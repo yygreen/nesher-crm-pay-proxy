@@ -338,7 +338,8 @@ describe("injectPayButtons", () => {
     assert.match(out, /data-kind="hotel-offer"/);
     assert.match(out, /data-id="50"/);
     assert.match(out, /nesher-mercury-pay-js/);
-    assert.match(out, /Mercury Pay \(this quote\)/);
+    assert.match(out, /Send pay link/);
+    assert.doesNotMatch(out, /Mercury Pay/);
   });
 
   it("injects reservation list pay buttons", () => {
@@ -391,7 +392,8 @@ describe("injectPayButtons", () => {
     assert.match(out, new RegExp(BUTTON_MARKER));
     assert.match(out, /data-kind="reservation"/);
     assert.match(out, /data-id="99"/);
-    assert.match(out, /Send card\/bank pay link/);
+    assert.match(out, /Card or bank link/);
+    assert.doesNotMatch(out, /Mercury Pay/);
     assert.match(out, /nesher-mercury-btn-hero/);
     assert.match(out, /nesher-mercury-pay-js/);
     assert.match(out, /stripe-secure-payment-panel \{ display: none/);
@@ -404,7 +406,8 @@ describe("injectPayButtons", () => {
     const out = injectPayButtons(html, "/reservations/12/payments/add");
     assert.match(out, /data-kind="reservation"/);
     assert.match(out, /data-id="12"/);
-    assert.match(out, /Send card\/bank pay link/);
+    assert.match(out, /Card or bank link/);
+    assert.doesNotMatch(out, /Mercury Pay/);
   });
 
   it("does not treat payments/add as the reservation list", () => {

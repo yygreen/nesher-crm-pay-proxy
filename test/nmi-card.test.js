@@ -30,6 +30,24 @@ import {
   GUEST_OURS,
   GUEST_MISSING_AMOUNT,
   GUEST_MISSING_CARD,
+  GUEST_ALREADY_PAID,
+  GUEST_INVALID_LINK,
+  GUEST_TRY_ANOTHER,
+  GUEST_INACCURATE,
+  GUEST_INACCURATE_EXP,
+  GUEST_INACCURATE_CVV,
+  GUEST_INACCURATE_PIN,
+  GUEST_NOT_A_CARD,
+  GUEST_UNSUPPORTED_CARD,
+  GUEST_NO_CARD_ON_FILE,
+  GUEST_CALL_ISSUER,
+  GUEST_DUPLICATE,
+  GUEST_RECURRING,
+  GUEST_RECURRING_STOP_ALL,
+  GUEST_RECURRING_STOP_THIS,
+  GUEST_RECURRING_UPDATE,
+  GUEST_RECURRING_RETRY_LATER,
+  NMI_CODE_MESSAGES,
 } from "../nmi-card.js";
 
 const CARD_HOST = /pinpointpayments\.transactiongateway\.com/;
@@ -609,11 +627,115 @@ describe("guestCardMessage", () => {
     assert.doesNotMatch(msg, /\{/);
   });
 
-  it("pickup / stolen stays generic not-us, no stolen word", () => {
+  it("pickup / stolen stays try-another, no stolen word", () => {
     const msg = guestCardMessage({ response_text: "Pick up card" });
-    assert.equal(msg, GUEST_DECLINE_DEFAULT);
+    assert.equal(msg, GUEST_TRY_ANOTHER);
     assert.match(msg, /Nothing is wrong on our side/);
-    assert.doesNotMatch(msg, /stolen|pick up/i);
+    assert.match(msg, /Try another card/);
+    assert.match(msg, /call the customer/i);
+    assert.doesNotMatch(msg, /stolen|pick up|lost|fraud/i);
+  });
+
+  it("already_paid / invalid / raw PAN never say Nothing is wrong on our side", () => {
+    const paid = guestCardMessage({ error: "already_paid" });
+    assert.equal(paid, GUEST_ALREADY_PAID);
+    assert.doesNotMatch(paid, /Nothing is wrong on our side/);
+    assert.doesNotMatch(paid, /\{/);
+    const invalid = guestCardMessage({ error: "invalid" });
+    assert.equal(invalid, GUEST_INVALID_LINK);
+    assert.doesNotMatch(invalid, /Nothing is wrong on our side/);
+    assert.doesNotMatch(invalid, /\{/);
+    const pan = guestCardMessage({ error: "raw_card_rejected" });
+    assert.equal(pan, GUEST_MISSING_CARD);
+    assert.doesNotMatch(pan, /Nothing is wrong on our side/);
+    assert.match(pan, /We're missing something/);
+    assert.doesNotMatch(pan, /\{/);
+  });
+
+  it("204 is not allowed, not expired", () => {
+    const msg = guestCardMessage({ response_code: "204" });
+    assert.match(msg, /Nothing is wrong on our side/);
+    assert.match(msg, /not allowed/);
+    assert.doesNotMatch(msg, /expired/i);
+    assert.doesNotMatch(msg, /\{/);
+  });
+
+  it("maps every NMI response_code 200-461 to plain English, never JSON", () => {
+    const expect = {
+      200: [/Nothing is wrong on our side/, /declined by processor/i],
+      201: [GUEST_DECLINE_DO_NOT_HONOR],
+      202: [/Nothing is wrong on our side/, /insufficient funds/i],
+      203: [/Nothing is wrong on our side/, /over limit/i],
+      204: [/Nothing is wrong on our side/, /not allowed/],
+      220: [GUEST_INACCURATE],
+      221: [GUEST_NOT_A_CARD],
+      222: [GUEST_NO_CARD_ON_FILE],
+      223: [/Nothing is wrong on our side/, /expired/i],
+      224: [GUEST_INACCURATE_EXP],
+      225: [GUEST_INACCURATE_CVV],
+      226: [GUEST_INACCURATE_PIN],
+      240: [GUEST_CALL_ISSUER],
+      250: [GUEST_TRY_ANOTHER],
+      251: [GUEST_TRY_ANOTHER],
+      252: [GUEST_TRY_ANOTHER],
+      253: [GUEST_TRY_ANOTHER],
+      260: [GUEST_RECURRING],
+      261: [GUEST_RECURRING_STOP_ALL],
+      262: [GUEST_RECURRING_STOP_THIS],
+      263: [GUEST_RECURRING_UPDATE],
+      264: [GUEST_RECURRING_RETRY_LATER],
+      300: [GUEST_OURS],
+      400: [GUEST_OURS],
+      410: [GUEST_OURS],
+      411: [GUEST_OURS],
+      420: [GUEST_OURS],
+      421: [GUEST_OURS],
+      430: [GUEST_DUPLICATE],
+      440: [GUEST_INACCURATE],
+      441: [GUEST_INACCURATE],
+      460: [GUEST_OURS],
+      461: [GUEST_UNSUPPORTED_CARD],
+    };
+    const codes = Object.keys(expect).map(Number);
+    assert.deepEqual(
+      Object.keys(NMI_CODE_MESSAGES).map(Number).sort((a, b) => a - b),
+      codes.sort((a, b) => a - b)
+    );
+    for (const code of codes) {
+      const msg = guestCardMessage({ response_code: String(code) });
+      assert.equal(msg, NMI_CODE_MESSAGES[code]);
+      assert.doesNotMatch(msg, /\{/);
+      assert.doesNotMatch(msg, /"object"/);
+      assert.doesNotMatch(msg, /response_code/);
+      for (const part of expect[code]) {
+        if (typeof part === "string") assert.equal(msg, part);
+        else assert.match(msg, part);
+      }
+      if (code >= 250 && code <= 253) {
+        assert.doesNotMatch(msg, /stolen|lost|fraud|pick up/i);
+        assert.match(msg, /Try another card/);
+      }
+      if (code === 204) assert.doesNotMatch(msg, /expired/i);
+      if ([220, 224, 225, 226, 440, 441].includes(code)) {
+        assert.match(msg, /inaccurate/);
+        assert.doesNotMatch(msg, /Nothing is wrong on our side/);
+      }
+      if (code === 221 || code === 461) {
+        assert.match(msg, /not a valid card/);
+        assert.doesNotMatch(msg, /Nothing is wrong on our side/);
+      }
+      if (code === 222) {
+        assert.match(msg, /We're missing something/);
+        assert.doesNotMatch(msg, /Nothing is wrong on our side/);
+      }
+      if ([300, 400, 410, 411, 420, 421, 460].includes(code)) {
+        assert.equal(msg, GUEST_OURS);
+      }
+      if (code === 430) {
+        assert.equal(msg, GUEST_DUPLICATE);
+        assert.doesNotMatch(msg, /Nothing is wrong on our side/);
+      }
+    }
   });
 
   it("JSON-only body → not-us default, no brace", () => {
@@ -690,6 +812,8 @@ describe("chargeGuestInvoice", () => {
     });
     assert.equal(out.ok, false);
     assert.equal(out.error, "raw_card_rejected");
+    assert.equal(out.message, GUEST_MISSING_CARD);
+    assert.doesNotMatch(out.message, /Nothing is wrong on our side/);
     assert.equal(looksLikePan("4111 1111 1111 1111"), true);
     assert.equal(looksLikePan("tok_collect"), false);
   });
@@ -708,6 +832,8 @@ describe("chargeGuestInvoice", () => {
     });
     assert.equal(out.ok, false);
     assert.equal(out.error, "already_paid");
+    assert.equal(out.message, GUEST_ALREADY_PAID);
+    assert.doesNotMatch(out.message, /Nothing is wrong on our side/);
   });
 });
 
@@ -893,6 +1019,8 @@ describe("chargePayCode", () => {
     assert.equal(second.ok, false);
     assert.equal(second.error, "already_paid");
     assert.equal(second.httpStatus, 409);
+    assert.equal(second.message, GUEST_ALREADY_PAID);
+    assert.doesNotMatch(second.message, /Nothing is wrong on our side/);
     assert.equal(sale.calls(), 1);
     assert.equal(claims.length, 1);
   });
@@ -927,7 +1055,29 @@ describe("chargePayCode", () => {
     assert.equal(second.ok, false);
     assert.equal(second.error, "already_paid");
     assert.equal(second.httpStatus, 409);
+    assert.equal(second.message, GUEST_ALREADY_PAID);
+    assert.doesNotMatch(second.message, /Nothing is wrong on our side/);
     assert.equal(sale.calls(), 1);
+  });
+
+  it("invalid pay code is not the bank-decline sentence", async () => {
+    const out = await chargePayCode({
+      code: "abc12xyz",
+      paymentToken: "tok_collect",
+      loadInvoice: async () => ({ ok: false, error: "invalid" }),
+      claimInvoicePaid: async () => {
+        throw new Error("no claim");
+      },
+      fetchImpl: async () => {
+        throw new Error("no fetch");
+      },
+    });
+    assert.equal(out.ok, false);
+    assert.equal(out.error, "invalid");
+    assert.equal(out.httpStatus, 410);
+    assert.equal(out.message, GUEST_INVALID_LINK);
+    assert.doesNotMatch(out.message, /Nothing is wrong on our side/);
+    assert.doesNotMatch(out.message, /\{/);
   });
 
   it("guest JRM-189 chargePayCode uses FLYNESHER.COM without NMI_JRM_DESCRIPTOR (Joseph 2026-09-08)", async () => {
@@ -1044,7 +1194,7 @@ describe("chargePayCode", () => {
   it("mint JSON and guest charge live on the brand website origin", () => {
     const src = fs.readFileSync(new URL("../server.js", import.meta.url), "utf8");
     assert.match(src, /guestPayOrigin\(/);
-    assert.match(src, /build: "2026-09-09-open-guest-copy"/);
+    assert.match(src, /build: "2026-09-09-nmi-code-map"/);
     assert.doesNotMatch(
       src.slice(src.indexOf("const stored = await storeInvoice"), src.indexOf("const shareUrl")),
       /publicHostFor\(req\)/
@@ -1062,7 +1212,12 @@ describe("chargePayCode", () => {
     assert.doesNotMatch(charge, /amountUsd:/);
     assert.match(charge, /chargePayCode\(\{/);
     assert.match(charge, /guestFailBody/);
+    assert.match(charge, /guestFailBody\(\{ error: "raw_card_rejected" \}\)/);
     assert.doesNotMatch(charge, /blockedReason \|\| result\.error/);
+    assert.doesNotMatch(
+      charge,
+      /sendJson\(res, 400, \{ ok: false, error: "raw_card_rejected" \}\)/
+    );
   });
 
   it("releases the paidAt claim when the NMI sale fails", async () => {

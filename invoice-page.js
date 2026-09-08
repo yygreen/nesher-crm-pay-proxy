@@ -295,7 +295,7 @@ export function renderInvoiceHtml(data) {
   const bankBtn = paid
     ? ""
     : `<a class="btn ${hasCard ? "btn-secondary" : "btn-primary"}" href="${mercuryUrl}">Pay with bank</a>`;
-  const hint = paid ? `<p class="hint">Paid. Thank you.</p>` : "";
+  const hint = paid ? `<p class="hint">Payment received. Thank you.</p>` : "";
   const actions = `
       ${cardBtn}
       ${bankBtn}

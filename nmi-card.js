@@ -249,7 +249,7 @@ function notUs(reason) {
   return `Nothing is wrong on our side.${named} ${GUEST_NOT_US_TAIL}`;
 }
 
-/** Bucket 1 default — bank declined, not us. */
+/** Bank declined, not us. */
 export const GUEST_DECLINE_DEFAULT = notUs("");
 
 export const GUEST_DECLINE_DO_NOT_HONOR = notUs("Do Not Honor");
@@ -269,7 +269,97 @@ export const GUEST_MISSING_CVV =
 export const GUEST_MISSING_DEFAULT =
   "We're missing something: amount / card details / security code. Fill that in, then Pay with card again.";
 
-const OURS_CODES = new Set(["300", "410", "411", "420", "430"]);
+export const GUEST_ALREADY_PAID =
+  "This payment is already recorded. No need to pay again.";
+
+export const GUEST_INVALID_LINK =
+  "This pay link is not valid. Ask us for a new one.";
+
+export const GUEST_LINK_EXPIRED =
+  "This pay link has expired. Ask us for a new one.";
+
+export const GUEST_INACCURATE =
+  "The payment details look inaccurate. Check the card number, expiration date, and security code, then try again.";
+
+export const GUEST_INACCURATE_EXP =
+  "The expiration date looks inaccurate. Check the month and year on the card, then try again.";
+
+export const GUEST_INACCURATE_CVV =
+  "The security code looks inaccurate. Check the three or four digits on the card, then try again.";
+
+export const GUEST_INACCURATE_PIN =
+  "The PIN looks inaccurate. Check it and try again, or use a card that does not need a PIN.";
+
+export const GUEST_NOT_A_CARD =
+  "That is not a valid card. Check the card number, or try another card.";
+
+export const GUEST_UNSUPPORTED_CARD =
+  "That card type is not a valid card for us. Try a different card.";
+
+export const GUEST_NO_CARD_ON_FILE =
+  "We're missing something: no card number on file. Fill in the card details, then Pay with card again.";
+
+export const GUEST_CALL_ISSUER =
+  "Nothing is wrong on our side. The customer's bank wants them to call the number on the back of the card before this charge can go through. Call the customer.";
+
+export const GUEST_TRY_ANOTHER =
+  "Nothing is wrong on our side. The bank will not take this card. Try another card, then call the customer.";
+
+export const GUEST_DUPLICATE =
+  "This looks like a duplicate charge. Check whether the payment already went through before trying again.";
+
+export const GUEST_RECURRING =
+  "Nothing is wrong on our side. The bank declined this recurring charge. Call the customer, or try another card.";
+
+export const GUEST_RECURRING_STOP_ALL =
+  "Nothing is wrong on our side. The bank declined this recurring charge and asked that all recurring payments on this card be stopped. Call the customer. Do not retry the same card.";
+
+export const GUEST_RECURRING_STOP_THIS =
+  "Nothing is wrong on our side. The bank declined this recurring charge and asked that this recurring program be stopped. Call the customer. Do not retry the same card.";
+
+export const GUEST_RECURRING_UPDATE =
+  "Nothing is wrong on our side. The bank declined this recurring charge. The card details need an update. Call the customer for a new card.";
+
+export const GUEST_RECURRING_RETRY_LATER =
+  "Nothing is wrong on our side. The bank declined this recurring charge and asked to retry in a few days. Call the customer. Do not keep retrying today.";
+
+/** docs.nmi.com response_code → one plain-English sentence. Never JSON. */
+export const NMI_CODE_MESSAGES = {
+  200: notUs("declined by processor"),
+  201: GUEST_DECLINE_DO_NOT_HONOR,
+  202: notUs("insufficient funds"),
+  203: notUs("over limit"),
+  204: notUs("not allowed"),
+  220: GUEST_INACCURATE,
+  221: GUEST_NOT_A_CARD,
+  222: GUEST_NO_CARD_ON_FILE,
+  223: notUs("expired"),
+  224: GUEST_INACCURATE_EXP,
+  225: GUEST_INACCURATE_CVV,
+  226: GUEST_INACCURATE_PIN,
+  240: GUEST_CALL_ISSUER,
+  250: GUEST_TRY_ANOTHER,
+  251: GUEST_TRY_ANOTHER,
+  252: GUEST_TRY_ANOTHER,
+  253: GUEST_TRY_ANOTHER,
+  260: GUEST_RECURRING,
+  261: GUEST_RECURRING_STOP_ALL,
+  262: GUEST_RECURRING_STOP_THIS,
+  263: GUEST_RECURRING_UPDATE,
+  264: GUEST_RECURRING_RETRY_LATER,
+  300: GUEST_OURS,
+  400: GUEST_OURS,
+  410: GUEST_OURS,
+  411: GUEST_OURS,
+  420: GUEST_OURS,
+  421: GUEST_OURS,
+  430: GUEST_DUPLICATE,
+  440: GUEST_INACCURATE,
+  441: GUEST_INACCURATE,
+  460: GUEST_OURS,
+  461: GUEST_UNSUPPORTED_CARD,
+};
+
 const MISSING_ERRORS = new Set([
   "amount_required",
   "amount_invalid",
@@ -283,6 +373,13 @@ const MISSING_CARD_ERRORS = new Set([
   "short_code_required",
   "invoicenumber required",
   "open_ref_required",
+]);
+const INVALID_LINK_ERRORS = new Set([
+  "invalid",
+  "not found",
+  "not_found",
+  "missing",
+  "gone",
 ]);
 
 function isUglyDump(value) {
@@ -358,27 +455,47 @@ function nmiDeclineSignals(src) {
   return out;
 }
 
+function messageForNmiCode(code) {
+  const n = Number(String(code || "").trim());
+  if (!Number.isFinite(n)) return null;
+  if (Object.prototype.hasOwnProperty.call(NMI_CODE_MESSAGES, n)) {
+    return NMI_CODE_MESSAGES[n];
+  }
+  return null;
+}
+
 /**
- * Guest-facing card line in three buckets. Never JSON, never PAN, never txn dump.
+ * Guest-facing card line. Buckets: bank / our side / missing / inaccurate /
+ * not a valid card / already paid / invalid link. Never JSON, never PAN.
  */
 export function guestCardMessage(saleOrNmiJson) {
   const { phrase, codes, error, httpStatus, response } =
     nmiDeclineSignals(saleOrNmiJson);
+  if (error === "already_paid") return GUEST_ALREADY_PAID;
+  if (INVALID_LINK_ERRORS.has(error)) return GUEST_INVALID_LINK;
   if (MISSING_ERRORS.has(error)) return GUEST_MISSING_AMOUNT;
   if (MISSING_CARD_ERRORS.has(error)) return GUEST_MISSING_CARD;
   if (error === "cvv" || error === "security code") return GUEST_MISSING_CVV;
 
-  const codeStr = new Set(codes.map((c) => String(c).toLowerCase()));
-  const ints = codes
-    .map((c) => Number(String(c).trim()))
-    .filter((n) => Number.isFinite(n));
-  const oursByCode = [...codeStr].some((c) => OURS_CODES.has(c));
   if (
     error === "keys_missing" ||
     error === "store_missing" ||
     error === "processor_error" ||
-    httpStatus >= 500 ||
-    oursByCode ||
+    error === "lookup failed" ||
+    error === "claim_failed" ||
+    httpStatus >= 500
+  ) {
+    return GUEST_OURS;
+  }
+
+  for (const c of codes) {
+    const mapped = messageForNmiCode(c);
+    if (mapped) return mapped;
+  }
+
+  if (error === "expired") return GUEST_LINK_EXPIRED;
+
+  if (
     /communication|timeout|network|econnreset|fetch failed/i.test(
       `${phrase} ${error}`
     )
@@ -386,27 +503,44 @@ export function guestCardMessage(saleOrNmiJson) {
     return GUEST_OURS;
   }
 
-  const blob = `${phrase} ${codes.join(" ")}`.toLowerCase();
-  if (/do not honor/.test(blob) || codeStr.has("201") || codeStr.has("05")) {
+  const blob = `${phrase} ${error}`.toLowerCase();
+  if (/do not honor/.test(blob) || codes.some((c) => String(c) === "05")) {
     return GUEST_DECLINE_DO_NOT_HONOR;
   }
-  if (
-    /insufficient|not sufficient|\bnsf\b/.test(blob) ||
-    codeStr.has("202")
-  ) {
+  if (/insufficient|not sufficient|\bnsf\b/.test(blob)) {
     return notUs("insufficient funds");
   }
-  if (/expired/.test(blob) || codeStr.has("204")) {
-    return notUs("expired");
-  }
-  if (/over.?limit/.test(blob) || codeStr.has("203")) {
+  if (/over.?limit/.test(blob)) {
     return notUs("over limit");
   }
+  if (/expired/.test(blob)) {
+    return notUs("expired");
+  }
+  if (/not allowed|not permitted/.test(blob)) {
+    return notUs("not allowed");
+  }
   if (
-    response === "2" ||
-    ints.some((n) => n >= 200 && n <= 299) ||
-    /pick\s*up|stolen|lost card|lost\/stolen/.test(blob)
+    /incorrect payment|inaccurate|invalid expiration|invalid card security|invalid cvv|invalid pin|format error|invalid transaction info/.test(
+      blob
+    )
   ) {
+    return GUEST_INACCURATE;
+  }
+  if (/no such card issuer|unsupported card/.test(blob)) {
+    return GUEST_NOT_A_CARD;
+  }
+  if (/pick\s*up|stolen|lost card|lost\/stolen|fraudulent/.test(blob)) {
+    return GUEST_TRY_ANOTHER;
+  }
+  if (/duplicate/.test(blob)) {
+    return GUEST_DUPLICATE;
+  }
+
+  const ints = codes
+    .map((c) => Number(String(c).trim()))
+    .filter((n) => Number.isFinite(n));
+  if (ints.some((n) => n >= 300 && n <= 499)) return GUEST_OURS;
+  if (response === "2" || ints.some((n) => n >= 200 && n <= 299)) {
     return GUEST_DECLINE_DEFAULT;
   }
   return GUEST_DECLINE_DEFAULT;
@@ -725,11 +859,13 @@ export async function chargeWithToken(opts = {}) {
 export async function chargeGuestInvoice(opts = {}) {
   const invoice = opts.invoice || {};
   if (invoice.paidAt) {
-    return { ok: false, error: "already_paid" };
+    const message = guestCardMessage({ error: "already_paid" });
+    return { ok: false, error: "already_paid", message, httpStatus: 409 };
   }
   const token = String(opts.paymentToken || "").trim();
   if (looksLikePan(token)) {
-    return { ok: false, error: "raw_card_rejected" };
+    const message = guestCardMessage({ error: "raw_card_rejected" });
+    return { ok: false, error: "raw_card_rejected", message, httpStatus: 400 };
   }
   return chargeWithToken({
     amountUsd: invoice.amountUsd,
@@ -775,24 +911,30 @@ export async function chargePayCode(opts = {}) {
 
   const verified = await opts.loadInvoice(code);
   if (!verified || !verified.ok || !verified.data) {
+    const err = verified?.error || "invalid";
+    const message = guestCardMessage({ error: err });
     return {
       ok: false,
-      error: verified?.error || "invalid",
+      error: err,
+      message,
       httpStatus: 410,
     };
   }
   const invoice = verified.data;
   if (invoice.paidAt) {
-    return { ok: false, error: "already_paid", httpStatus: 409 };
+    const message = guestCardMessage({ error: "already_paid" });
+    return { ok: false, error: "already_paid", message, httpStatus: 409 };
   }
 
   const claimedAt = opts.now || new Date().toISOString();
   const claimed = await opts.claimInvoicePaid(code, { paidAt: claimedAt });
   if (!claimed || !claimed.ok) {
     const err = claimed?.error || "claim_failed";
+    const message = guestCardMessage({ error: err });
     return {
       ok: false,
       error: err === "already_paid" ? "already_paid" : err,
+      message,
       httpStatus: err === "already_paid" ? 409 : 503,
     };
   }

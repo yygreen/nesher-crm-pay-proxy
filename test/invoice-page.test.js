@@ -275,7 +275,8 @@ describe("unified invoice token", () => {
     assert.doesNotMatch(html, /Collect\.js/);
     assert.doesNotMatch(html, /Pay with card/);
     assert.doesNotMatch(html, /Pay with bank/);
-    assert.match(html, /Paid\. Thank you\./);
+    assert.match(html, /Payment received\. Thank you\./);
+    assert.doesNotMatch(html, /Paid\. Thank you\./);
     assert.doesNotMatch(html, /Card processed by/);
     assert.doesNotMatch(html, /Your card statement shows/);
   });

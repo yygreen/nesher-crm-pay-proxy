@@ -147,13 +147,14 @@ describe("buildCustomerDraft", () => {
 });
 
 describe("injectPayButtons — customer list and detail", () => {
-  it("injects one Pay due button per name on the list, not on View/Edit", () => {
+  it("injects one Send pay link button per name on the list, not on View/Edit", () => {
     const out = injectPayButtons(LIST_HTML, "/customers/");
     assert.match(out, new RegExp(BUTTON_MARKER));
     assert.match(out, /data-kind="customer"/);
     assert.match(out, /data-id="212"/);
     assert.match(out, /data-id="348"/);
-    assert.match(out, /Pay due/);
+    assert.match(out, /Send pay link/);
+    assert.doesNotMatch(out, /Mercury Pay/);
     assert.match(out, /nesher-mercury-pay-js/);
     assert.match(out, /Create payment link/);
     assert.match(out, /\/__nesher_pay\/customer\//);
@@ -165,12 +166,13 @@ describe("injectPayButtons — customer list and detail", () => {
     );
   });
 
-  it("injects Mercury Pay Link on customer detail next to Payment", () => {
+  it("injects Send pay link on customer detail next to Payment", () => {
     const out = injectPayButtons(DETAIL_HTML, "/customers/212/");
     assert.match(out, new RegExp(BUTTON_MARKER));
     assert.match(out, /data-kind="customer"/);
     assert.match(out, /data-id="212"/);
-    assert.match(out, /Mercury Pay Link/);
+    assert.match(out, /Send pay link/);
+    assert.doesNotMatch(out, /Mercury Pay/);
     assert.match(out, /customer-action-pay[\s\S]*data-kind="customer"/);
     assert.equal((out.match(/data-kind="customer"/g) || []).length, 1);
   });
@@ -205,13 +207,24 @@ describe("injectPayButtons — customer list and detail", () => {
 });
 
 describe("customer pay mint path wiring", () => {
+  it("staff teal buttons say Send pay link / Card or bank link, never Mercury Pay", () => {
+    const src = fs.readFileSync(new URL("../inject.js", import.meta.url), "utf8");
+    assert.match(src, /Send pay link/);
+    assert.match(src, /Card or bank link/);
+    assert.match(src, /Create payment link/);
+    assert.doesNotMatch(src, /Mercury Pay/);
+    assert.doesNotMatch(src, /Send card\/bank pay link/);
+    assert.doesNotMatch(src, /"Pay due"/);
+    assert.doesNotMatch(src, /"Pay quote"/);
+  });
+
   it("staffCore includes the customer list and the customer API kind", () => {
     const src = fs.readFileSync(new URL("../server.js", import.meta.url), "utf8");
     assert.ok(src.includes("/^\\/customers\\/?$/.test(pathOnly)"));
     assert.ok(src.includes("hotel-offer|hotel|reservation|customer"));
     assert.ok(src.includes("loadCustomerPayTarget"));
     assert.ok(src.includes("buildCustomerDraft"));
-    assert.ok(src.includes('build: "2026-09-09-open-guest-copy"'));
+    assert.ok(src.includes('build: "2026-09-09-nmi-code-map"'));
     assert.ok(!/NMI_JRM_DESCRIPTOR\s*=/.test(src));
   });
 

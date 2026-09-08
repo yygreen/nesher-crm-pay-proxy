@@ -128,6 +128,7 @@ describe("inject per-offer buttons", () => {
     assert.match(out, /data-id="50"/);
     assert.match(out, /data-id="51"/);
     assert.equal((out.match(/data-kind="hotel-offer"/g) || []).length, 2);
-    assert.match(out, /Mercury Pay \(this quote\)/);
+    assert.match(out, /Send pay link/);
+    assert.doesNotMatch(out, /Mercury Pay/);
   });
 });

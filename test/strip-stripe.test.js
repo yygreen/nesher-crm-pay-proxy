@@ -130,7 +130,7 @@ describe("stripStripeUi", () => {
     const isGetAt = src.indexOf("if (isGet)");
     const waAt = src.indexOf("injectWhatsAppUi(");
     assert.ok(isGetAt > 0 && waAt > isGetAt);
-    assert.match(src, /build: "2026-09-09-open-guest-copy"/);
+    assert.match(src, /build: "2026-09-09-nmi-code-map"/);
   });
 
   it("POST save-error HTML is stripped and still gets the send-pay-link", () => {
@@ -138,7 +138,9 @@ describe("stripStripeUi", () => {
     assertGone(stripped);
     const out = injectPayButtons(stripped, "/reservations/99/payments/add/");
     assertGone(out);
-    assert.match(out, /Send card\/bank pay link/);
+    assert.match(out, /Card or bank link/);
+    assert.doesNotMatch(out, /Mercury Pay/);
+    assert.doesNotMatch(out, /Send card\/bank pay link/);
     assert.match(out, /id="id_amount"/);
     assert.match(out, />Save Payment</);
     assert.match(out, /Add Payment for GKT5U4/);

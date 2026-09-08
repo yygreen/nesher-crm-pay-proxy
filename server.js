@@ -918,7 +918,7 @@ function proxyWithInject(req, res) {
                 staffCore &&
                 /^\/reservations\/\d+\/payments\/add\/?$/.test(pathOnly)
               ) {
-                // Add Payment save-error: keep the teal Send card/bank pay link.
+                // Add Payment save-error: keep the teal Card or bank link.
                 // Do not widen staffCore; do not run WhatsApp / badges / intake.
                 injected = injectPayButtons(injected, pathOnly);
               }
@@ -1064,7 +1064,7 @@ const server = http.createServer(async (req, res) => {
         openBody.cvv ||
         openBody.ccexp
       ) {
-        sendJson(res, 400, { ok: false, error: "raw_card_rejected" });
+        sendJson(res, 400, guestFailBody({ error: "raw_card_rejected" }));
         return;
       }
       const openResult = await chargeOpenPay({
@@ -1117,7 +1117,7 @@ const server = http.createServer(async (req, res) => {
       body = {};
     }
     if (body.ccnumber || body.cc_number || body.cvv || body.ccexp) {
-      sendJson(res, 400, { ok: false, error: "raw_card_rejected" });
+      sendJson(res, 400, guestFailBody({ error: "raw_card_rejected" }));
       return;
     }
     const result = await chargePayCode({
@@ -1190,7 +1190,7 @@ const server = http.createServer(async (req, res) => {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-09-09-open-guest-copy",
+      build: "2026-09-09-nmi-code-map",
       snapEngage: {
         enabled: SNAPENGAGE_ENABLED,
         widgetId: SNAPENGAGE_WIDGET_ID,
