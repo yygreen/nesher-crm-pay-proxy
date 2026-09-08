@@ -242,7 +242,9 @@ export function staffCardFields(cardMint = {}) {
     cardUrl: hostedCard ? cardMint.cardUrl : null,
     cardBlockedReason: hasCard
       ? null
-      : cardMint.blockedReason || cardMint.error || null,
+      : cardMint.error === "second_dba_pending"
+        ? "second_dba_pending"
+        : cardMint.blockedReason || cardMint.error || null,
   };
 }
 

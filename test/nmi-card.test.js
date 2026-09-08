@@ -491,6 +491,14 @@ describe("agent paste", () => {
     const none = staffCardFields({ ok: false, error: "keys_missing" });
     assert.equal(none.creditCardEnabled, false);
     assert.equal(none.cardProcessor, "none");
+    const jrmBlocked = staffCardFields({
+      ok: false,
+      error: "second_dba_pending",
+      blockedReason:
+        "JRM card links wait on a Pinpoint second DBA / statement descriptor. Nesher (FLYNESHER.COM) can mint.",
+    });
+    assert.equal(jrmBlocked.cardBlockedReason, "second_dba_pending");
+    assert.doesNotMatch(jrmBlocked.cardBlockedReason || "", /flynesher/i);
     const hosted = staffCardFields({
       ok: true,
       cardUrl:
