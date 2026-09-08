@@ -257,3 +257,70 @@ export async function markInvoicePaid(idOrToken, extra = {}, poolImpl) {
     return { ok: false, error: e.message };
   }
 }
+
+/**
+ * Short codes for one CRM invoice number, newest first.
+ * Used by the NMI webhook to find the guest /pay row without the URL code.
+ */
+export async function findInvoicesByOrderId(orderId, poolImpl) {
+  const ref = String(orderId || "").trim();
+  if (!ref) return [];
+  try {
+    const pool = storePool(poolImpl);
+    await ensureTable(pool);
+    const r = await pool.query(
+      `SELECT id, payload, created_at
+         FROM nesher_pay_invoices
+        WHERE lower(payload->>'invoiceNumber') = lower($1)
+        ORDER BY created_at DESC
+        LIMIT 25`,
+      [ref]
+    );
+    return (r.rows || []).map((row) => ({
+      id: row.id,
+      payload:
+        row.payload && typeof row.payload === "object" ? row.payload : {},
+      createdAt: row.created_at || null,
+    }));
+  } catch (e) {
+    console.warn("findInvoicesByOrderId failed", e.message);
+    return [];
+  }
+}
+
+/** Compare-and-swap nmiNoteAt so guest charge and webhook write the CRM note once. */
+export async function claimNmiNote(idOrToken, extra = {}, poolImpl) {
+  const key = String(idOrToken || "").trim();
+  if (!isShortPayCode(key)) {
+    return { ok: false, error: "short_code_required" };
+  }
+  const nmiNoteAt = extra.nmiNoteAt || new Date().toISOString();
+  try {
+    const pool = storePool(poolImpl);
+    await ensureTable(pool);
+    const r = await pool.query(
+      `UPDATE nesher_pay_invoices
+          SET payload = COALESCE(payload, '{}'::jsonb) || $2::jsonb
+        WHERE id = $1
+          AND (payload->>'nmiNoteAt' IS NULL OR payload->>'nmiNoteAt' = '')
+        RETURNING payload`,
+      [key.toLowerCase(), JSON.stringify({ nmiNoteAt })]
+    );
+    if (!r.rows.length) {
+      const existing = await pool.query(
+        `SELECT payload FROM nesher_pay_invoices WHERE id = $1`,
+        [key.toLowerCase()]
+      );
+      if (!existing.rows.length) return { ok: false, error: "not found" };
+      return {
+        ok: false,
+        error: "already_noted",
+        nmiNoteAt: existing.rows[0].payload?.nmiNoteAt || true,
+      };
+    }
+    return { ok: true, nmiNoteAt, payload: r.rows[0].payload };
+  } catch (e) {
+    console.warn("claimNmiNote failed", e.message);
+    return { ok: false, error: e.message };
+  }
+}

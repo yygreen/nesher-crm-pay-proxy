@@ -4,6 +4,8 @@ import {
   claimInvoicePaid,
   releaseInvoicePaidClaim,
   markInvoicePaid,
+  findInvoicesByOrderId,
+  claimNmiNote,
 } from "../invoice-store.js";
 
 function memoryPool(seed = {}) {
@@ -21,10 +23,25 @@ function memoryPool(seed = {}) {
         const patch = JSON.parse(params[1]);
         const row = rows.get(id);
         if (!row) return { rows: [] };
-        const cur = row.payload && row.payload.paidAt;
+        const gate = s.includes("nmiNoteAt") ? "nmiNoteAt" : "paidAt";
+        const cur = row.payload && row.payload[gate];
         if (cur) return { rows: [] };
         row.payload = { ...row.payload, ...patch };
         return { rows: [{ payload: row.payload }] };
+      }
+      if (s.includes("lower(payload->>'invoiceNumber')")) {
+        const ref = String(params[0] || "").toLowerCase();
+        const out = [];
+        for (const [id, row] of rows) {
+          if (String(row.payload?.invoiceNumber || "").toLowerCase() === ref) {
+            out.push({
+              id,
+              payload: row.payload,
+              created_at: row.created_at || "2026-09-08T00:00:00Z",
+            });
+          }
+        }
+        return { rows: out };
       }
       if (s.includes("payload - 'paidAt'")) {
         const id = params[0];
@@ -106,5 +123,31 @@ describe("invoice-store paidAt CAS", () => {
     );
     assert.equal(again.ok, true);
     assert.equal(pool.rows.get("abc12xyz").payload.paidAt, "claim-2");
+  });
+
+  it("finds short codes by CRM invoice number, newest first", async () => {
+    const pool = memoryPool({
+      oldcode1: { amountUsd: 10, invoiceNumber: "RES-555TRAIN" },
+      newcode2: { amountUsd: 10, invoiceNumber: "RES-555TRAIN" },
+      otherxxx: { amountUsd: 1, invoiceNumber: "RES-OTHER" },
+    });
+    pool.rows.get("oldcode1").created_at = "2026-09-01T00:00:00Z";
+    pool.rows.get("newcode2").created_at = "2026-09-08T00:00:00Z";
+    const rows = await findInvoicesByOrderId("res-555train", pool);
+    assert.equal(rows.length, 2);
+    assert.equal(rows.some((r) => r.id === "newcode2"), true);
+    assert.equal(rows.some((r) => r.id === "otherxxx"), false);
+  });
+
+  it("second nmi note claim is already_noted", async () => {
+    const pool = memoryPool({
+      abc12xyz: { amountUsd: 55.55, invoiceNumber: "RES-555TRAIN" },
+    });
+    const first = await claimNmiNote("abc12xyz", { nmiNoteAt: "n1" }, pool);
+    const second = await claimNmiNote("abc12xyz", { nmiNoteAt: "n2" }, pool);
+    assert.equal(first.ok, true);
+    assert.equal(second.ok, false);
+    assert.equal(second.error, "already_noted");
+    assert.equal(pool.rows.get("abc12xyz").payload.nmiNoteAt, "n1");
   });
 });

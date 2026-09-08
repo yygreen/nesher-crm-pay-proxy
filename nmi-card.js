@@ -179,10 +179,16 @@ export function agentPaste({
   return lines.join("\n");
 }
 
-function money2(n) {
+export function money2(n) {
   const x = Math.round(Number(n) * 100) / 100;
   if (!Number.isFinite(x) || x <= 0) return null;
   return x.toFixed(2);
+}
+
+export function amountsMatch(a, b) {
+  const x = money2(a);
+  const y = money2(b);
+  return Boolean(x && y && x === y);
 }
 
 function splitName(full) {
@@ -622,40 +628,87 @@ export async function chargePayCode(opts = {}) {
     };
   }
 
+  const recorded = await recordNmiPaid({
+    code,
+    invoice,
+    transactionId: sale.transactionId,
+    paidAt: claimed.paidAt || claimedAt,
+    markInvoicePaid: opts.markInvoicePaid,
+    claimNmiNote: opts.claimNmiNote,
+    appendReservationNote: opts.appendReservationNote,
+    appendHotelNote: opts.appendHotelNote,
+  });
+  return {
+    ok: true,
+    transactionId: sale.transactionId || recorded.transactionId || null,
+    httpStatus: 200,
+    note: recorded.note,
+    noteWritten: Boolean(recorded.noteWritten),
+  };
+}
+
+/**
+ * Stamp paidAt + transactionId and write the CRM staff note once.
+ * Shared by guest /pay/:code/charge and the signed NMI webhook.
+ * claimNmiNote CAS-skips a second note if the browser POST already wrote it.
+ */
+export async function recordNmiPaid(opts = {}) {
+  const code = String(opts.code || "").trim();
+  const invoice = opts.invoice || {};
+  const transactionId = String(opts.transactionId || "").trim() || null;
+  const paidAt = opts.paidAt || new Date().toISOString();
   if (typeof opts.markInvoicePaid === "function") {
     try {
-      await opts.markInvoicePaid(code, {
-        paidAt: claimed.paidAt || claimedAt,
-        transactionId: sale.transactionId,
-      });
+      await opts.markInvoicePaid(code, { paidAt, transactionId });
     } catch (e) {
       console.warn("markInvoicePaid failed", e.message);
     }
   }
-
   const note = nmiPaidStaffNote({
     amountUsd: invoice.amountUsd,
-    transactionId: sale.transactionId,
+    transactionId,
   });
+  if (typeof opts.claimNmiNote === "function") {
+    let claimed;
+    try {
+      claimed = await opts.claimNmiNote(code, { nmiNoteAt: paidAt });
+    } catch (e) {
+      console.warn("claimNmiNote failed", e.message);
+      claimed = { ok: false, error: e.message };
+    }
+    if (!claimed || !claimed.ok) {
+      return {
+        ok: true,
+        transactionId,
+        note,
+        noteWritten: false,
+        alreadyNoted: true,
+        httpStatus: 200,
+      };
+    }
+  }
   const recordId = Number(invoice.recordId);
   const kind = noteKind(invoice);
+  let noteWritten = false;
   try {
     if (Number.isFinite(recordId) && recordId > 0) {
       if (kind === "reservation" && typeof opts.appendReservationNote === "function") {
         await opts.appendReservationNote(recordId, note);
+        noteWritten = true;
       } else if (kind === "hotel" && typeof opts.appendHotelNote === "function") {
         await opts.appendHotelNote(recordId, note);
+        noteWritten = true;
       }
     }
   } catch (e) {
     console.warn("nmi paid CRM note failed", e.message);
   }
-
   return {
     ok: true,
-    transactionId: sale.transactionId || null,
-    httpStatus: 200,
+    transactionId,
     note,
+    noteWritten,
+    httpStatus: 200,
   };
 }
 

@@ -29,6 +29,7 @@ Railway service that sits in front of **Nesher-CRM** and injects **Mercury Pay L
 | `CRM_UPSTREAM` | `https://nesher-crm-production.up.railway.app` |
 | `DATABASE_URL` | Public Postgres URL |
 | `MERCURY_API_BASE` | Optional. When Railway egress IP is not on the Mercury token whitelist, point at a local relay (see `C:\Users\User\nesher-mercury-relay`) |
+| `NMI_WEBHOOK_SECRET` | HMAC signing key from NMI portal Settings → Webhooks. Receiver: `POST /__nesher_pay/nmi-webhook`. Never print. |
 
 ## Mercury IP whitelist
 

@@ -18,6 +18,12 @@ import {
   descriptorFor,
 } from "./nmi-card.js";
 import {
+  nmiWebhookSecret,
+  verifyNmiWebhookSignature,
+  parseNmiWebhook,
+  applyNmiSaleSuccess,
+} from "./nmi-webhook.js";
+import {
   buildCombinedPayUrl,
   renderInvoiceHtml,
   renderInvoiceErrorHtml,
@@ -36,6 +42,8 @@ import {
   markInvoicePaid,
   claimInvoicePaid,
   releaseInvoicePaidClaim,
+  findInvoicesByOrderId,
+  claimNmiNote,
 } from "./invoice-store.js";
 import { injectPayButtons, injectPaidBadges } from "./inject.js";
 import { injectWhatsAppUi } from "./whatsapp-ui.js";
@@ -1040,6 +1048,7 @@ const server = http.createServer(async (req, res) => {
       claimInvoicePaid,
       releaseInvoicePaidClaim,
       markInvoicePaid,
+      claimNmiNote,
       appendHotelNote,
       appendReservationNote,
     });
@@ -1106,7 +1115,7 @@ const server = http.createServer(async (req, res) => {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-09-08-open-pay",
+      build: "2026-09-08-nmi-webhook",
       snapEngage: {
         enabled: SNAPENGAGE_ENABLED,
         widgetId: SNAPENGAGE_WIDGET_ID,
@@ -1133,7 +1142,77 @@ const server = http.createServer(async (req, res) => {
         path: "/__nesher_wa/webhook/",
         verifyTokenConfigured: Boolean(webhookVerifyToken()),
       },
+      nmiWebhook: {
+        path: "/__nesher_pay/nmi-webhook",
+        secretConfigured: Boolean(nmiWebhookSecret()),
+      },
     });
+    return;
+  }
+
+  // Signed NMI sale webhook (public — HMAC, no staff session).
+  if (
+    /^\/__nesher_pay\/nmi-webhook\/?$/.test(url.pathname) ||
+    /^\/__nesher_nmi\/webhook\/?$/.test(url.pathname)
+  ) {
+    if ((req.method || "GET") === "GET") {
+      sendJson(res, 200, { ok: true, service: "nmi-webhook" });
+      return;
+    }
+    if ((req.method || "") !== "POST") {
+      sendJson(res, 405, { error: "GET or POST only" });
+      return;
+    }
+    const secret = nmiWebhookSecret();
+    if (!secret) {
+      sendJson(res, 503, { ok: false, error: "webhook_secret_missing" });
+      return;
+    }
+    let rawBuf;
+    try {
+      rawBuf = await readBodyBuffer(req, 256 * 1024);
+    } catch {
+      sendJson(res, 413, { ok: false, error: "body_too_large" });
+      return;
+    }
+    const sigCheck = verifyNmiWebhookSignature(rawBuf, req.headers, secret);
+    if (!sigCheck.ok) {
+      sendJson(res, 403, { ok: false, error: sigCheck.error || "bad_signature" });
+      return;
+    }
+    let body = {};
+    try {
+      body = JSON.parse(rawBuf.toString("utf8") || "{}");
+    } catch {
+      sendJson(res, 400, { ok: false, error: "invalid JSON" });
+      return;
+    }
+    const parsed = parseNmiWebhook(body);
+    try {
+      const result = await applyNmiSaleSuccess(parsed, {
+        findInvoicesByOrderId,
+        claimInvoicePaid,
+        markInvoicePaid,
+        claimNmiNote,
+        appendHotelNote,
+        appendReservationNote,
+      });
+      if (result.ok === false) {
+        sendJson(res, result.httpStatus || 503, {
+          ok: false,
+          error: result.error || "apply_failed",
+        });
+        return;
+      }
+      sendJson(res, 200, {
+        ok: true,
+        ignored: result.ignored || null,
+        already: Boolean(result.already),
+      });
+    } catch (e) {
+      console.warn("nmi webhook apply", e.message);
+      sendJson(res, 503, { ok: false, error: "apply_failed" });
+    }
     return;
   }
 
