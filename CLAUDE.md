@@ -24,7 +24,7 @@ So "change the CRM" almost always means: edit an injector or add a route here,
 |------|------|
 | `server.js` | HTTP entry. Route dispatch (search `url.pathname`), `proxyWithInject()` decides which pages get which injectors. Health: `GET /__nesher_pay/health` (bump the `build` tag on every deploy). |
 | `inject.js` | Mercury **Pay Link** button + modal (CSS / SCRIPT strings) on `/jrm/hotels/*`, `/reservations/*`; PAID badges. |
-| `draft.js`, `quote.js`, `mercury.js`, `nmi-card.js`, `invoice-*.js`, `payments-sync.js` | Invoice drafting, Mercury AR API, Pinpoint/NMI CRM-priced card mint, guest pay page `/pay/<slug>`, paid-invoice sync. |
+| `draft.js`, `quote.js`, `mercury.js`, `nmi-card.js`, `invoice-*.js`, `open-pay.js`, `payments-sync.js` | Invoice drafting, Mercury AR API, Pinpoint/NMI CRM-priced card mint, guest pay page `/pay/<slug>`, Nesher open-amount `/pay/open`, paid-invoice sync. |
 | `db.js` | All CRM SQL (Postgres, Django tables e.g. `core_jrmhotelrequest`, `core_reservation`). |
 | `auth.js` | Staff-session check: validates the Django `sessionid` cookie against upstream. Use `requireStaff()` in server.js for any new staff route. |
 | `whatsapp-ui.js`, `whatsapp-media.js`, `whatsapp-webhook.js` | WhatsApp inbox UI on `/whatsapp/*`, Meta media/send API, webhook `/__nesher_wa/webhook/`. |

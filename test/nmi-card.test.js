@@ -739,7 +739,7 @@ describe("chargePayCode", () => {
   it("mint JSON and guest charge live on the brand website origin", () => {
     const src = fs.readFileSync(new URL("../server.js", import.meta.url), "utf8");
     assert.match(src, /guestPayOrigin\(/);
-    assert.match(src, /build: "2026-09-08-processed-by"/);
+    assert.match(src, /build: "2026-09-08-open-pay"/);
     assert.doesNotMatch(
       src.slice(src.indexOf("const stored = await storeInvoice"), src.indexOf("const shareUrl")),
       /publicHostFor\(req\)/

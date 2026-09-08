@@ -23,6 +23,14 @@ import {
   renderInvoiceErrorHtml,
 } from "./invoice-page.js";
 import {
+  isOpenPayPath,
+  isOpenPayChargePath,
+  openPayHostForbidden,
+  renderOpenPayHtml,
+  renderOpenPayErrorHtml,
+  chargeOpenPay,
+} from "./open-pay.js";
+import {
   storeInvoice,
   loadInvoice,
   markInvoicePaid,
@@ -944,6 +952,71 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Public Nesher open-amount /pay/open — guest types USD. Not a CRM invoice.
+  if (isOpenPayPath(url.pathname)) {
+    if (openPayHostForbidden(req.headers.host)) {
+      res.setHeader("Cache-Control", "no-store");
+      res.setHeader("Content-Type", "text/html; charset=utf-8");
+      res.writeHead(404);
+      res.end(
+        renderOpenPayErrorHtml("This payment page is not available here.")
+      );
+      return;
+    }
+    if (isOpenPayChargePath(url.pathname)) {
+      if ((req.method || "") !== "POST") {
+        sendJson(res, 405, { ok: false, error: "POST only" });
+        return;
+      }
+      let openBody = {};
+      try {
+        openBody = await readJson(req);
+      } catch {
+        openBody = {};
+      }
+      if (
+        openBody.ccnumber ||
+        openBody.cc_number ||
+        openBody.cvv ||
+        openBody.ccexp
+      ) {
+        sendJson(res, 400, { ok: false, error: "raw_card_rejected" });
+        return;
+      }
+      const openResult = await chargeOpenPay({
+        paymentToken:
+          openBody.payment_token ||
+          openBody.paymentToken ||
+          openBody.token ||
+          "",
+        amountUsd: openBody.amountUsd,
+        kind: "open",
+      });
+      if (openResult.ok) {
+        sendJson(res, 200, {
+          ok: true,
+          transactionId: openResult.transactionId || null,
+        });
+        return;
+      }
+      sendJson(res, openResult.httpStatus || 200, {
+        ok: false,
+        error: openResult.error,
+        message: openResult.blockedReason || openResult.error,
+      });
+      return;
+    }
+    if ((req.method || "GET") !== "GET") {
+      sendJson(res, 405, { ok: false, error: "GET only" });
+      return;
+    }
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.writeHead(200);
+    res.end(renderOpenPayHtml({ collectPublicKey: nmiPublicKey() }));
+    return;
+  }
+
   // Public guest card capture — CRM amount from the store, token only.
   const payChargeMatch =
     url.pathname.match(/^\/pay\/([^/]+)\/charge\/?$/) ||
@@ -1033,7 +1106,7 @@ const server = http.createServer(async (req, res) => {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-09-08-processed-by",
+      build: "2026-09-08-open-pay",
       snapEngage: {
         enabled: SNAPENGAGE_ENABLED,
         widgetId: SNAPENGAGE_WIDGET_ID,
