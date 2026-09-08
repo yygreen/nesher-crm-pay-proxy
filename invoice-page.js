@@ -11,7 +11,6 @@ import {
   stripDeadCardFields,
   collectScriptUrl,
   descriptorFor,
-  processedByFacts,
 } from "./nmi-card.js";
 
 const DEFAULT_TTL_SEC = 60 * 60 * 24 * 45;
@@ -164,6 +163,21 @@ function money(n) {
   );
 }
 
+const NESHER_LOGO_SRC = "https://assets.flynesher.com/nesher-logo.jpg";
+const NESHER_LOGO_FALLBACK =
+  "https://www.flynesher.com/static/core/images/nesher_logo.png";
+const JRM_LOGO_SRC = "https://jrmhotels.com/images/logos/jrm-logo.png";
+
+function brandLogoHtml(brand) {
+  const isJrm = brand && brand.id === "jrm";
+  const src = isJrm ? JRM_LOGO_SRC : NESHER_LOGO_SRC;
+  const alt = isJrm ? "JRM Hotels" : "Nesher Travel";
+  const fallback = isJrm
+    ? ""
+    : ` data-fallback="${esc(NESHER_LOGO_FALLBACK)}" onerror="this.onerror=null;this.src=this.getAttribute('data-fallback')"`;
+  return `<p class="logo"><img src="${esc(src)}" alt="${esc(alt)}" height="40"${fallback}></p>`;
+}
+
 function renderCollectJsForm(collectKey) {
   const src = esc(collectScriptUrl());
   const key = esc(collectKey);
@@ -241,15 +255,6 @@ function renderCollectJsForm(collectKey) {
     </div>`;
 }
 
-function processedByHintHtml({ paid, hasCard, brand }) {
-  if (paid) return `<p class="hint">Paid. Thank you.</p>`;
-  const f = processedByFacts({ brand, hasCard });
-  if (f.showCard) {
-    return `<p class="hint processed-by">Card processed by <strong>${esc(f.merchant)}</strong> (${esc(f.dba)}).<br>Your card statement shows <strong>${esc(f.descriptor)}</strong>.<br>Bank transfer is ${esc(f.bankRail)}, beneficiary <strong>${esc(f.bankBeneficiary)}</strong>.</p>`;
-  }
-  return `<p class="hint processed-by">Bank transfer is ${esc(f.bankRail)}, beneficiary <strong>${esc(f.bankBeneficiary)}</strong>.</p>`;
-}
-
 /**
  * Clean guest invoice — white, calm, two clear actions max.
  */
@@ -264,8 +269,6 @@ export function renderInvoiceHtml(data) {
     invoiceNumber: data.invoiceNumber,
     kind: data.kind,
   });
-  const isJrm = brand.id === "jrm";
-  const brandLabel = isJrm ? "JRM Hotels" : "Nesher · FlyNesher";
   const paid = Boolean(data.paidAt);
   const hostedCardUrl =
     !paid && isAllowedCardUrl(data.cardUrl) ? esc(data.cardUrl) : "";
@@ -287,7 +290,7 @@ export function renderInvoiceHtml(data) {
   const bankBtn = paid
     ? ""
     : `<a class="btn ${hasCard ? "btn-secondary" : "btn-primary"}" href="${mercuryUrl}">Pay with bank</a>`;
-  const hint = processedByHintHtml({ paid, hasCard, brand });
+  const hint = paid ? `<p class="hint">Paid. Thank you.</p>` : "";
   const actions = `
       ${cardBtn}
       ${bankBtn}
@@ -316,9 +319,10 @@ export function renderInvoiceHtml(data) {
       box-shadow: 0 1px 2px rgba(0,0,0,.04), 0 12px 32px rgba(0,0,0,.08);
       padding: 32px 28px 28px;
     }
-    .logo {
-      font-size: 13px; font-weight: 600; color: #666;
-      letter-spacing: .02em; margin: 0 0 28px;
+    .logo { margin: 0 0 24px; }
+    .logo img {
+      display: block; height: 40px; width: auto; max-width: 220px;
+      object-fit: contain;
     }
     .label { font-size: 13px; color: #888; margin: 0 0 6px; }
     .amount {
@@ -364,13 +368,13 @@ export function renderInvoiceHtml(data) {
       margin: 14px 0 0; font-size: 12.5px; color: #888;
       text-align: center; line-height: 1.45;
     }
-    .hint.processed-by { text-align: left; }
-    .hint.processed-by strong { color: #555; font-weight: 600; }
     .foot {
       margin-top: 28px; font-size: 12px; color: #aaa; text-align: center;
     }
     body.pay-brand-jrm { background: #FAF6EC; }
-    body.pay-brand-jrm .logo { color: #5C4528; }
+    body.pay-brand-jrm .logo img {
+      filter: brightness(0) sepia(1) hue-rotate(0deg) saturate(0.5);
+    }
     body.pay-brand-jrm .btn-primary { background: #5C4528; }
     body.pay-brand-jrm .btn-primary:hover { background: #3D3229; }
     body.pay-brand-jrm .card-field:focus-within {
@@ -381,7 +385,7 @@ export function renderInvoiceHtml(data) {
 </head>
 <body class="pay-brand-${esc(brand.id)}">
   <div class="sheet">
-    <p class="logo">${esc(brandLabel)}</p>
+    ${brandLogoHtml(brand)}
     <p class="label">Amount due</p>
     <p class="amount">${amount}</p>
     ${name ? `<p class="meta">For <strong>${name}</strong></p>` : ""}

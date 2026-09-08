@@ -64,8 +64,11 @@ describe("unified invoice token", () => {
     assert.match(html, /Pay with bank/);
     assert.match(html, /mercury\.com\/pay\/a/);
     assert.match(html, /\$100\.00/);
-    assert.match(html, /Nesher/);
+    assert.match(html, /alt="Nesher Travel"/);
+    assert.match(html, /assets\.flynesher\.com\/nesher-logo\.jpg/);
     assert.doesNotMatch(html, /Pay with card/);
+    assert.doesNotMatch(html, /Card processed by/);
+    assert.doesNotMatch(html, /Your card statement shows/);
   });
 
   it("brands a JRM invoice as JRM Hotels even without a card URL", () => {
@@ -75,7 +78,8 @@ describe("unified invoice token", () => {
       mercuryUrl: "https://app.mercury.com/pay/a",
       brandId: "jrm",
     });
-    assert.match(html, /JRM Hotels/);
+    assert.match(html, /alt="JRM Hotels"/);
+    assert.match(html, /jrmhotels\.com\/images\/logos\/jrm-logo\.png/);
     assert.doesNotMatch(html, /Nesher · JRM Hotels/);
     assert.doesNotMatch(html, /Pay with card/);
     assert.match(html, /Pay with bank/);
@@ -259,7 +263,9 @@ describe("unified invoice token", () => {
     assert.doesNotMatch(html, /Collect\.js/);
     assert.doesNotMatch(html, /Pay with card/);
     assert.doesNotMatch(html, /Pay with bank/);
-    assert.match(html, /Paid/);
+    assert.match(html, /Paid\. Thank you\./);
+    assert.doesNotMatch(html, /Card processed by/);
+    assert.doesNotMatch(html, /Your card statement shows/);
   });
 
   it("round-trips collectjs capture on the signed token", () => {
@@ -291,7 +297,7 @@ describe("unified invoice token", () => {
     );
   });
 
-  it("Nesher card-on page names Air Today, the statement descriptor, and the bank", () => {
+  it("guest Nesher page shows the real logo img and no processed-by sermon", () => {
     const html = renderInvoiceHtml({
       amountUsd: 55.55,
       invoiceNumber: "RES-555TRAIN",
@@ -301,17 +307,28 @@ describe("unified invoice token", () => {
       collectPublicKey: "pk_test_collect",
       brandId: "nesher",
     });
-    assert.match(html, /processed-by/);
-    assert.match(html, /Card processed by <strong>Air Today Travel Inc<\/strong>/);
-    assert.match(html, /\(Nesher Travel\)/);
-    assert.match(html, /Your card statement shows <strong>FLYNESHER\.COM<\/strong>/);
-    assert.match(html, /Bank transfer is Mercury \/ Bank Hapoalim, beneficiary <strong>Air Today Travel<\/strong>/);
-    assert.doesNotMatch(html, /beneficiary <strong>Air Today Travel Inc/);
+    assert.match(html, /<p class="logo"><img /);
+    assert.match(html, /src="https:\/\/assets\.flynesher\.com\/nesher-logo\.jpg"/);
+    assert.match(html, /alt="Nesher Travel"/);
+    assert.match(html, /height="40"/);
+    assert.match(
+      html,
+      /data-fallback="https:\/\/www\.flynesher\.com\/static\/core\/images\/nesher_logo\.png"/
+    );
+    assert.match(html, /Questions\? Reply to your booking message\./);
+    assert.doesNotMatch(html, /<p class="logo">Nesher/);
+    assert.doesNotMatch(html, /Nesher · FlyNesher/);
+    assert.doesNotMatch(html, /processed-by/);
+    assert.doesNotMatch(html, /Card processed by/);
+    assert.doesNotMatch(html, /Your card statement shows/);
+    assert.doesNotMatch(html, /FLYNESHER\.COM/);
+    assert.doesNotMatch(html, /Bank transfer is Mercury/);
+    assert.doesNotMatch(html, /beneficiary <strong>Air Today Travel/);
     assert.doesNotMatch(html, /Pinpoint\/NMI/);
     assert.doesNotMatch(html, /JRM HOTELS/);
   });
 
-  it("JRM bank-only page has the bank line and no card processed-by", () => {
+  it("guest JRM page shows the JRM logo img and no sermon", () => {
     const html = renderInvoiceHtml({
       amountUsd: 189,
       invoiceNumber: "JRM-189-O50",
@@ -319,27 +336,38 @@ describe("unified invoice token", () => {
       brandId: "jrm",
       kind: "hotel",
     });
-    assert.match(html, /processed-by/);
-    assert.match(html, /Bank transfer is Mercury \/ Bank Hapoalim, beneficiary <strong>Air Today Travel<\/strong>/);
+    assert.match(html, /<p class="logo"><img /);
+    assert.match(html, /src="https:\/\/jrmhotels\.com\/images\/logos\/jrm-logo\.png"/);
+    assert.match(html, /alt="JRM Hotels"/);
+    assert.match(html, /height="40"/);
+    assert.match(html, /body\.pay-brand-jrm \.logo img/);
+    assert.match(html, /filter: brightness\(0\) sepia\(1\)/);
+    assert.match(html, /Questions\? Reply to your booking message\./);
+    assert.doesNotMatch(html, /processed-by/);
     assert.doesNotMatch(html, /Card processed/);
     assert.doesNotMatch(html, /FLYNESHER/);
-    assert.doesNotMatch(html, /flynesher\.com/i);
+    assert.doesNotMatch(html, /Your card statement shows/);
+    assert.doesNotMatch(html, /Bank transfer is Mercury/);
     assert.doesNotMatch(html, /Pinpoint|NMI/);
     assert.doesNotMatch(html, /Nesher Travel/);
     assert.doesNotMatch(html, /statement shows/i);
+    assert.doesNotMatch(html, /assets\.flynesher\.com\/nesher-logo/);
   });
 
-  it("Nesher bank-only drops the card statement line", () => {
+  it("Nesher bank-only still has the logo and still has no sermon", () => {
     const html = renderInvoiceHtml({
       amountUsd: 100,
       invoiceNumber: "RES-1",
       mercuryUrl: "https://app.mercury.com/pay/a",
       brandId: "nesher",
     });
-    assert.match(html, /Bank transfer is Mercury \/ Bank Hapoalim, beneficiary <strong>Air Today Travel<\/strong>/);
+    assert.match(html, /src="https:\/\/assets\.flynesher\.com\/nesher-logo\.jpg"/);
+    assert.match(html, /alt="Nesher Travel"/);
     assert.doesNotMatch(html, /Card processed/);
     assert.doesNotMatch(html, /statement shows/i);
+    assert.doesNotMatch(html, /processed-by/);
     assert.doesNotMatch(html, /Pinpoint\/NMI/);
+    assert.doesNotMatch(html, /Bank transfer is Mercury/);
   });
 
   it("paints JRM guest chrome without Collect.js while DBA is pending", () => {
@@ -351,10 +379,11 @@ describe("unified invoice token", () => {
       kind: "hotel",
     });
     assert.match(html, /pay-brand-jrm/);
-    assert.match(html, /JRM Hotels/);
+    assert.match(html, /alt="JRM Hotels"/);
     assert.match(html, /#5C4528/);
     assert.match(html, /body\.pay-brand-jrm \.card-field:focus-within/);
     assert.doesNotMatch(html, /Collect\.js/);
     assert.doesNotMatch(html, /Nesher · FlyNesher/);
+    assert.doesNotMatch(html, /<p class="logo">JRM Hotels<\/p>/);
   });
 });
