@@ -1,11 +1,14 @@
 /**
- * Nesher open-amount guest card page.
- * Staff paste https://www.flynesher.com/pay/open — Office records (optional
- * Processor, Customer name, More info) then Card (amount, billing address
- * used to match the card, Collect.js). POST /pay/open/charge
- * {payment_token, amountUsd, customerName?, staffName?, notes?, address1?,
- * city?, state?, zip?, country?, email?}. Empty omitted. Address is AVS,
- * never a descriptor. Decline copy is guestCardMessage, never raw JSON.
+ * Nesher open-amount card pages.
+ * External (the link they send): https://www.flynesher.com/pay/open
+ *   Name, then Card (amount, AVS, Collect.js). POST /pay/open/charge
+ *   ignores staffName / processor / notes even if posted.
+ * Internal (office fills): https://www.flynesher.com/pay/office
+ *   Office (Taken by roster select, Name, More info) then Card.
+ *   POST /pay/office/charge accepts staffName only when it is exactly
+ *   one of OPEN_PAY_STAFF; otherwise omit field_5 (still charge).
+ * Empty omitted. Address is AVS, never a descriptor. Never Guest.
+ * Decline copy is guestCardMessage, never raw JSON.
  *
  * Not the CRM-priced /pay/<8-char> path (that amount stays store-locked).
  * Not JRM. Not Collect Checkout customPayment. No Mercury mint (no amount
@@ -26,11 +29,33 @@ import {
 } from "./nmi-card.js";
 
 export const OPEN_PAY_PATH = "/pay/open";
+export const OFFICE_PAY_PATH = "/pay/office";
 export const OPEN_PAY_MIN_USD = 1;
 export const OPEN_PAY_MAX_USD = 25000;
 export const NESHER_LOGO_URL = "https://assets.flynesher.com/nesher-logo.jpg";
 const NESHER_LOGO_FALLBACK =
   "https://www.flynesher.com/static/core/images/nesher_logo.png";
+
+/** Hardcoded desk roster. Exact strings only. No CRM fetch. */
+export const OPEN_PAY_STAFF = [
+  "Hershy",
+  "Sruly",
+  "Richter",
+  "Goldie",
+  "Joseph",
+  "John",
+  "Aby",
+  "Anne",
+  "Purity",
+  "Lennart",
+  "Kimberly",
+];
+
+export function rosterStaffName(value) {
+  const n = recordName(value);
+  if (!n) return "";
+  return OPEN_PAY_STAFF.includes(n) ? n : "";
+}
 
 function normPath(pathname) {
   const p = String(pathname || "").split("?")[0];
@@ -51,6 +76,21 @@ export function isOpenPayPath(pathname) {
 export function isOpenPayChargePath(pathname) {
   const p = normPath(pathname);
   return p === "/pay/open/charge" || p === "/__nesher_pay/open/charge";
+}
+
+export function isOfficePayPath(pathname) {
+  const p = normPath(pathname);
+  return (
+    p === "/pay/office" ||
+    p === "/pay/office/charge" ||
+    p === "/__nesher_pay/office" ||
+    p === "/__nesher_pay/office/charge"
+  );
+}
+
+export function isOfficePayChargePath(pathname) {
+  const p = normPath(pathname);
+  return p === "/pay/office/charge" || p === "/__nesher_pay/office/charge";
 }
 
 /**
@@ -134,6 +174,19 @@ export function decideOpenPayPage(headers, data = {}) {
   };
 }
 
+export function decideOfficePayPage(headers, data = {}) {
+  if (!openPayRequestAllowed(headers)) {
+    return {
+      status: 404,
+      html: renderOpenPayErrorHtml("This payment page is not available here."),
+    };
+  }
+  return {
+    status: 200,
+    html: renderOfficePayHtml(data),
+  };
+}
+
 export function parseOpenAmountUsd(value) {
   if (value == null || value === "") {
     return { ok: false, error: "amount_required" };
@@ -199,10 +252,11 @@ function httpStatusFor(error) {
 /**
  * Open-amount capture. Amount comes from the guest POST (validated here).
  * CRM /pay/:code/charge must keep ignoring body.amount — this is the only
- * route that reads amountUsd from the client. Processor / customer names /
- * notes are optional records (NMI field_4 / field_5 / field_6). Billing
- * address is optional AVS on billing_address — never a charge gate, never
- * payment_descriptor, never invented as "Guest".
+ * route that reads amountUsd from the client. Guest path ignores staff /
+ * notes even if posted. Office path (opts.office) records Taken by only
+ * when it matches OPEN_PAY_STAFF exactly (field_5) and notes (field_6).
+ * Customer name is field_4 on both. Billing address is optional AVS —
+ * never a charge gate, never payment_descriptor, never invented as "Guest".
  */
 export async function chargeOpenPay(opts = {}) {
   const kind = String(opts.kind || "open").toLowerCase();
@@ -252,9 +306,10 @@ export async function chargeOpenPay(opts = {}) {
       httpStatus: 400,
     };
   }
+  const office = opts.office === true;
   const customerName = recordName(opts.customerName);
-  const staffName = recordName(opts.staffName);
-  const notes = recordName(opts.notes || opts.moreInfo, 255);
+  const staffName = office ? rosterStaffName(opts.staffName) : "";
+  const notes = office ? recordName(opts.notes || opts.moreInfo, 255) : "";
   const address1 = recordName(opts.address1 || opts.address, 255);
   const city = recordName(opts.city, 80);
   const state = recordName(opts.state, 40);
@@ -299,6 +354,10 @@ export async function chargeOpenPay(opts = {}) {
   };
 }
 
+export function chargeOfficePay(opts = {}) {
+  return chargeOpenPay({ ...opts, office: true });
+}
+
 export function renderOpenPayErrorHtml(message) {
   const msg = esc(message || "This page is not available.");
   return `<!doctype html>
@@ -315,9 +374,18 @@ export function renderOpenPayErrorHtml(message) {
 <body><div class="box"><h1>Link unavailable</h1><p>${msg}</p></div></body></html>`;
 }
 
-function renderCollectJsForm(collectKey) {
+function renderCollectJsForm(collectKey, opts = {}) {
   const src = esc(collectScriptUrl());
   const key = esc(collectKey);
+  const office = opts.office === true;
+  const chargePath = office ? "/pay/office/charge" : "/pay/open/charge";
+  const officeFields = office
+    ? `              var staffName=readName("staff-name");
+              var notes=readName("more-info",255);
+              if(staffName) payload.staffName=staffName;
+              if(notes) payload.notes=notes;
+`
+    : "";
   return `<div id="card-form">
       <p class="card-field-label">Card number</p>
       <div id="ccnumber" class="card-field"></div>
@@ -384,8 +452,6 @@ function renderCollectJsForm(collectKey) {
               if(amt==null){showErr(${JSON.stringify(GUEST_MISSING_AMOUNT)});return;}
               var payload={payment_token:token,amountUsd:amt};
               var customerName=readName("customer-name");
-              var staffName=readName("staff-name");
-              var notes=readName("more-info",255);
               var address1=readName("billing-address",255);
               var city=readName("billing-city");
               var state=readName("billing-state",40);
@@ -393,16 +459,14 @@ function renderCollectJsForm(collectKey) {
               var country=readName("billing-country",40);
               var email=readName("billing-email",120);
               if(customerName) payload.customerName=customerName;
-              if(staffName) payload.staffName=staffName;
-              if(notes) payload.notes=notes;
-              if(address1) payload.address1=address1;
+${officeFields}              if(address1) payload.address1=address1;
               if(city) payload.city=city;
               if(state) payload.state=state;
               if(zip) payload.zip=zip;
               if(country) payload.country=country;
               if(email) payload.email=email;
               if(btn) btn.disabled=true;
-              fetch("/pay/open/charge",{
+              fetch(${JSON.stringify(chargePath)},{
                 method:"POST",
                 headers:{"Content-Type":"application/json"},
                 body:JSON.stringify(payload)
@@ -438,14 +502,42 @@ function renderCollectJsForm(collectKey) {
     </div>`;
 }
 
-export function renderOpenPayHtml(data = {}) {
+function staffSelectHtml() {
+  const opts = ['<option value=""></option>'].concat(
+    OPEN_PAY_STAFF.map((n) => `<option value="${esc(n)}">${esc(n)}</option>`)
+  );
+  return `<select id="staff-name" autocomplete="off">${opts.join("")}</select>`;
+}
+
+function renderPaySheet(data = {}, opts = {}) {
+  const office = opts.office === true;
   const collectKey = String(data.collectPublicKey || "").trim();
   const collectOn = Boolean(collectKey);
   const card = collectOn
-    ? renderCollectJsForm(collectKey)
+    ? renderCollectJsForm(collectKey, { office })
     : `<p class="hint">Card pay is not available right now.</p>`;
   const logo = esc(NESHER_LOGO_URL);
   const logoFallback = esc(NESHER_LOGO_FALLBACK);
+  const top = office
+    ? `<div class="group" id="office-group">
+      <h2 class="group-title">Office</h2>
+      <div class="meta-field">
+        <p class="label">Taken by</p>
+        ${staffSelectHtml()}
+      </div>
+      <div class="meta-field">
+        <p class="label">Name</p>
+        <input id="customer-name" type="text" maxlength="80" autocomplete="name" />
+      </div>
+      <div class="meta-field">
+        <p class="label">More info</p>
+        <textarea id="more-info" maxlength="255" rows="2"></textarea>
+      </div>
+    </div>`
+    : `<div class="meta-field" id="guest-name">
+      <p class="label">Name</p>
+      <input id="customer-name" type="text" maxlength="80" autocomplete="name" />
+    </div>`;
 
   return `<!doctype html>
 <html lang="en">
@@ -486,12 +578,13 @@ export function renderOpenPayHtml(data = {}) {
     }
     .meta-field { margin: 12px 0 0; }
     .meta-field:first-of-type { margin-top: 0; }
-    .meta-field input {
+    #guest-name { margin: 0 0 14px; }
+    .meta-field input, .meta-field select {
       width: 100%; font-size: 15px; font-family: inherit; color: #111;
       border: 1px solid #D8DEE4; border-radius: 10px; padding: 10px 12px;
       background: #fff;
     }
-    .meta-field input:focus, .meta-field textarea:focus {
+    .meta-field input:focus, .meta-field textarea:focus, .meta-field select:focus {
       outline: none; border-color: #3D7A99;
       box-shadow: 0 0 0 3px rgba(61,122,153,.18);
     }
@@ -563,21 +656,7 @@ export function renderOpenPayHtml(data = {}) {
 <body class="pay-brand-nesher">
   <div class="sheet">
     <p class="logo"><img src="${logo}" alt="Nesher Travel" height="40" data-fallback="${logoFallback}" onerror="this.onerror=null;this.src=this.getAttribute('data-fallback')"></p>
-    <div class="group" id="office-group">
-      <h2 class="group-title">Office</h2>
-      <div class="meta-field">
-        <p class="label">Processor</p>
-        <input id="staff-name" type="text" maxlength="80" autocomplete="off" />
-      </div>
-      <div class="meta-field">
-        <p class="label">Customer name</p>
-        <input id="customer-name" type="text" maxlength="80" autocomplete="name" />
-      </div>
-      <div class="meta-field">
-        <p class="label">More info</p>
-        <textarea id="more-info" maxlength="255" rows="2"></textarea>
-      </div>
-    </div>
+    ${top}
     <div class="group group-card" id="card-group">
       <h2 class="group-title">Card</h2>
       <div id="amount-wrap">
@@ -624,4 +703,12 @@ export function renderOpenPayHtml(data = {}) {
   </div>
 </body>
 </html>`;
+}
+
+export function renderOpenPayHtml(data = {}) {
+  return renderPaySheet(data, { office: false });
+}
+
+export function renderOfficePayHtml(data = {}) {
+  return renderPaySheet(data, { office: true });
 }

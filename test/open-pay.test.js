@@ -4,16 +4,23 @@ import fs from "node:fs";
 import {
   OPEN_PAY_MAX_USD,
   OPEN_PAY_MIN_USD,
+  OPEN_PAY_STAFF,
   NESHER_LOGO_URL,
   isOpenPayPath,
   isOpenPayChargePath,
+  isOfficePayPath,
+  isOfficePayChargePath,
   openPayHostAllowed,
   openPayRequestAllowed,
   decideOpenPayPage,
+  decideOfficePayPage,
   parseOpenAmountUsd,
   mintOpenInvoiceNumber,
+  rosterStaffName,
   chargeOpenPay,
+  chargeOfficePay,
   renderOpenPayHtml,
+  renderOfficePayHtml,
   renderOpenPayErrorHtml,
 } from "../open-pay.js";
 import { chargePayCode, NMI_HOST } from "../nmi-card.js";
@@ -30,6 +37,43 @@ describe("open-pay paths", () => {
     assert.equal(isOpenPayPath("/pay/openx"), false);
     assert.equal(isOpenPayPath("/pay/open-amount"), false);
     assert.equal(isOpenPayPath("/pay/abc12xyz/charge"), false);
+    assert.equal(isOpenPayPath("/pay/office"), false);
+    assert.equal(isOpenPayPath("/pay/office/charge"), false);
+    assert.equal(isOfficePayPath("/pay/office"), true);
+    assert.equal(isOfficePayPath("/pay/office/"), true);
+    assert.equal(isOfficePayPath("/pay/office/charge"), true);
+    assert.equal(isOfficePayPath("/__nesher_pay/office"), true);
+    assert.equal(isOfficePayPath("/__nesher_pay/office/charge/"), true);
+    assert.equal(isOfficePayChargePath("/pay/office/charge"), true);
+    assert.equal(isOfficePayChargePath("/pay/office"), false);
+    assert.equal(isOfficePayChargePath("/pay/open/charge"), false);
+    assert.equal(isOfficePayPath("/pay/open"), false);
+    assert.equal(isOfficePayPath("/pay/officer"), false);
+    assert.equal(isOfficePayPath("/pay/7wm3td6g"), false);
+  });
+
+  it("roster is the named desk people, exact strings only", () => {
+    assert.deepEqual(OPEN_PAY_STAFF, [
+      "Hershy",
+      "Sruly",
+      "Richter",
+      "Goldie",
+      "Joseph",
+      "John",
+      "Aby",
+      "Anne",
+      "Purity",
+      "Lennart",
+      "Kimberly",
+    ]);
+    assert.equal(rosterStaffName("Hershy"), "Hershy");
+    assert.equal(rosterStaffName(" Goldie "), "Goldie");
+    assert.equal(rosterStaffName("hershy"), "");
+    assert.equal(rosterStaffName("Hershey"), "");
+    assert.equal(rosterStaffName("goldy"), "");
+    assert.equal(rosterStaffName("Processor"), "");
+    assert.equal(rosterStaffName("Guest"), "");
+    assert.equal(rosterStaffName(""), "");
   });
 
   it("allowlists only flynesher.com and www.flynesher.com", () => {
@@ -101,11 +145,30 @@ describe("open-pay paths", () => {
     });
     assertClosed({});
     assertClosed({ host: "" });
+    function assertOfficeClosed(headers) {
+      const page = decideOfficePayPage(headers, collect);
+      assert.equal(page.status, 404);
+      assert.doesNotMatch(page.html, /Collect\.js/);
+      assert.doesNotMatch(page.html, /Taken by/);
+      assert.doesNotMatch(page.html, /Hershy/);
+    }
+    assertOfficeClosed({ host: "www.jrmhotels.com" });
+    assertOfficeClosed({ host: "jrmhotels.com" });
+    assertOfficeClosed({ host: "crm.flynesher.com" });
+    assertOfficeClosed({});
+    assertOfficeClosed({ host: "" });
     const ok = decideOpenPayPage({ host: "www.flynesher.com" }, collect);
     assert.equal(ok.status, 200);
     assert.match(ok.html, /Collect\.js/);
     assert.match(ok.html, /id="amount-usd"/);
     assert.match(ok.html, /Pay with card/);
+    assert.doesNotMatch(ok.html, /Taken by/);
+    assert.doesNotMatch(ok.html, /Processor/);
+    const officeOk = decideOfficePayPage({ host: "www.flynesher.com" }, collect);
+    assert.equal(officeOk.status, 200);
+    assert.match(officeOk.html, /Collect\.js/);
+    assert.match(officeOk.html, /Taken by/);
+    assert.match(officeOk.html, /Hershy/);
   });
 });
 
@@ -163,16 +226,24 @@ describe("renderOpenPayHtml", () => {
     assert.match(html, /alt="Nesher Travel"/);
     assert.match(html, /height="40"/);
     assert.match(html, /Pay with card/);
-    assert.match(html, /id="staff-name"/);
     assert.match(html, /id="customer-name"/);
-    assert.match(html, /id="more-info"/);
-    assert.match(html, /id="office-group"/);
+    assert.match(html, /id="guest-name"/);
+    assert.match(html, />Name</);
+    assert.doesNotMatch(html, /id="staff-name"/);
+    assert.doesNotMatch(html, /id="more-info"/);
+    assert.doesNotMatch(html, /id="office-group"/);
+    assert.doesNotMatch(html, /<h2 class="group-title">Office<\/h2>/);
+    assert.doesNotMatch(html, />Processor</);
+    assert.doesNotMatch(html, /Taken by/);
+    assert.doesNotMatch(html, /Hershy/);
+    assert.doesNotMatch(html, /Sruly/);
+    assert.doesNotMatch(html, /Richter/);
+    assert.doesNotMatch(html, /Goldie/);
+    assert.doesNotMatch(html, /<select/);
+    assert.doesNotMatch(html, />Customer name</);
+    assert.doesNotMatch(html, />More info</);
     assert.match(html, /id="card-group"/);
-    assert.match(html, /<h2 class="group-title">Office<\/h2>/);
     assert.match(html, /<h2 class="group-title">Card<\/h2>/);
-    assert.match(html, />Processor</);
-    assert.match(html, />Customer name</);
-    assert.match(html, />More info</);
     assert.match(html, /id="billing-address"/);
     assert.match(html, /id="billing-city"/);
     assert.match(html, /id="billing-state"/);
@@ -186,47 +257,21 @@ describe("renderOpenPayHtml", () => {
     assert.match(html, />Country</);
     assert.match(html, />Email</);
     assert.match(html, /Used to match the card\./);
-    assert.doesNotMatch(html, /id="staff-name"[^>]*required/);
     assert.doesNotMatch(html, /id="customer-name"[^>]*required/);
-    assert.doesNotMatch(html, /id="more-info"[^>]*required/);
     assert.doesNotMatch(html, /id="billing-address"[^>]*required/);
     assert.doesNotMatch(html, /id="billing-city"[^>]*required/);
     assert.doesNotMatch(html, /id="billing-state"[^>]*required/);
     assert.doesNotMatch(html, /id="billing-zip"[^>]*required/);
     assert.doesNotMatch(html, /id="billing-country"[^>]*required/);
     assert.doesNotMatch(html, /id="billing-email"[^>]*required/);
-    const officeAt = html.indexOf(">Office<");
+    const nameAt = html.indexOf(">Name<");
     const cardAt = html.indexOf(">Card<");
     const amountAt = html.indexOf('id="amount-usd"');
-    const processorAt = html.indexOf(">Processor<");
-    assert.ok(officeAt > 0 && officeAt < processorAt);
-    assert.ok(processorAt < cardAt);
+    assert.ok(nameAt > 0 && nameAt < cardAt);
     assert.ok(cardAt > 0 && cardAt < amountAt);
-    const officeHtml = html.slice(
-      html.indexOf('id="office-group"'),
-      html.indexOf('id="card-group"')
-    );
     const cardHtml = html.slice(html.indexOf('id="card-group"'));
-    assert.match(officeHtml, /id="staff-name"/);
-    assert.match(officeHtml, /id="customer-name"/);
-    assert.match(officeHtml, /id="more-info"/);
-    assert.match(officeHtml, />Processor</);
-    assert.match(officeHtml, />Customer name</);
-    assert.match(officeHtml, />More info</);
-    assert.doesNotMatch(officeHtml, /id="billing-address"/);
-    assert.doesNotMatch(officeHtml, /id="billing-city"/);
-    assert.doesNotMatch(officeHtml, /id="billing-state"/);
-    assert.doesNotMatch(officeHtml, /id="billing-zip"/);
-    assert.doesNotMatch(officeHtml, /id="billing-country"/);
-    assert.doesNotMatch(officeHtml, /id="billing-email"/);
-    assert.doesNotMatch(officeHtml, /id="amount-usd"/);
     assert.match(cardHtml, /id="amount-usd"/);
     assert.match(cardHtml, /id="billing-address"/);
-    assert.match(cardHtml, /id="billing-city"/);
-    assert.match(cardHtml, /id="billing-state"/);
-    assert.match(cardHtml, /id="billing-zip"/);
-    assert.match(cardHtml, /id="billing-country"/);
-    assert.match(cardHtml, /id="billing-email"/);
     assert.match(cardHtml, /Used to match the card\./);
     assert.doesNotMatch(cardHtml, /id="staff-name"/);
     assert.doesNotMatch(cardHtml, /id="customer-name"/);
@@ -248,8 +293,8 @@ describe("renderOpenPayHtml", () => {
     assert.ok(hideAt > html.indexOf('if(x.j&&x.j.ok)'));
     assert.match(html, /var payload=\{payment_token:token,amountUsd:amt\}/);
     assert.match(html, /if\(customerName\) payload\.customerName=customerName/);
-    assert.match(html, /if\(staffName\) payload\.staffName=staffName/);
-    assert.match(html, /if\(notes\) payload\.notes=notes/);
+    assert.doesNotMatch(html, /payload\.staffName/);
+    assert.doesNotMatch(html, /payload\.notes/);
     assert.match(html, /if\(address1\) payload\.address1=address1/);
     assert.match(html, /if\(city\) payload\.city=city/);
     assert.match(html, /if\(state\) payload\.state=state/);
@@ -264,6 +309,7 @@ describe("renderOpenPayHtml", () => {
     assert.match(html, /problem on our side/);
     assert.doesNotMatch(html, /x\.j\.error/);
     assert.match(html, /fetch\("\/pay\/open\/charge"/);
+    assert.doesNotMatch(html, /fetch\("\/pay\/office\/charge"/);
     assert.doesNotMatch(html, /Card processed by/);
     assert.doesNotMatch(html, /Air Today Travel/);
     assert.doesNotMatch(html, /Your card statement shows/);
@@ -297,6 +343,74 @@ describe("renderOpenPayHtml", () => {
     const err = renderOpenPayErrorHtml("nope");
     assert.match(err, /nope/);
     assert.doesNotMatch(err, /Card processed by/);
+  });
+});
+
+describe("renderOfficePayHtml", () => {
+  const html = renderOfficePayHtml({ collectPublicKey: "pk_test_collect" });
+
+  it("Office then Card: Taken by select, Name, More info, none required", () => {
+    assert.match(html, /id="office-group"/);
+    assert.match(html, /<h2 class="group-title">Office<\/h2>/);
+    assert.match(html, /<h2 class="group-title">Card<\/h2>/);
+    assert.match(html, />Taken by</);
+    assert.match(html, /<select id="staff-name"/);
+    assert.match(html, /<option value=""><\/option>/);
+    assert.match(html, /<option value="Hershy">Hershy<\/option>/);
+    assert.match(html, /<option value="Sruly">Sruly<\/option>/);
+    assert.match(html, /<option value="Richter">Richter<\/option>/);
+    assert.match(html, /<option value="Goldie">Goldie<\/option>/);
+    assert.match(html, /<option value="Joseph">Joseph<\/option>/);
+    assert.match(html, /<option value="John">John<\/option>/);
+    assert.match(html, /<option value="Aby">Aby<\/option>/);
+    assert.match(html, /<option value="Anne">Anne<\/option>/);
+    assert.match(html, /<option value="Purity">Purity<\/option>/);
+    assert.match(html, /<option value="Lennart">Lennart<\/option>/);
+    assert.match(html, /<option value="Kimberly">Kimberly<\/option>/);
+    assert.doesNotMatch(html, /Hershey/);
+    assert.doesNotMatch(html, />Processor</);
+    assert.match(html, />Name</);
+    assert.match(html, /id="customer-name"/);
+    assert.match(html, />More info</);
+    assert.match(html, /id="more-info"/);
+    assert.doesNotMatch(html, /id="staff-name"[^>]*required/);
+    assert.doesNotMatch(html, /id="customer-name"[^>]*required/);
+    assert.doesNotMatch(html, /id="more-info"[^>]*required/);
+    assert.doesNotMatch(html, /<select id="staff-name"[^>]*required/);
+    const officeAt = html.indexOf(">Office<");
+    const takenAt = html.indexOf(">Taken by<");
+    const cardAt = html.indexOf(">Card<");
+    const amountAt = html.indexOf('id="amount-usd"');
+    assert.ok(officeAt > 0 && officeAt < takenAt);
+    assert.ok(takenAt < cardAt);
+    assert.ok(cardAt > 0 && cardAt < amountAt);
+    const officeHtml = html.slice(
+      html.indexOf('id="office-group"'),
+      html.indexOf('id="card-group"')
+    );
+    const cardHtml = html.slice(html.indexOf('id="card-group"'));
+    assert.match(officeHtml, /id="staff-name"/);
+    assert.match(officeHtml, /id="customer-name"/);
+    assert.match(officeHtml, /id="more-info"/);
+    assert.match(officeHtml, />Taken by</);
+    assert.match(officeHtml, />Name</);
+    assert.match(officeHtml, />More info</);
+    assert.doesNotMatch(officeHtml, /id="billing-address"/);
+    assert.doesNotMatch(officeHtml, /id="amount-usd"/);
+    assert.match(cardHtml, /id="amount-usd"/);
+    assert.match(cardHtml, /Used to match the card\./);
+    assert.match(cardHtml, /Pay with card/);
+    assert.doesNotMatch(cardHtml, /id="staff-name"/);
+    assert.match(html, /if\(staffName\) payload\.staffName=staffName/);
+    assert.match(html, /if\(notes\) payload\.notes=notes/);
+    assert.match(html, /fetch\("\/pay\/office\/charge"/);
+    assert.doesNotMatch(html, /fetch\("\/pay\/open\/charge"/);
+    assert.match(html, /if\(avs\) avs\.hidden=true/);
+    assert.match(html, /if\(office\) office\.hidden=true/);
+    assert.match(html, /if\(wrap\) wrap\.hidden=true/);
+    assert.doesNotMatch(html, /FLYNESHER\.COM/);
+    assert.doesNotMatch(html, /Stripe/i);
+    assert.doesNotMatch(html, /required/);
   });
 });
 
@@ -453,32 +567,91 @@ describe("chargeOpenPay", () => {
     assert.doesNotMatch(JSON.stringify(body), /payment_descriptor/);
   });
 
-  it("names go to field_4 and field_5, never payment_descriptor", async () => {
+  it("guest name is field_4; staffName Hershy on /pay/open/charge never sets field_5", async () => {
     const sale = saleFetch();
     const out = await chargeOpenPay({
       amountUsd: 12.5,
       paymentToken: "tok_collect",
       invoiceNumber: "OPEN-20260908-named1",
       customerName: "Chaim Cohen",
-      staffName: "Sruly",
+      staffName: "Hershy",
+      notes: "Window seat",
+      processor: "Hershy",
       fetchImpl: sale.fetchImpl,
     });
     assert.equal(out.ok, true);
     const body = sale.lastBody();
     assert.equal(body.merchant_defined_fields.field_1, "nesher");
     assert.equal(body.merchant_defined_fields.field_4, "Chaim Cohen");
-    assert.equal(body.merchant_defined_fields.field_5, "Sruly");
+    assert.equal(body.merchant_defined_fields.field_5, undefined);
     assert.equal(body.merchant_defined_fields.field_6, undefined);
     assert.equal(body.billing_address.first_name, "Chaim");
     assert.equal(body.billing_address.last_name, "Cohen");
-    assert.match(body.order_details.order_description, /Sruly/);
+    assert.doesNotMatch(body.order_details.order_description, /Hershy/);
+    assert.doesNotMatch(JSON.stringify(body), /Hershy/);
+    assert.doesNotMatch(JSON.stringify(body), /Window seat/);
     assert.equal(body.payment_descriptor, undefined);
     assert.equal(
       Object.prototype.hasOwnProperty.call(body, "payment_descriptor"),
       false
     );
     assert.doesNotMatch(JSON.stringify(body), /payment_descriptor/);
-    assert.doesNotMatch(JSON.stringify(body), /"descriptor"/);
+    assert.doesNotMatch(JSON.stringify(body), /Guest/);
+  });
+
+  it("office Taken by Hershy sets field_5; junk staffName omitted; empty still charges", async () => {
+    const sale = saleFetch();
+    const hershy = await chargeOfficePay({
+      amountUsd: 12.5,
+      paymentToken: "tok_collect",
+      invoiceNumber: "OPEN-20260908-off1",
+      customerName: "Chaim Cohen",
+      staffName: "Hershy",
+      notes: "Window seat",
+      fetchImpl: sale.fetchImpl,
+    });
+    assert.equal(hershy.ok, true);
+    const body = sale.lastBody();
+    assert.equal(body.merchant_defined_fields.field_4, "Chaim Cohen");
+    assert.equal(body.merchant_defined_fields.field_5, "Hershy");
+    assert.equal(body.merchant_defined_fields.field_6, "Window seat");
+    assert.match(body.order_details.order_description, /Hershy/);
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(body, "payment_descriptor"),
+      false
+    );
+    assert.doesNotMatch(JSON.stringify(body), /payment_descriptor/);
+    assert.doesNotMatch(JSON.stringify(body), /Guest/);
+    const junk = await chargeOfficePay({
+      amountUsd: 10,
+      paymentToken: "tok_collect",
+      invoiceNumber: "OPEN-20260908-off2",
+      staffName: "Hershey",
+      fetchImpl: sale.fetchImpl,
+    });
+    assert.equal(junk.ok, true);
+    assert.equal(junk.httpStatus, 200);
+    const junkBody = sale.lastBody();
+    assert.equal(junkBody.merchant_defined_fields.field_5, undefined);
+    assert.doesNotMatch(JSON.stringify(junkBody), /Hershey/);
+    assert.doesNotMatch(JSON.stringify(junkBody), /Guest/);
+    const empty = await chargeOfficePay({
+      amountUsd: 10,
+      paymentToken: "tok_collect",
+      invoiceNumber: "OPEN-20260908-off3",
+      staffName: "",
+      notes: "",
+      fetchImpl: sale.fetchImpl,
+    });
+    assert.equal(empty.ok, true);
+    const emptyBody = sale.lastBody();
+    assert.equal(emptyBody.merchant_defined_fields.field_5, undefined);
+    assert.equal(emptyBody.merchant_defined_fields.field_6, undefined);
+    assert.doesNotMatch(JSON.stringify(emptyBody), /Guest/);
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(emptyBody, "payment_descriptor"),
+      false
+    );
   });
 
   it("rejects amount too small without hitting NMI", async () => {
@@ -560,16 +733,25 @@ describe("chargeOpenPay", () => {
     assert.match(out.message, /missing something: card details/);
   });
 
-  it("notes go to field_6 when provided", async () => {
+  it("guest notes are ignored; office notes go to field_6", async () => {
     const sale = saleFetch();
-    const out = await chargeOpenPay({
+    const guest = await chargeOpenPay({
+      amountUsd: 12.5,
+      paymentToken: "tok_collect",
+      invoiceNumber: "OPEN-20260908-note0",
+      notes: "Window seat",
+      fetchImpl: sale.fetchImpl,
+    });
+    assert.equal(guest.ok, true);
+    assert.equal(sale.lastBody().merchant_defined_fields.field_6, undefined);
+    const office = await chargeOfficePay({
       amountUsd: 12.5,
       paymentToken: "tok_collect",
       invoiceNumber: "OPEN-20260908-note1",
       notes: "Window seat",
       fetchImpl: sale.fetchImpl,
     });
-    assert.equal(out.ok, true);
+    assert.equal(office.ok, true);
     assert.equal(sale.lastBody().merchant_defined_fields.field_6, "Window seat");
     assert.equal(
       Object.prototype.hasOwnProperty.call(sale.lastBody(), "payment_descriptor"),
@@ -662,8 +844,14 @@ describe("CRM amount lock is unchanged", () => {
     assert.match(open, /chargeOpenPay\(\{/);
     assert.match(open, /amountUsd:/);
     assert.match(open, /customerName:/);
+    assert.match(open, /isOfficePayPath/);
+    assert.match(open, /isOfficePayChargePath/);
+    assert.match(open, /officeCharge/);
+    assert.match(open, /office: true/);
     assert.match(open, /staffName:/);
     assert.match(open, /notes:/);
+    assert.match(open, /renderOfficePayHtml/);
+    assert.match(open, /renderOpenPayHtml/);
     assert.match(open, /address1:/);
     assert.match(open, /city:/);
     assert.match(open, /state:/);
@@ -689,9 +877,11 @@ describe("wiring", () => {
     assert.match(docker, /\bopen-pay\.js\b/);
     const src = fs.readFileSync(new URL("../server.js", import.meta.url), "utf8");
     assert.match(src, /from "\.\/open-pay\.js"/);
-    assert.match(src, /build: "2026-09-09-avs-match"/);
+    assert.match(src, /build: "2026-09-09-open-staff"/);
     assert.match(src, /isOpenPayPath\(url\.pathname\)/);
+    assert.match(src, /isOfficePayPath\(url\.pathname\)/);
     assert.match(src, /openPayRequestAllowed\(req\.headers\)/);
     assert.match(src, /\/pay\/open/);
+    assert.match(src, /\/pay\/office/);
   });
 });

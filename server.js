@@ -31,8 +31,11 @@ import {
 import {
   isOpenPayPath,
   isOpenPayChargePath,
+  isOfficePayPath,
+  isOfficePayChargePath,
   openPayRequestAllowed,
   renderOpenPayHtml,
+  renderOfficePayHtml,
   renderOpenPayErrorHtml,
   chargeOpenPay,
 } from "./open-pay.js";
@@ -1036,8 +1039,8 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Public Nesher open-amount /pay/open — guest types USD. Not a CRM invoice.
-  if (isOpenPayPath(url.pathname)) {
+  // Public Nesher open-amount /pay/open (guest) and /pay/office (staff).
+  if (isOpenPayPath(url.pathname) || isOfficePayPath(url.pathname)) {
     if (!openPayRequestAllowed(req.headers)) {
       res.setHeader("Cache-Control", "no-store");
       res.setHeader("Content-Type", "text/html; charset=utf-8");
@@ -1047,7 +1050,7 @@ const server = http.createServer(async (req, res) => {
       );
       return;
     }
-    if (isOpenPayChargePath(url.pathname)) {
+    if (isOpenPayChargePath(url.pathname) || isOfficePayChargePath(url.pathname)) {
       if ((req.method || "") !== "POST") {
         sendJson(res, 405, { ok: false, error: "POST only" });
         return;
@@ -1067,6 +1070,7 @@ const server = http.createServer(async (req, res) => {
         sendJson(res, 400, guestFailBody({ error: "raw_card_rejected" }));
         return;
       }
+      const officeCharge = isOfficePayChargePath(url.pathname);
       const openResult = await chargeOpenPay({
         paymentToken:
           openBody.payment_token ||
@@ -1075,12 +1079,18 @@ const server = http.createServer(async (req, res) => {
           "",
         amountUsd: openBody.amountUsd,
         customerName: openBody.customerName || openBody.customer_name || "",
-        staffName:
-          openBody.staffName ||
-          openBody.staff_name ||
-          openBody.processor ||
-          "",
-        notes: openBody.notes || openBody.moreInfo || openBody.more_info || "",
+        ...(officeCharge
+          ? {
+              office: true,
+              staffName:
+                openBody.staffName ||
+                openBody.staff_name ||
+                openBody.processor ||
+                "",
+              notes:
+                openBody.notes || openBody.moreInfo || openBody.more_info || "",
+            }
+          : {}),
         address1: openBody.address1 || openBody.address || "",
         city: openBody.city || "",
         state: openBody.state || "",
@@ -1106,7 +1116,10 @@ const server = http.createServer(async (req, res) => {
     res.setHeader("Cache-Control", "no-store");
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     res.writeHead(200);
-    res.end(renderOpenPayHtml({ collectPublicKey: nmiPublicKey() }));
+    const pageHtml = isOfficePayPath(url.pathname)
+      ? renderOfficePayHtml({ collectPublicKey: nmiPublicKey() })
+      : renderOpenPayHtml({ collectPublicKey: nmiPublicKey() });
+    res.end(pageHtml);
     return;
   }
 
@@ -1202,7 +1215,7 @@ const server = http.createServer(async (req, res) => {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-09-09-avs-match",
+      build: "2026-09-09-open-staff",
       snapEngage: {
         enabled: SNAPENGAGE_ENABLED,
         widgetId: SNAPENGAGE_WIDGET_ID,
