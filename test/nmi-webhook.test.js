@@ -363,7 +363,7 @@ describe("wiring", () => {
     assert.match(docker, /\bnmi-webhook\.js\b/);
     const src = fs.readFileSync(new URL("../server.js", import.meta.url), "utf8");
     assert.match(src, /__nesher_pay\/nmi-webhook/);
-    assert.match(src, /build: "2026-09-09-open-avs"/);
+    assert.match(src, /build: "2026-09-09-avs-match"/);
     assert.match(src, /claimNmiNote/);
     assert.match(src, /verifyNmiWebhookSignature/);
     assert.match(src, /nmiWebhook:/);

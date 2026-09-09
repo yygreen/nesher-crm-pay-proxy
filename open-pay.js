@@ -1,11 +1,11 @@
 /**
  * Nesher open-amount guest card page.
  * Staff paste https://www.flynesher.com/pay/open — Office records (optional
- * Processor, Customer name, More info, address / city / ZIP / country / email)
- * then Card (amount + Collect.js). POST /pay/open/charge
+ * Processor, Customer name, More info) then Card (amount, billing address
+ * used to match the card, Collect.js). POST /pay/open/charge
  * {payment_token, amountUsd, customerName?, staffName?, notes?, address1?,
- * city?, zip?, country?, email?}. Empty omitted. Address is AVS, never a
- * descriptor. Decline copy is guestCardMessage, never raw JSON.
+ * city?, state?, zip?, country?, email?}. Empty omitted. Address is AVS,
+ * never a descriptor. Decline copy is guestCardMessage, never raw JSON.
  *
  * Not the CRM-priced /pay/<8-char> path (that amount stays store-locked).
  * Not JRM. Not Collect Checkout customPayment. No Mercury mint (no amount
@@ -200,8 +200,8 @@ function httpStatusFor(error) {
  * Open-amount capture. Amount comes from the guest POST (validated here).
  * CRM /pay/:code/charge must keep ignoring body.amount — this is the only
  * route that reads amountUsd from the client. Processor / customer names /
- * notes are optional records (NMI field_4 / field_5 / field_6). Address is
- * optional AVS on billing_address — never a charge gate, never
+ * notes are optional records (NMI field_4 / field_5 / field_6). Billing
+ * address is optional AVS on billing_address — never a charge gate, never
  * payment_descriptor, never invented as "Guest".
  */
 export async function chargeOpenPay(opts = {}) {
@@ -257,6 +257,7 @@ export async function chargeOpenPay(opts = {}) {
   const notes = recordName(opts.notes || opts.moreInfo, 255);
   const address1 = recordName(opts.address1 || opts.address, 255);
   const city = recordName(opts.city, 80);
+  const state = recordName(opts.state, 40);
   const zip = recordName(opts.zip || opts.postalCode || opts.postal_code, 20);
   const country = recordName(opts.country, 40);
   const email = recordName(opts.email, 120);
@@ -269,6 +270,7 @@ export async function chargeOpenPay(opts = {}) {
     ...(notes ? { notes } : {}),
     ...(address1 ? { address1 } : {}),
     ...(city ? { city } : {}),
+    ...(state ? { state } : {}),
     ...(zip ? { zip } : {}),
     ...(country ? { country } : {}),
     ...(email ? { email } : {}),
@@ -386,6 +388,7 @@ function renderCollectJsForm(collectKey) {
               var notes=readName("more-info",255);
               var address1=readName("billing-address",255);
               var city=readName("billing-city");
+              var state=readName("billing-state",40);
               var zip=readName("billing-zip",20);
               var country=readName("billing-country",40);
               var email=readName("billing-email",120);
@@ -394,6 +397,7 @@ function renderCollectJsForm(collectKey) {
               if(notes) payload.notes=notes;
               if(address1) payload.address1=address1;
               if(city) payload.city=city;
+              if(state) payload.state=state;
               if(zip) payload.zip=zip;
               if(country) payload.country=country;
               if(email) payload.email=email;
@@ -545,6 +549,10 @@ export function renderOpenPayHtml(data = {}) {
       margin: 14px 0 0; font-size: 12.5px; color: #888;
       text-align: center; line-height: 1.45;
     }
+    .avs-hint {
+      margin: 0 0 10px; font-size: 12.5px; color: #6B7280; line-height: 1.4;
+    }
+    .avs-block { margin: 12px 0 4px; }
     .foot {
       margin-top: 28px; font-size: 12px; color: #aaa; text-align: center;
     }
@@ -567,28 +575,6 @@ export function renderOpenPayHtml(data = {}) {
         <p class="label">More info</p>
         <textarea id="more-info" maxlength="255" rows="2"></textarea>
       </div>
-      <div class="meta-field">
-        <p class="label">Address</p>
-        <input id="billing-address" type="text" maxlength="255" autocomplete="street-address" />
-      </div>
-      <div class="meta-field meta-row">
-        <div>
-          <p class="label">City</p>
-          <input id="billing-city" type="text" maxlength="80" autocomplete="address-level2" />
-        </div>
-        <div>
-          <p class="label">ZIP</p>
-          <input id="billing-zip" type="text" maxlength="20" autocomplete="postal-code" />
-        </div>
-      </div>
-      <div class="meta-field">
-        <p class="label">Country</p>
-        <input id="billing-country" type="text" maxlength="40" placeholder="US" autocomplete="country" />
-      </div>
-      <div class="meta-field">
-        <p class="label">Email</p>
-        <input id="billing-email" type="email" maxlength="120" autocomplete="email" />
-      </div>
     </div>
     <div class="group group-card" id="card-group">
       <h2 class="group-title">Card</h2>
@@ -597,6 +583,37 @@ export function renderOpenPayHtml(data = {}) {
         <div class="amount-row">
           <span class="amount-prefix">$</span>
           <input id="amount-usd" type="number" inputmode="decimal" min="1" max="25000" step="0.01" autocomplete="off" />
+        </div>
+      </div>
+      <div class="avs-block">
+        <p class="avs-hint">Used to match the card.</p>
+        <div class="meta-field">
+          <p class="label">Address</p>
+          <input id="billing-address" type="text" maxlength="255" autocomplete="street-address" />
+        </div>
+        <div class="meta-field meta-row">
+          <div>
+            <p class="label">City</p>
+            <input id="billing-city" type="text" maxlength="80" autocomplete="address-level2" />
+          </div>
+          <div>
+            <p class="label">State</p>
+            <input id="billing-state" type="text" maxlength="40" autocomplete="address-level1" />
+          </div>
+        </div>
+        <div class="meta-field meta-row">
+          <div>
+            <p class="label">ZIP</p>
+            <input id="billing-zip" type="text" maxlength="20" autocomplete="postal-code" />
+          </div>
+          <div>
+            <p class="label">Country</p>
+            <input id="billing-country" type="text" maxlength="40" placeholder="US" autocomplete="country" />
+          </div>
+        </div>
+        <div class="meta-field">
+          <p class="label">Email</p>
+          <input id="billing-email" type="email" maxlength="120" autocomplete="email" />
         </div>
       </div>
       ${card}

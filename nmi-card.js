@@ -219,24 +219,128 @@ export function recordName(value, max = 80) {
     .slice(0, cap);
 }
 
+const US_CA_STATE_NAMES = {
+  ALABAMA: "AL",
+  ALASKA: "AK",
+  ARIZONA: "AZ",
+  ARKANSAS: "AR",
+  CALIFORNIA: "CA",
+  COLORADO: "CO",
+  CONNECTICUT: "CT",
+  DELAWARE: "DE",
+  FLORIDA: "FL",
+  GEORGIA: "GA",
+  HAWAII: "HI",
+  IDAHO: "ID",
+  ILLINOIS: "IL",
+  INDIANA: "IN",
+  IOWA: "IA",
+  KANSAS: "KS",
+  KENTUCKY: "KY",
+  LOUISIANA: "LA",
+  MAINE: "ME",
+  MARYLAND: "MD",
+  MASSACHUSETTS: "MA",
+  MICHIGAN: "MI",
+  MINNESOTA: "MN",
+  MISSISSIPPI: "MS",
+  MISSOURI: "MO",
+  MONTANA: "MT",
+  NEBRASKA: "NE",
+  NEVADA: "NV",
+  "NEW HAMPSHIRE": "NH",
+  "NEW JERSEY": "NJ",
+  "NEW MEXICO": "NM",
+  "NEW YORK": "NY",
+  "NORTH CAROLINA": "NC",
+  "NORTH DAKOTA": "ND",
+  OHIO: "OH",
+  OKLAHOMA: "OK",
+  OREGON: "OR",
+  PENNSYLVANIA: "PA",
+  "RHODE ISLAND": "RI",
+  "SOUTH CAROLINA": "SC",
+  "SOUTH DAKOTA": "SD",
+  TENNESSEE: "TN",
+  TEXAS: "TX",
+  UTAH: "UT",
+  VERMONT: "VT",
+  VIRGINIA: "VA",
+  WASHINGTON: "WA",
+  "WEST VIRGINIA": "WV",
+  WISCONSIN: "WI",
+  WYOMING: "WY",
+  "DISTRICT OF COLUMBIA": "DC",
+  "WASHINGTON DC": "DC",
+  ALBERTA: "AB",
+  "BRITISH COLUMBIA": "BC",
+  MANITOBA: "MB",
+  "NEW BRUNSWICK": "NB",
+  NEWFOUNDLAND: "NL",
+  "NEWFOUNDLAND AND LABRADOR": "NL",
+  "NOVA SCOTIA": "NS",
+  "NORTHWEST TERRITORIES": "NT",
+  NUNAVUT: "NU",
+  ONTARIO: "ON",
+  "PRINCE EDWARD ISLAND": "PE",
+  QUEBEC: "QC",
+  SASKATCHEWAN: "SK",
+  YUKON: "YT",
+};
+
+/** v5 billing_address.country is ISO 3166-1 alpha-2. Never a 40-char string. */
+export function isoCountry(value, hasPlace) {
+  const raw = String(value || "")
+    .replace(/[\r\n\t]+/g, " ")
+    .trim();
+  if (!raw) return hasPlace ? "US" : "";
+  const upper = raw.toUpperCase().replace(/\./g, "").replace(/\s+/g, " ");
+  if (
+    upper === "US" ||
+    upper === "USA" ||
+    upper === "UNITED STATES" ||
+    upper === "UNITED STATES OF AMERICA" ||
+    upper === "AMERICA"
+  ) {
+    return "US";
+  }
+  const letters = raw.toUpperCase().replace(/[^A-Z]/g, "");
+  if (letters.length === 2) return letters;
+  return "";
+}
+
+/** US/CA 2-letter when it looks like a state; otherwise a trimmed short code. */
+export function isoState(value) {
+  const raw = recordName(value, 40);
+  if (!raw) return "";
+  const upper = raw.toUpperCase().replace(/\./g, "").replace(/\s+/g, " ");
+  if (/^[A-Z]{2}$/.test(upper)) return upper;
+  if (US_CA_STATE_NAMES[upper]) return US_CA_STATE_NAMES[upper];
+  const compact = upper.replace(/[^A-Z0-9]/g, "");
+  if (compact.length >= 1 && compact.length <= 5) return compact;
+  if (compact.length > 5) return compact.slice(0, 5);
+  return "";
+}
+
 /**
  * Optional v5 billing_address for AVS. Names from customerName when
- * present; address1 / city / zip / country / email when present.
- * Country defaults to US only if a street field is filled and country
- * is blank. Empty keys omitted. Never invents Guest. Not a descriptor.
+ * present; address1 / city / state / zip / country / email when present.
+ * Country is ISO-2. Blank + any street/city/zip/state → US. Empty keys
+ * omitted. Never invents Guest. Not a descriptor.
  */
 export function saleBillingAddress(opts = {}) {
   const customerName = recordName(opts.customerName);
   const names = customerName ? splitName(customerName) : null;
   const address1 = recordName(opts.address1 || opts.address, 255);
   const city = recordName(opts.city, 80);
+  const state = isoState(opts.state);
   const zip = recordName(
     opts.zip || opts.postalCode || opts.postal_code,
     20
   );
   const email = recordName(opts.email, 120);
-  let country = recordName(opts.country, 40);
-  if (!country && (address1 || city || zip)) country = "US";
+  const hasPlace = Boolean(address1 || city || zip || state);
+  const country = isoCountry(opts.country, hasPlace);
   const addr = {};
   if (names) {
     addr.first_name = names.first_name;
@@ -244,6 +348,7 @@ export function saleBillingAddress(opts = {}) {
   }
   if (address1) addr.address1 = address1;
   if (city) addr.city = city;
+  if (state) addr.state = state;
   if (zip) addr.zip = zip;
   if (country) addr.country = country;
   if (email) addr.email = email;
@@ -311,6 +416,11 @@ export const GUEST_LINK_EXPIRED =
 
 export const GUEST_INACCURATE =
   "The payment details look inaccurate. Check the card number, expiration date, and security code, then try again.";
+
+export const GUEST_AVS_MISMATCH =
+  "The address does not match the card. Check the address, then Pay with card again.";
+
+const AVS_NO_MATCH = new Set(["N", "C", "4", "8"]);
 
 export const GUEST_INACCURATE_EXP =
   "The expiration date looks inaccurate. Check the month and year on the card, then try again.";
@@ -424,7 +534,14 @@ function isUglyDump(value) {
 }
 
 function nmiDeclineSignals(src) {
-  const out = { phrase: "", codes: [], error: "", httpStatus: 0, response: "" };
+  const out = {
+    phrase: "",
+    codes: [],
+    error: "",
+    httpStatus: 0,
+    response: "",
+    avs: "",
+  };
   if (src == null) return out;
   if (typeof src === "string") {
     const t = src.trim();
@@ -483,6 +600,13 @@ function nmiDeclineSignals(src) {
     if (v != null && String(v).trim() !== "") out.codes.push(String(v).trim());
   }
   out.response = String(json.response ?? "").trim();
+  for (const k of ["avs_response", "avsresponse", "avs"]) {
+    const v = json[k];
+    if (v != null && String(v).trim() !== "") {
+      out.avs = String(v).trim().toUpperCase();
+      break;
+    }
+  }
   return out;
 }
 
@@ -500,7 +624,7 @@ function messageForNmiCode(code) {
  * not a valid card / already paid / invalid link. Never JSON, never PAN.
  */
 export function guestCardMessage(saleOrNmiJson) {
-  const { phrase, codes, error, httpStatus, response } =
+  const { phrase, codes, error, httpStatus, response, avs } =
     nmiDeclineSignals(saleOrNmiJson);
   if (error === "already_paid") return GUEST_ALREADY_PAID;
   if (INVALID_LINK_ERRORS.has(error)) return GUEST_INVALID_LINK;
@@ -517,6 +641,10 @@ export function guestCardMessage(saleOrNmiJson) {
     httpStatus >= 500
   ) {
     return GUEST_OURS;
+  }
+
+  if (AVS_NO_MATCH.has(avs) && response !== "1") {
+    return GUEST_AVS_MISMATCH;
   }
 
   for (const c of codes) {
@@ -814,6 +942,7 @@ export async function chargeWithToken(opts = {}) {
     customerName,
     address1: opts.address1 || opts.address,
     city: opts.city,
+    state: opts.state,
     zip: opts.zip || opts.postalCode || opts.postal_code,
     country: opts.country,
     email: opts.email,
@@ -824,7 +953,7 @@ export async function chargeWithToken(opts = {}) {
     : descBase.slice(0, 100);
   // No payment_descriptor / Classic descriptor: this MID refuses custom DBA.
   // field_4 Guest / field_5 Processor / field_6 More info — records only.
-  // billing_address AVS (address1/city/zip/country) is not a descriptor.
+  // billing_address AVS (address1/city/state/zip/country) is not a descriptor.
   const body = {
     amount,
     currency: "USD",
@@ -908,6 +1037,7 @@ export async function chargeGuestInvoice(opts = {}) {
     paymentToken: token,
     address1: opts.address1 || opts.address,
     city: opts.city,
+    state: opts.state,
     zip: opts.zip || opts.postalCode || opts.postal_code,
     country: opts.country,
     email: opts.email,
@@ -985,6 +1115,7 @@ export async function chargePayCode(opts = {}) {
     paymentToken: token,
     address1: opts.address1 || opts.address,
     city: opts.city,
+    state: opts.state,
     zip: opts.zip || opts.postalCode || opts.postal_code,
     country: opts.country,
     email: opts.email,

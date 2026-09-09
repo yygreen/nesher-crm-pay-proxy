@@ -1083,6 +1083,7 @@ const server = http.createServer(async (req, res) => {
         notes: openBody.notes || openBody.moreInfo || openBody.more_info || "",
         address1: openBody.address1 || openBody.address || "",
         city: openBody.city || "",
+        state: openBody.state || "",
         zip: openBody.zip || openBody.postalCode || openBody.postal_code || "",
         country: openBody.country || "",
         email: openBody.email || "",
@@ -1130,6 +1131,7 @@ const server = http.createServer(async (req, res) => {
       paymentToken: body.payment_token || body.paymentToken || body.token || "",
       address1: body.address1 || body.address || "",
       city: body.city || "",
+      state: body.state || "",
       zip: body.zip || body.postalCode || body.postal_code || "",
       country: body.country || "",
       email: body.email || "",
@@ -1200,7 +1202,7 @@ const server = http.createServer(async (req, res) => {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-09-09-open-avs",
+      build: "2026-09-09-avs-match",
       snapEngage: {
         enabled: SNAPENGAGE_ENABLED,
         widgetId: SNAPENGAGE_WIDGET_ID,

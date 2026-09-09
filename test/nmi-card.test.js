@@ -14,6 +14,8 @@ import {
   mintCardCheckout,
   chargeWithToken,
   saleBillingAddress,
+  isoCountry,
+  isoState,
   chargeGuestInvoice,
   chargePayCode,
   looksLikePan,
@@ -35,6 +37,7 @@ import {
   GUEST_INVALID_LINK,
   GUEST_TRY_ANOTHER,
   GUEST_INACCURATE,
+  GUEST_AVS_MISMATCH,
   GUEST_INACCURATE_EXP,
   GUEST_INACCURATE_CVV,
   GUEST_INACCURATE_PIN,
@@ -551,6 +554,7 @@ describe("chargeWithToken", () => {
       customerName: "Ada Lovelace",
       address1: "12 Main St",
       city: "Spring Valley",
+      state: "NY",
       zip: "10977",
       country: "IL",
       email: "ada@example.com",
@@ -559,6 +563,7 @@ describe("chargeWithToken", () => {
     assert.equal(named.last_name, "Lovelace");
     assert.equal(named.address1, "12 Main St");
     assert.equal(named.city, "Spring Valley");
+    assert.equal(named.state, "NY");
     assert.equal(named.zip, "10977");
     assert.equal(named.country, "IL");
     assert.equal(named.email, "ada@example.com");
@@ -566,6 +571,34 @@ describe("chargeWithToken", () => {
     assert.deepEqual(emailOnly, { email: "ada@example.com" });
     assert.equal(emailOnly.country, undefined);
     assert.doesNotMatch(JSON.stringify(avs), /Guest/);
+    const usa = saleBillingAddress({
+      address1: "12 Main St",
+      zip: "10977",
+      country: "United States",
+    });
+    assert.equal(usa.country, "US");
+    assert.equal(isoCountry("usa", true), "US");
+    assert.equal(isoCountry("us", true), "US");
+    assert.equal(isoCountry("", true), "US");
+    assert.equal(isoCountry("Israel", true), "");
+    assert.equal(isoCountry("GB", false), "GB");
+    assert.equal(isoState("ny"), "NY");
+    assert.equal(isoState("New York"), "NY");
+    assert.equal(isoState(""), "");
+    const noCountry = saleBillingAddress({
+      address1: "12 Main St",
+      zip: "10977",
+      country: "Israel",
+    });
+    assert.equal(noCountry.country, undefined);
+    assert.equal(noCountry.address1, "12 Main St");
+    const withState = saleBillingAddress({
+      address1: "12 Main St",
+      zip: "10977",
+      state: "ny",
+    });
+    assert.equal(withState.state, "NY");
+    assert.equal(withState.country, "US");
   });
 
   it("empty address still charges; zip+address1 appear on sale billing_address", async () => {
@@ -605,15 +638,29 @@ describe("chargeWithToken", () => {
       paymentToken: "tok_collect",
       address1: "12 Main St",
       zip: "10977",
+      state: "NY",
       fetchImpl,
     });
     assert.equal(out.ok, true);
     const body = JSON.parse(captured.body);
     assert.equal(body.billing_address.address1, "12 Main St");
     assert.equal(body.billing_address.zip, "10977");
+    assert.equal(body.billing_address.state, "NY");
     assert.equal(body.billing_address.country, "US");
     assert.equal(body.billing_address.city, undefined);
     assert.equal(body.billing_address.email, undefined);
+    const usa = await chargeWithToken({
+      amountUsd: 10,
+      invoiceNumber: "OPEN-20260909-avs2",
+      kind: "open",
+      paymentToken: "tok_collect",
+      address1: "12 Main St",
+      zip: "10977",
+      country: "United States",
+      fetchImpl,
+    });
+    assert.equal(usa.ok, true);
+    assert.equal(JSON.parse(captured.body).billing_address.country, "US");
     assert.equal(body.payment_descriptor, undefined);
     assert.equal(
       Object.prototype.hasOwnProperty.call(body, "payment_descriptor"),
@@ -672,6 +719,56 @@ describe("chargeWithToken", () => {
     assert.doesNotMatch(out.message, /12532467411/);
     assert.doesNotMatch(out.message, /\{/);
     assert.equal(out.blockedReason, out.message);
+  });
+
+  it("declined avs_response N is address mismatch; approved N still ok", async () => {
+    process.env.NMI_PRIVATE_KEY = "test-private-key";
+    const declined = await chargeWithToken({
+      amountUsd: 10,
+      invoiceNumber: "OPEN-20260909-avsn",
+      kind: "open",
+      paymentToken: "tok_collect",
+      address1: "12 Main St",
+      zip: "10977",
+      fetchImpl: async () => ({
+        ok: true,
+        status: 200,
+        async text() {
+          return JSON.stringify({
+            response: "2",
+            response_code: "201",
+            response_text: "Do Not Honor",
+            avs_response: "N",
+          });
+        },
+      }),
+    });
+    assert.equal(declined.ok, false);
+    assert.equal(declined.message, GUEST_AVS_MISMATCH);
+    assert.match(declined.message, /address does not match the card/);
+    assert.doesNotMatch(declined.message, /\{/);
+    assert.doesNotMatch(declined.message, /avs_response/);
+    const approved = await chargeWithToken({
+      amountUsd: 10,
+      invoiceNumber: "OPEN-20260909-avsok",
+      kind: "open",
+      paymentToken: "tok_collect",
+      address1: "12 Main St",
+      zip: "10977",
+      fetchImpl: async () => ({
+        ok: true,
+        status: 200,
+        async text() {
+          return JSON.stringify({
+            response: "1",
+            id: "txn_avs_ok",
+            avs_response: "N",
+          });
+        },
+      }),
+    });
+    assert.equal(approved.ok, true);
+    assert.equal(approved.transactionId, "txn_avs_ok");
   });
 });
 
@@ -857,6 +954,28 @@ describe("guestCardMessage", () => {
     assert.match(GUEST_MISSING_AMOUNT, /amount/);
     assert.match(GUEST_MISSING_CARD, /card details/);
     assert.doesNotMatch(GUEST_MISSING_AMOUNT, /\{/);
+  });
+
+  it("declined avs N/C/4/8 is address mismatch; U/G/I/R/S/0/O is not", () => {
+    for (const code of ["N", "C", "4", "8", "n"]) {
+      const msg = guestCardMessage({
+        response: "2",
+        response_code: "201",
+        response_text: "Do Not Honor",
+        avs_response: code,
+      });
+      assert.equal(msg, GUEST_AVS_MISMATCH);
+      assert.doesNotMatch(msg, /\{/);
+    }
+    for (const code of ["U", "G", "I", "R", "S", "0", "O"]) {
+      const msg = guestCardMessage({
+        response: "2",
+        response_code: "201",
+        response_text: "Do Not Honor",
+        avs_response: code,
+      });
+      assert.equal(msg, GUEST_DECLINE_DO_NOT_HONOR);
+    }
   });
 });
 
@@ -1288,6 +1407,7 @@ describe("chargePayCode", () => {
       amountUsd: 1,
       address1: "12 Main St",
       zip: "10977",
+      state: "NY",
       loadInvoice: async () => ({ ok: true, data: invoice }),
       claimInvoicePaid: async () => ({ ok: true, paidAt: "t" }),
       markInvoicePaid: async () => ({ ok: true }),
@@ -1300,6 +1420,7 @@ describe("chargePayCode", () => {
     assert.notEqual(Number(body.amount), 1);
     assert.equal(body.billing_address.address1, "12 Main St");
     assert.equal(body.billing_address.zip, "10977");
+    assert.equal(body.billing_address.state, "NY");
     assert.equal(body.billing_address.country, "US");
     assert.equal(body.billing_address.first_name, "Ada");
     assert.equal(
@@ -1311,7 +1432,7 @@ describe("chargePayCode", () => {
   it("mint JSON and guest charge live on the brand website origin", () => {
     const src = fs.readFileSync(new URL("../server.js", import.meta.url), "utf8");
     assert.match(src, /guestPayOrigin\(/);
-    assert.match(src, /build: "2026-09-09-open-avs"/);
+    assert.match(src, /build: "2026-09-09-avs-match"/);
     assert.doesNotMatch(
       src.slice(src.indexOf("const stored = await storeInvoice"), src.indexOf("const shareUrl")),
       /publicHostFor\(req\)/
@@ -1329,6 +1450,7 @@ describe("chargePayCode", () => {
     assert.doesNotMatch(charge, /amountUsd:/);
     assert.match(charge, /chargePayCode\(\{/);
     assert.match(charge, /address1: body\.address1/);
+    assert.match(charge, /state: body\.state/);
     assert.match(charge, /zip: body\.zip/);
     assert.match(charge, /guestFailBody/);
     assert.match(charge, /guestFailBody\(\{ error: "raw_card_rejected" \}\)/);
