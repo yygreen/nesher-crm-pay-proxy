@@ -1,9 +1,11 @@
 /**
  * Nesher open-amount guest card page.
- * Staff paste https://www.flynesher.com/pay/open — amount + optional Processor,
- * Customer name, and More info, then Collect.js tokenizes, then POST
- * /pay/open/charge {payment_token, amountUsd, customerName?, staffName?, notes?}.
- * Empty records omitted. Decline copy is guestCardMessage, never raw JSON.
+ * Staff paste https://www.flynesher.com/pay/open — Office records (optional
+ * Processor, Customer name, More info, address / city / ZIP / country / email)
+ * then Card (amount + Collect.js). POST /pay/open/charge
+ * {payment_token, amountUsd, customerName?, staffName?, notes?, address1?,
+ * city?, zip?, country?, email?}. Empty omitted. Address is AVS, never a
+ * descriptor. Decline copy is guestCardMessage, never raw JSON.
  *
  * Not the CRM-priced /pay/<8-char> path (that amount stays store-locked).
  * Not JRM. Not Collect Checkout customPayment. No Mercury mint (no amount
@@ -197,9 +199,10 @@ function httpStatusFor(error) {
 /**
  * Open-amount capture. Amount comes from the guest POST (validated here).
  * CRM /pay/:code/charge must keep ignoring body.amount — this is the only
- * route that reads amountUsd from the client. Processor / customer names
- * are optional records (NMI field_4 / field_5 / field_6) — never a charge
- * gate, never payment_descriptor, never invented as "Guest".
+ * route that reads amountUsd from the client. Processor / customer names /
+ * notes are optional records (NMI field_4 / field_5 / field_6). Address is
+ * optional AVS on billing_address — never a charge gate, never
+ * payment_descriptor, never invented as "Guest".
  */
 export async function chargeOpenPay(opts = {}) {
   const kind = String(opts.kind || "open").toLowerCase();
@@ -252,6 +255,11 @@ export async function chargeOpenPay(opts = {}) {
   const customerName = recordName(opts.customerName);
   const staffName = recordName(opts.staffName);
   const notes = recordName(opts.notes || opts.moreInfo, 255);
+  const address1 = recordName(opts.address1 || opts.address, 255);
+  const city = recordName(opts.city, 80);
+  const zip = recordName(opts.zip || opts.postalCode || opts.postal_code, 20);
+  const country = recordName(opts.country, 40);
+  const email = recordName(opts.email, 120);
   const sale = await chargeWithToken({
     amountUsd: parsed.amountUsd,
     invoiceNumber,
@@ -259,6 +267,11 @@ export async function chargeOpenPay(opts = {}) {
     ...(customerName ? { customerName } : {}),
     ...(staffName ? { staffName } : {}),
     ...(notes ? { notes } : {}),
+    ...(address1 ? { address1 } : {}),
+    ...(city ? { city } : {}),
+    ...(zip ? { zip } : {}),
+    ...(country ? { country } : {}),
+    ...(email ? { email } : {}),
     summary: opts.summary || "Open amount",
     paymentToken: token,
     fetchImpl: opts.fetchImpl,
@@ -371,9 +384,19 @@ function renderCollectJsForm(collectKey) {
               var customerName=readName("customer-name");
               var staffName=readName("staff-name");
               var notes=readName("more-info",255);
+              var address1=readName("billing-address",255);
+              var city=readName("billing-city");
+              var zip=readName("billing-zip",20);
+              var country=readName("billing-country",40);
+              var email=readName("billing-email",120);
               if(customerName) payload.customerName=customerName;
               if(staffName) payload.staffName=staffName;
               if(notes) payload.notes=notes;
+              if(address1) payload.address1=address1;
+              if(city) payload.city=city;
+              if(zip) payload.zip=zip;
+              if(country) payload.country=country;
+              if(email) payload.email=email;
               if(btn) btn.disabled=true;
               fetch("/pay/open/charge",{
                 method:"POST",
@@ -384,6 +407,8 @@ function renderCollectJsForm(collectKey) {
                 if(x.j&&x.j.ok){
                   var form=document.getElementById("card-form");
                   var wrap=document.getElementById("amount-wrap");
+                  var office=document.getElementById("office-group");
+                  if(office) office.hidden=true;
                   if(wrap) wrap.hidden=true;
                   if(form) form.innerHTML="<p class='hint'>Card payment received. Thank you.</p>";
                 } else {
@@ -442,7 +467,19 @@ export function renderOpenPayHtml(data = {}) {
     .logo { margin: 0 0 22px; }
     .logo img { display: block; height: 40px; width: auto; }
     .label { font-size: 13px; color: #888; margin: 0 0 6px; }
+    .group {
+      border: 1px solid #E6E9EE;
+      border-radius: 12px;
+      padding: 14px 14px 16px;
+      margin: 0 0 14px;
+    }
+    .group-card { margin-bottom: 0; }
+    .group-title {
+      font-size: 12px; font-weight: 700; letter-spacing: .06em;
+      text-transform: uppercase; color: #6B7280; margin: 0 0 12px;
+    }
     .meta-field { margin: 12px 0 0; }
+    .meta-field:first-of-type { margin-top: 0; }
     .meta-field input {
       width: 100%; font-size: 15px; font-family: inherit; color: #111;
       border: 1px solid #D8DEE4; border-radius: 10px; padding: 10px 12px;
@@ -457,6 +494,9 @@ export function renderOpenPayHtml(data = {}) {
       font-size: 15px; font-family: inherit; color: #111;
       border: 1px solid #D8DEE4; border-radius: 10px; padding: 10px 12px;
       background: #fff;
+    }
+    .meta-row {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
     }
     .amount-row {
       display: flex; align-items: center; gap: 8px; margin: 0 0 8px;
@@ -476,7 +516,6 @@ export function renderOpenPayHtml(data = {}) {
       outline: none; border-color: #3D7A99;
       box-shadow: 0 0 0 3px rgba(61,122,153,.18);
     }
-    .line { height: 1px; background: #eee; margin: 22px 0; }
     .btn {
       display: block; width: 100%; text-align: center; text-decoration: none;
       border-radius: 12px; padding: 14px 16px; font-size: 16px; font-weight: 600;
@@ -514,12 +553,8 @@ export function renderOpenPayHtml(data = {}) {
 <body class="pay-brand-nesher">
   <div class="sheet">
     <p class="logo"><img src="${logo}" alt="Nesher Travel" height="40" data-fallback="${logoFallback}" onerror="this.onerror=null;this.src=this.getAttribute('data-fallback')"></p>
-    <div id="amount-wrap">
-      <p class="label">Amount</p>
-      <div class="amount-row">
-        <span class="amount-prefix">$</span>
-        <input id="amount-usd" type="number" inputmode="decimal" min="1" max="25000" step="0.01" autocomplete="off" />
-      </div>
+    <div class="group" id="office-group">
+      <h2 class="group-title">Office</h2>
       <div class="meta-field">
         <p class="label">Processor</p>
         <input id="staff-name" type="text" maxlength="80" autocomplete="off" />
@@ -532,9 +567,40 @@ export function renderOpenPayHtml(data = {}) {
         <p class="label">More info</p>
         <textarea id="more-info" maxlength="255" rows="2"></textarea>
       </div>
+      <div class="meta-field">
+        <p class="label">Address</p>
+        <input id="billing-address" type="text" maxlength="255" autocomplete="street-address" />
+      </div>
+      <div class="meta-field meta-row">
+        <div>
+          <p class="label">City</p>
+          <input id="billing-city" type="text" maxlength="80" autocomplete="address-level2" />
+        </div>
+        <div>
+          <p class="label">ZIP</p>
+          <input id="billing-zip" type="text" maxlength="20" autocomplete="postal-code" />
+        </div>
+      </div>
+      <div class="meta-field">
+        <p class="label">Country</p>
+        <input id="billing-country" type="text" maxlength="40" placeholder="US" autocomplete="country" />
+      </div>
+      <div class="meta-field">
+        <p class="label">Email</p>
+        <input id="billing-email" type="email" maxlength="120" autocomplete="email" />
+      </div>
     </div>
-    <div class="line"></div>
-    ${card}
+    <div class="group group-card" id="card-group">
+      <h2 class="group-title">Card</h2>
+      <div id="amount-wrap">
+        <p class="label">Amount</p>
+        <div class="amount-row">
+          <span class="amount-prefix">$</span>
+          <input id="amount-usd" type="number" inputmode="decimal" min="1" max="25000" step="0.01" autocomplete="off" />
+        </div>
+      </div>
+      ${card}
+    </div>
     <p class="foot">Nesher Travel</p>
   </div>
 </body>

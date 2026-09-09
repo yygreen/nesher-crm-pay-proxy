@@ -13,6 +13,7 @@ import {
   hostedInvoiceUrl,
   mintCardCheckout,
   chargeWithToken,
+  saleBillingAddress,
   chargeGuestInvoice,
   chargePayCode,
   looksLikePan,
@@ -532,6 +533,94 @@ describe("chargeWithToken", () => {
     });
     assert.equal(blank.ok, true);
     assert.equal(JSON.parse(captured.body).merchant_defined_fields.field_6, undefined);
+  });
+
+  it("saleBillingAddress omits empty keys and never invents Guest", () => {
+    assert.equal(saleBillingAddress({}), null);
+    assert.equal(saleBillingAddress({ address1: "  ", zip: "" }), null);
+    const avs = saleBillingAddress({
+      address1: "12 Main St",
+      zip: "10977",
+    });
+    assert.deepEqual(avs, {
+      address1: "12 Main St",
+      zip: "10977",
+      country: "US",
+    });
+    const named = saleBillingAddress({
+      customerName: "Ada Lovelace",
+      address1: "12 Main St",
+      city: "Spring Valley",
+      zip: "10977",
+      country: "IL",
+      email: "ada@example.com",
+    });
+    assert.equal(named.first_name, "Ada");
+    assert.equal(named.last_name, "Lovelace");
+    assert.equal(named.address1, "12 Main St");
+    assert.equal(named.city, "Spring Valley");
+    assert.equal(named.zip, "10977");
+    assert.equal(named.country, "IL");
+    assert.equal(named.email, "ada@example.com");
+    const emailOnly = saleBillingAddress({ email: "ada@example.com" });
+    assert.deepEqual(emailOnly, { email: "ada@example.com" });
+    assert.equal(emailOnly.country, undefined);
+    assert.doesNotMatch(JSON.stringify(avs), /Guest/);
+  });
+
+  it("empty address still charges; zip+address1 appear on sale billing_address", async () => {
+    process.env.NMI_PRIVATE_KEY = "test-private-key";
+    let captured;
+    const fetchImpl = async (_url, init) => {
+      captured = init;
+      return {
+        ok: true,
+        status: 200,
+        async text() {
+          return JSON.stringify({ response: "1", id: "txn_avs" });
+        },
+      };
+    };
+    const empty = await chargeWithToken({
+      amountUsd: 10,
+      invoiceNumber: "OPEN-20260909-avs0",
+      kind: "open",
+      paymentToken: "tok_collect",
+      address1: "",
+      zip: "  ",
+      fetchImpl,
+    });
+    assert.equal(empty.ok, true);
+    const emptyBody = JSON.parse(captured.body);
+    assert.equal(emptyBody.billing_address, undefined);
+    assert.doesNotMatch(JSON.stringify(emptyBody), /Guest/);
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(emptyBody, "payment_descriptor"),
+      false
+    );
+    const out = await chargeWithToken({
+      amountUsd: 10,
+      invoiceNumber: "OPEN-20260909-avs1",
+      kind: "open",
+      paymentToken: "tok_collect",
+      address1: "12 Main St",
+      zip: "10977",
+      fetchImpl,
+    });
+    assert.equal(out.ok, true);
+    const body = JSON.parse(captured.body);
+    assert.equal(body.billing_address.address1, "12 Main St");
+    assert.equal(body.billing_address.zip, "10977");
+    assert.equal(body.billing_address.country, "US");
+    assert.equal(body.billing_address.city, undefined);
+    assert.equal(body.billing_address.email, undefined);
+    assert.equal(body.payment_descriptor, undefined);
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(body, "payment_descriptor"),
+      false
+    );
+    assert.doesNotMatch(captured.body, /payment_descriptor/);
+    assert.doesNotMatch(captured.body, /Guest/);
   });
 
   it("requires a payment token", async () => {
@@ -1191,10 +1280,38 @@ describe("chargePayCode", () => {
     assert.doesNotMatch(JSON.stringify(sale.lastBody()), /NESHER-PAY|JRM-PAY/);
   });
 
+  it("forwards zip+address1 onto the CRM-priced sale, still amount-locked", async () => {
+    const sale = saleFetch();
+    const out = await chargePayCode({
+      code: "abc12xyz",
+      paymentToken: "tok_collect",
+      amountUsd: 1,
+      address1: "12 Main St",
+      zip: "10977",
+      loadInvoice: async () => ({ ok: true, data: invoice }),
+      claimInvoicePaid: async () => ({ ok: true, paidAt: "t" }),
+      markInvoicePaid: async () => ({ ok: true }),
+      fetchImpl: sale.fetchImpl,
+      privateKey: "test-private-key",
+    });
+    assert.equal(out.ok, true);
+    const body = sale.lastBody();
+    assert.equal(body.amount, "55.55");
+    assert.notEqual(Number(body.amount), 1);
+    assert.equal(body.billing_address.address1, "12 Main St");
+    assert.equal(body.billing_address.zip, "10977");
+    assert.equal(body.billing_address.country, "US");
+    assert.equal(body.billing_address.first_name, "Ada");
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(body, "payment_descriptor"),
+      false
+    );
+  });
+
   it("mint JSON and guest charge live on the brand website origin", () => {
     const src = fs.readFileSync(new URL("../server.js", import.meta.url), "utf8");
     assert.match(src, /guestPayOrigin\(/);
-    assert.match(src, /build: "2026-09-09-nmi-code-map"/);
+    assert.match(src, /build: "2026-09-09-open-avs"/);
     assert.doesNotMatch(
       src.slice(src.indexOf("const stored = await storeInvoice"), src.indexOf("const shareUrl")),
       /publicHostFor\(req\)/
@@ -1211,6 +1328,8 @@ describe("chargePayCode", () => {
     assert.doesNotMatch(charge, /body\.amount/);
     assert.doesNotMatch(charge, /amountUsd:/);
     assert.match(charge, /chargePayCode\(\{/);
+    assert.match(charge, /address1: body\.address1/);
+    assert.match(charge, /zip: body\.zip/);
     assert.match(charge, /guestFailBody/);
     assert.match(charge, /guestFailBody\(\{ error: "raw_card_rejected" \}\)/);
     assert.doesNotMatch(charge, /blockedReason \|\| result\.error/);

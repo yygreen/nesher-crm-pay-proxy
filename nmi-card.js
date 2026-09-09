@@ -219,6 +219,37 @@ export function recordName(value, max = 80) {
     .slice(0, cap);
 }
 
+/**
+ * Optional v5 billing_address for AVS. Names from customerName when
+ * present; address1 / city / zip / country / email when present.
+ * Country defaults to US only if a street field is filled and country
+ * is blank. Empty keys omitted. Never invents Guest. Not a descriptor.
+ */
+export function saleBillingAddress(opts = {}) {
+  const customerName = recordName(opts.customerName);
+  const names = customerName ? splitName(customerName) : null;
+  const address1 = recordName(opts.address1 || opts.address, 255);
+  const city = recordName(opts.city, 80);
+  const zip = recordName(
+    opts.zip || opts.postalCode || opts.postal_code,
+    20
+  );
+  const email = recordName(opts.email, 120);
+  let country = recordName(opts.country, 40);
+  if (!country && (address1 || city || zip)) country = "US";
+  const addr = {};
+  if (names) {
+    addr.first_name = names.first_name;
+    addr.last_name = names.last_name;
+  }
+  if (address1) addr.address1 = address1;
+  if (city) addr.city = city;
+  if (zip) addr.zip = zip;
+  if (country) addr.country = country;
+  if (email) addr.email = email;
+  return Object.keys(addr).length ? addr : null;
+}
+
 function nmiPrivateKey() {
   return String(process.env.NMI_PRIVATE_KEY || "").trim();
 }
@@ -779,25 +810,26 @@ export async function chargeWithToken(opts = {}) {
   const customerName = recordName(opts.customerName);
   const staffName = recordName(opts.staffName);
   const notes = recordName(opts.notes || opts.moreInfo, 255);
-  const names = customerName ? splitName(customerName) : null;
+  const billing = saleBillingAddress({
+    customerName,
+    address1: opts.address1 || opts.address,
+    city: opts.city,
+    zip: opts.zip || opts.postalCode || opts.postal_code,
+    country: opts.country,
+    email: opts.email,
+  });
   const descBase = String(opts.summary || `${brand.name} ${orderId}`);
   const orderDescription = staffName
     ? `${descBase} · ${staffName}`.slice(0, 100)
     : descBase.slice(0, 100);
   // No payment_descriptor / Classic descriptor: this MID refuses custom DBA.
   // field_4 Guest / field_5 Processor / field_6 More info — records only.
+  // billing_address AVS (address1/city/zip/country) is not a descriptor.
   const body = {
     amount,
     currency: "USD",
     payment_details: { payment_token: token },
-    ...(names
-      ? {
-          billing_address: {
-            first_name: names.first_name,
-            last_name: names.last_name,
-          },
-        }
-      : {}),
+    ...(billing ? { billing_address: billing } : {}),
     order_details: {
       id: orderId,
       order_description: orderDescription,
@@ -874,6 +906,11 @@ export async function chargeGuestInvoice(opts = {}) {
     customerName: invoice.customerName,
     summary: invoice.summary,
     paymentToken: token,
+    address1: opts.address1 || opts.address,
+    city: opts.city,
+    zip: opts.zip || opts.postalCode || opts.postal_code,
+    country: opts.country,
+    email: opts.email,
     fetchImpl: opts.fetchImpl,
     privateKey: opts.privateKey,
   });
@@ -946,6 +983,11 @@ export async function chargePayCode(opts = {}) {
     customerName: invoice.customerName,
     summary: invoice.summary,
     paymentToken: token,
+    address1: opts.address1 || opts.address,
+    city: opts.city,
+    zip: opts.zip || opts.postalCode || opts.postal_code,
+    country: opts.country,
+    email: opts.email,
     fetchImpl: opts.fetchImpl,
     privateKey: opts.privateKey,
   });

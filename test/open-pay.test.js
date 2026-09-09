@@ -166,16 +166,47 @@ describe("renderOpenPayHtml", () => {
     assert.match(html, /id="staff-name"/);
     assert.match(html, /id="customer-name"/);
     assert.match(html, /id="more-info"/);
+    assert.match(html, /id="office-group"/);
+    assert.match(html, /id="card-group"/);
+    assert.match(html, /<h2 class="group-title">Office<\/h2>/);
+    assert.match(html, /<h2 class="group-title">Card<\/h2>/);
     assert.match(html, />Processor</);
     assert.match(html, />Customer name</);
     assert.match(html, />More info</);
+    assert.match(html, /id="billing-address"/);
+    assert.match(html, /id="billing-city"/);
+    assert.match(html, /id="billing-zip"/);
+    assert.match(html, /id="billing-country"/);
+    assert.match(html, /id="billing-email"/);
+    assert.match(html, />Address</);
+    assert.match(html, />City</);
+    assert.match(html, />ZIP</);
+    assert.match(html, />Country</);
+    assert.match(html, />Email</);
     assert.doesNotMatch(html, /id="staff-name"[^>]*required/);
     assert.doesNotMatch(html, /id="customer-name"[^>]*required/);
     assert.doesNotMatch(html, /id="more-info"[^>]*required/);
+    assert.doesNotMatch(html, /id="billing-address"[^>]*required/);
+    assert.doesNotMatch(html, /id="billing-city"[^>]*required/);
+    assert.doesNotMatch(html, /id="billing-zip"[^>]*required/);
+    assert.doesNotMatch(html, /id="billing-country"[^>]*required/);
+    assert.doesNotMatch(html, /id="billing-email"[^>]*required/);
+    const officeAt = html.indexOf(">Office<");
+    const cardAt = html.indexOf(">Card<");
+    const amountAt = html.indexOf('id="amount-usd"');
+    const processorAt = html.indexOf(">Processor<");
+    assert.ok(officeAt > 0 && officeAt < processorAt);
+    assert.ok(processorAt < cardAt);
+    assert.ok(cardAt > 0 && cardAt < amountAt);
     assert.match(html, /var payload=\{payment_token:token,amountUsd:amt\}/);
     assert.match(html, /if\(customerName\) payload\.customerName=customerName/);
     assert.match(html, /if\(staffName\) payload\.staffName=staffName/);
     assert.match(html, /if\(notes\) payload\.notes=notes/);
+    assert.match(html, /if\(address1\) payload\.address1=address1/);
+    assert.match(html, /if\(city\) payload\.city=city/);
+    assert.match(html, /if\(zip\) payload\.zip=zip/);
+    assert.match(html, /if\(country\) payload\.country=country/);
+    assert.match(html, /if\(email\) payload\.email=email/);
     assert.match(html, /JSON\.stringify\(payload\)/);
     assert.match(html, /charAt\(0\)==="\{"/);
     assert.match(html, /Nothing is wrong on our side/);
@@ -312,6 +343,52 @@ describe("chargeOpenPay", () => {
       Object.prototype.hasOwnProperty.call(body, "payment_descriptor"),
       false
     );
+  });
+
+  it("empty address still charges; zip+address1 go on billing_address", async () => {
+    const sale = saleFetch();
+    const blank = await chargeOpenPay({
+      amountUsd: 10,
+      paymentToken: "tok_collect",
+      invoiceNumber: "OPEN-20260908-avs0",
+      address1: "",
+      city: "   ",
+      zip: "",
+      country: "",
+      email: "",
+      fetchImpl: sale.fetchImpl,
+    });
+    assert.equal(blank.ok, true);
+    assert.equal(blank.httpStatus, 200);
+    const emptyBody = sale.lastBody();
+    assert.equal(emptyBody.billing_address, undefined);
+    assert.doesNotMatch(JSON.stringify(emptyBody), /Guest/);
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(emptyBody, "payment_descriptor"),
+      false
+    );
+    const filled = await chargeOpenPay({
+      amountUsd: 10,
+      paymentToken: "tok_collect",
+      invoiceNumber: "OPEN-20260908-avs1",
+      address1: "12 Main St",
+      zip: "10977",
+      fetchImpl: sale.fetchImpl,
+    });
+    assert.equal(filled.ok, true);
+    const body = sale.lastBody();
+    assert.equal(body.billing_address.address1, "12 Main St");
+    assert.equal(body.billing_address.zip, "10977");
+    assert.equal(body.billing_address.country, "US");
+    assert.equal(body.billing_address.city, undefined);
+    assert.equal(body.billing_address.email, undefined);
+    assert.equal(body.billing_address.first_name, undefined);
+    assert.doesNotMatch(JSON.stringify(body), /Guest/);
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(body, "payment_descriptor"),
+      false
+    );
+    assert.doesNotMatch(JSON.stringify(body), /payment_descriptor/);
   });
 
   it("names go to field_4 and field_5, never payment_descriptor", async () => {
@@ -525,6 +602,11 @@ describe("CRM amount lock is unchanged", () => {
     assert.match(open, /customerName:/);
     assert.match(open, /staffName:/);
     assert.match(open, /notes:/);
+    assert.match(open, /address1:/);
+    assert.match(open, /city:/);
+    assert.match(open, /zip:/);
+    assert.match(open, /country:/);
+    assert.match(open, /email:/);
     assert.match(open, /guestFailBody/);
     assert.match(open, /guestFailBody\(\{ error: "raw_card_rejected" \}\)/);
     assert.doesNotMatch(
@@ -544,7 +626,7 @@ describe("wiring", () => {
     assert.match(docker, /\bopen-pay\.js\b/);
     const src = fs.readFileSync(new URL("../server.js", import.meta.url), "utf8");
     assert.match(src, /from "\.\/open-pay\.js"/);
-    assert.match(src, /build: "2026-09-09-nmi-code-map"/);
+    assert.match(src, /build: "2026-09-09-open-avs"/);
     assert.match(src, /isOpenPayPath\(url\.pathname\)/);
     assert.match(src, /openPayRequestAllowed\(req\.headers\)/);
     assert.match(src, /\/pay\/open/);

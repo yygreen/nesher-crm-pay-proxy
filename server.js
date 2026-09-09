@@ -1081,6 +1081,11 @@ const server = http.createServer(async (req, res) => {
           openBody.processor ||
           "",
         notes: openBody.notes || openBody.moreInfo || openBody.more_info || "",
+        address1: openBody.address1 || openBody.address || "",
+        city: openBody.city || "",
+        zip: openBody.zip || openBody.postalCode || openBody.postal_code || "",
+        country: openBody.country || "",
+        email: openBody.email || "",
         kind: "open",
       });
       if (openResult.ok) {
@@ -1123,6 +1128,11 @@ const server = http.createServer(async (req, res) => {
     const result = await chargePayCode({
       code,
       paymentToken: body.payment_token || body.paymentToken || body.token || "",
+      address1: body.address1 || body.address || "",
+      city: body.city || "",
+      zip: body.zip || body.postalCode || body.postal_code || "",
+      country: body.country || "",
+      email: body.email || "",
       loadInvoice,
       claimInvoicePaid,
       releaseInvoicePaidClaim,
@@ -1190,7 +1200,7 @@ const server = http.createServer(async (req, res) => {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-09-09-nmi-code-map",
+      build: "2026-09-09-open-avs",
       snapEngage: {
         enabled: SNAPENGAGE_ENABLED,
         widgetId: SNAPENGAGE_WIDGET_ID,
