@@ -236,6 +236,16 @@ describe("renderOpenPayHtml", () => {
     const amountInCard = cardHtml.indexOf('id="amount-usd"');
     assert.ok(amountInCard >= 0 && amountInCard < billingAt);
     assert.ok(billingAt > 0 && collectAt > billingAt);
+    assert.match(html, /class="avs-block"/);
+    assert.match(html, /var avs=document\.querySelector\("\.avs-block"\)/);
+    assert.match(html, /if\(avs\) avs\.hidden=true/);
+    assert.match(html, /if\(office\) office\.hidden=true/);
+    assert.match(html, /if\(wrap\) wrap\.hidden=true/);
+    const avsAt = html.indexOf('class="avs-block"');
+    const payAt = html.indexOf("Pay with card");
+    const hideAt = html.indexOf("if(avs) avs.hidden=true");
+    assert.ok(avsAt > 0 && payAt > avsAt);
+    assert.ok(hideAt > html.indexOf('if(x.j&&x.j.ok)'));
     assert.match(html, /var payload=\{payment_token:token,amountUsd:amt\}/);
     assert.match(html, /if\(customerName\) payload\.customerName=customerName/);
     assert.match(html, /if\(staffName\) payload\.staffName=staffName/);

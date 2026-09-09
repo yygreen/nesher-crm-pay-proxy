@@ -412,8 +412,10 @@ function renderCollectJsForm(collectKey) {
                   var form=document.getElementById("card-form");
                   var wrap=document.getElementById("amount-wrap");
                   var office=document.getElementById("office-group");
+                  var avs=document.querySelector(".avs-block");
                   if(office) office.hidden=true;
                   if(wrap) wrap.hidden=true;
+                  if(avs) avs.hidden=true;
                   if(form) form.innerHTML="<p class='hint'>Card payment received. Thank you.</p>";
                 } else {
                   if(btn) btn.disabled=false;
