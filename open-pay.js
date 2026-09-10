@@ -476,8 +476,10 @@ ${officeFields}              if(address1) payload.address1=address1;
                   var form=document.getElementById("card-form");
                   var wrap=document.getElementById("amount-wrap");
                   var office=document.getElementById("office-group");
+                  var address=document.getElementById("address-group");
                   var avs=document.querySelector(".avs-block");
                   if(office) office.hidden=true;
+                  if(address) address.hidden=true;
                   if(wrap) wrap.hidden=true;
                   if(avs) avs.hidden=true;
                   if(form) form.innerHTML="<p class='hint'>Card payment received. Thank you.</p>";
@@ -647,7 +649,7 @@ function renderPaySheet(data = {}, opts = {}) {
     .avs-hint {
       margin: 0 0 10px; font-size: 12.5px; color: #6B7280; line-height: 1.4;
     }
-    .avs-block { margin: 12px 0 4px; }
+    .avs-block { margin: 0; }
     .foot {
       margin-top: 28px; font-size: 12px; color: #aaa; text-align: center;
     }
@@ -657,15 +659,8 @@ function renderPaySheet(data = {}, opts = {}) {
   <div class="sheet">
     <p class="logo"><img src="${logo}" alt="Nesher Travel" height="40" data-fallback="${logoFallback}" onerror="this.onerror=null;this.src=this.getAttribute('data-fallback')"></p>
     ${top}
-    <div class="group group-card" id="card-group">
-      <h2 class="group-title">Card</h2>
-      <div id="amount-wrap">
-        <p class="label">Amount</p>
-        <div class="amount-row">
-          <span class="amount-prefix">$</span>
-          <input id="amount-usd" type="number" inputmode="decimal" min="1" max="25000" step="0.01" autocomplete="off" />
-        </div>
-      </div>
+    <div class="group" id="address-group">
+      <h2 class="group-title">Address</h2>
       <div class="avs-block">
         <p class="avs-hint">Used to match the card.</p>
         <div class="meta-field">
@@ -695,6 +690,16 @@ function renderPaySheet(data = {}, opts = {}) {
         <div class="meta-field">
           <p class="label">Email</p>
           <input id="billing-email" type="email" maxlength="120" autocomplete="email" />
+        </div>
+      </div>
+    </div>
+    <div class="group group-card" id="card-group">
+      <h2 class="group-title">Card</h2>
+      <div id="amount-wrap">
+        <p class="label">Amount</p>
+        <div class="amount-row">
+          <span class="amount-prefix">$</span>
+          <input id="amount-usd" type="number" inputmode="decimal" min="1" max="25000" step="0.01" autocomplete="off" />
         </div>
       </div>
       ${card}

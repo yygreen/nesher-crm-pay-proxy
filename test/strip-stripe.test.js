@@ -130,7 +130,7 @@ describe("stripStripeUi", () => {
     const isGetAt = src.indexOf("if (isGet)");
     const waAt = src.indexOf("injectWhatsAppUi(");
     assert.ok(isGetAt > 0 && waAt > isGetAt);
-    assert.match(src, /build: "2026-09-10-customer-name"/);
+    assert.match(src, /build: "2026-09-10-address-group"/);
   });
 
   it("POST save-error HTML is stripped and still gets the send-pay-link", () => {

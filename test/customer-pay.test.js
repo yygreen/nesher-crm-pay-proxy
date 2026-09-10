@@ -224,7 +224,7 @@ describe("customer pay mint path wiring", () => {
     assert.ok(src.includes("hotel-offer|hotel|reservation|customer"));
     assert.ok(src.includes("loadCustomerPayTarget"));
     assert.ok(src.includes("buildCustomerDraft"));
-    assert.ok(src.includes('build: "2026-09-10-customer-name"'));
+    assert.ok(src.includes('build: "2026-09-10-address-group"'));
     assert.ok(!/NMI_JRM_DESCRIPTOR\s*=/.test(src));
   });
 

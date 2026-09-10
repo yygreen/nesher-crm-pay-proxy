@@ -242,6 +242,8 @@ describe("renderOpenPayHtml", () => {
     assert.doesNotMatch(html, /Goldie/);
     assert.doesNotMatch(html, /<select/);
     assert.doesNotMatch(html, />More info</);
+    assert.match(html, /id="address-group"/);
+    assert.match(html, /<h2 class="group-title">Address<\/h2>/);
     assert.match(html, /id="card-group"/);
     assert.match(html, /<h2 class="group-title">Card<\/h2>/);
     assert.match(html, /id="billing-address"/);
@@ -265,29 +267,52 @@ describe("renderOpenPayHtml", () => {
     assert.doesNotMatch(html, /id="billing-country"[^>]*required/);
     assert.doesNotMatch(html, /id="billing-email"[^>]*required/);
     const nameAt = html.indexOf(">Customer name<");
-    const cardAt = html.indexOf(">Card<");
+    const addressTitleAt = html.indexOf('<h2 class="group-title">Address</h2>');
+    const cardAt = html.indexOf('<h2 class="group-title">Card</h2>');
     const amountAt = html.indexOf('id="amount-usd"');
-    assert.ok(nameAt > 0 && nameAt < cardAt);
+    const amountLabelAt = html.indexOf(">Amount<");
+    const billingAt = html.indexOf('id="billing-address"');
+    const collectAt = html.indexOf("token/Collect.js");
+    const payAt = html.indexOf("Pay with card");
+    assert.ok(nameAt > 0 && nameAt < addressTitleAt);
+    assert.ok(addressTitleAt > 0 && addressTitleAt < cardAt);
     assert.ok(cardAt > 0 && cardAt < amountAt);
+    assert.ok(billingAt > addressTitleAt && billingAt < cardAt);
+    assert.ok(billingAt > addressTitleAt && billingAt < collectAt);
+    assert.ok(billingAt < payAt);
+    assert.ok(!(amountLabelAt < billingAt && billingAt < collectAt));
+    const addressHtml = html.slice(
+      html.indexOf('id="address-group"'),
+      html.indexOf('id="card-group"')
+    );
     const cardHtml = html.slice(html.indexOf('id="card-group"'));
+    assert.match(addressHtml, /<h2 class="group-title">Address<\/h2>/);
+    assert.match(addressHtml, /class="avs-block"/);
+    assert.match(addressHtml, /Used to match the card\./);
+    assert.match(addressHtml, /id="billing-address"/);
+    assert.match(addressHtml, /id="billing-city"/);
+    assert.match(addressHtml, /id="billing-state"/);
+    assert.match(addressHtml, /id="billing-zip"/);
+    assert.match(addressHtml, /id="billing-country"/);
+    assert.match(addressHtml, /id="billing-email"/);
+    assert.doesNotMatch(addressHtml, /id="amount-usd"/);
+    assert.doesNotMatch(addressHtml, /Pay with card/);
+    assert.doesNotMatch(addressHtml, /id="customer-name"/);
     assert.match(cardHtml, /id="amount-usd"/);
-    assert.match(cardHtml, /id="billing-address"/);
-    assert.match(cardHtml, /Used to match the card\./);
+    assert.match(cardHtml, /Pay with card/);
+    assert.doesNotMatch(cardHtml, /id="billing-address"/);
+    assert.doesNotMatch(cardHtml, /Used to match the card\./);
     assert.doesNotMatch(cardHtml, /id="staff-name"/);
     assert.doesNotMatch(cardHtml, /id="customer-name"/);
     assert.doesNotMatch(cardHtml, /id="more-info"/);
-    const billingAt = cardHtml.indexOf('id="billing-address"');
-    const collectAt = cardHtml.indexOf("token/Collect.js");
-    const amountInCard = cardHtml.indexOf('id="amount-usd"');
-    assert.ok(amountInCard >= 0 && amountInCard < billingAt);
-    assert.ok(billingAt > 0 && collectAt > billingAt);
     assert.match(html, /class="avs-block"/);
     assert.match(html, /var avs=document\.querySelector\("\.avs-block"\)/);
+    assert.match(html, /var address=document\.getElementById\("address-group"\)/);
     assert.match(html, /if\(avs\) avs\.hidden=true/);
+    assert.match(html, /if\(address\) address\.hidden=true/);
     assert.match(html, /if\(office\) office\.hidden=true/);
     assert.match(html, /if\(wrap\) wrap\.hidden=true/);
     const avsAt = html.indexOf('class="avs-block"');
-    const payAt = html.indexOf("Pay with card");
     const hideAt = html.indexOf("if(avs) avs.hidden=true");
     assert.ok(avsAt > 0 && payAt > avsAt);
     assert.ok(hideAt > html.indexOf('if(x.j&&x.j.ok)'));
@@ -352,6 +377,8 @@ describe("renderOfficePayHtml", () => {
   it("Office then Card: Taken by select, Customer name, More info, none required", () => {
     assert.match(html, /id="office-group"/);
     assert.match(html, /<h2 class="group-title">Office<\/h2>/);
+    assert.match(html, /id="address-group"/);
+    assert.match(html, /<h2 class="group-title">Address<\/h2>/);
     assert.match(html, /<h2 class="group-title">Card<\/h2>/);
     assert.match(html, />Taken by</);
     assert.match(html, /<select id="staff-name"/);
@@ -380,13 +407,27 @@ describe("renderOfficePayHtml", () => {
     assert.doesNotMatch(html, /<select id="staff-name"[^>]*required/);
     const officeAt = html.indexOf(">Office<");
     const takenAt = html.indexOf(">Taken by<");
-    const cardAt = html.indexOf(">Card<");
+    const addressTitleAt = html.indexOf('<h2 class="group-title">Address</h2>');
+    const cardAt = html.indexOf('<h2 class="group-title">Card</h2>');
     const amountAt = html.indexOf('id="amount-usd"');
+    const amountLabelAt = html.indexOf(">Amount<");
+    const billingAt = html.indexOf('id="billing-address"');
+    const collectAt = html.indexOf("token/Collect.js");
+    const payAt = html.indexOf("Pay with card");
     assert.ok(officeAt > 0 && officeAt < takenAt);
-    assert.ok(takenAt < cardAt);
+    assert.ok(takenAt < addressTitleAt);
+    assert.ok(addressTitleAt > 0 && addressTitleAt < cardAt);
     assert.ok(cardAt > 0 && cardAt < amountAt);
+    assert.ok(billingAt > addressTitleAt && billingAt < cardAt);
+    assert.ok(billingAt > addressTitleAt && billingAt < collectAt);
+    assert.ok(billingAt < payAt);
+    assert.ok(!(amountLabelAt < billingAt && billingAt < collectAt));
     const officeHtml = html.slice(
       html.indexOf('id="office-group"'),
+      html.indexOf('id="address-group"')
+    );
+    const addressHtml = html.slice(
+      html.indexOf('id="address-group"'),
       html.indexOf('id="card-group"')
     );
     const cardHtml = html.slice(html.indexOf('id="card-group"'));
@@ -399,15 +440,24 @@ describe("renderOfficePayHtml", () => {
     assert.match(officeHtml, />More info</);
     assert.doesNotMatch(officeHtml, /id="billing-address"/);
     assert.doesNotMatch(officeHtml, /id="amount-usd"/);
+    assert.match(addressHtml, /<h2 class="group-title">Address<\/h2>/);
+    assert.match(addressHtml, /class="avs-block"/);
+    assert.match(addressHtml, /Used to match the card\./);
+    assert.match(addressHtml, /id="billing-address"/);
+    assert.doesNotMatch(addressHtml, /id="amount-usd"/);
+    assert.doesNotMatch(addressHtml, /id="staff-name"/);
+    assert.doesNotMatch(addressHtml, /Pay with card/);
     assert.match(cardHtml, /id="amount-usd"/);
-    assert.match(cardHtml, /Used to match the card\./);
     assert.match(cardHtml, /Pay with card/);
+    assert.doesNotMatch(cardHtml, /Used to match the card\./);
+    assert.doesNotMatch(cardHtml, /id="billing-address"/);
     assert.doesNotMatch(cardHtml, /id="staff-name"/);
     assert.match(html, /if\(staffName\) payload\.staffName=staffName/);
     assert.match(html, /if\(notes\) payload\.notes=notes/);
     assert.match(html, /fetch\("\/pay\/office\/charge"/);
     assert.doesNotMatch(html, /fetch\("\/pay\/open\/charge"/);
     assert.match(html, /if\(avs\) avs\.hidden=true/);
+    assert.match(html, /if\(address\) address\.hidden=true/);
     assert.match(html, /if\(office\) office\.hidden=true/);
     assert.match(html, /if\(wrap\) wrap\.hidden=true/);
     assert.doesNotMatch(html, /FLYNESHER\.COM/);
@@ -879,7 +929,7 @@ describe("wiring", () => {
     assert.match(docker, /\bopen-pay\.js\b/);
     const src = fs.readFileSync(new URL("../server.js", import.meta.url), "utf8");
     assert.match(src, /from "\.\/open-pay\.js"/);
-    assert.match(src, /build: "2026-09-10-customer-name"/);
+    assert.match(src, /build: "2026-09-10-address-group"/);
     assert.match(src, /isOpenPayPath\(url\.pathname\)/);
     assert.match(src, /isOfficePayPath\(url\.pathname\)/);
     assert.match(src, /openPayRequestAllowed\(req\.headers\)/);
