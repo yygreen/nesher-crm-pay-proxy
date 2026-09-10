@@ -2,31 +2,45 @@
  * Nesher open-amount card pages.
  * External (the link they send): https://www.flynesher.com/pay/open
  *   Customer name, then Card (amount, AVS, Collect.js). POST /pay/open/charge
- *   ignores staffName / processor / notes even if posted.
+ *   ignores staffName / processor / notes / crmRef even if posted. Ignores ?ref=.
  * Internal (office fills): https://www.flynesher.com/pay/office
- *   Office (Taken by roster select, Customer name, More info) then Card.
+ *   Office (optional CRM reference, Taken by roster select, Customer name,
+ *   More info) then Address then Card. ?ref= prefills + loads. Empty CRM ref
+ *   still charges as OPEN- (Pinpoint only, no CRM write).
  *   POST /pay/office/charge accepts staffName only when it is exactly
  *   one of OPEN_PAY_STAFF; otherwise omit field_5 (still charge).
  * Empty omitted. Address is AVS, never a descriptor. Never Guest.
  * Decline copy is guestCardMessage, never raw JSON.
  *
- * Not the CRM-priced /pay/<8-char> path (that amount stays store-locked).
- * Not JRM. Not Collect Checkout customPayment. No Mercury mint (no amount
- * until the guest types one). No processed-by sermon.
+ * Not the CRM-priced /pay/<8-char> path (that amount stays store-locked)
+ * except when office loads that 8-char as the CRM reference.
+ * Not Collect Checkout customPayment. No processed-by sermon.
  */
 
 import crypto from "node:crypto";
 import {
   chargeWithToken,
+  chargePayCode,
   collectScriptUrl,
   looksLikePan,
   recordName,
   guestCardMessage,
+  isShortPayCode,
   GUEST_DECLINE_DEFAULT,
   GUEST_OURS,
   GUEST_MISSING_AMOUNT,
   GUEST_MISSING_CARD,
 } from "./nmi-card.js";
+import { parseInvoiceNumber, recordNmiPaidInvoice } from "./payments-sync.js";
+import { loadInvoice } from "./invoice-store.js";
+import {
+  loadHotelPayContext,
+  loadReservationPayContext,
+  loadReservationPayContextByCode,
+  loadCustomerPayContext,
+  loadCustomerPayTarget,
+} from "./db.js";
+import { hotelInvoiceNumber, reservationInvoiceNumber } from "./mercury.js";
 
 export const OPEN_PAY_PATH = "/pay/open";
 export const OFFICE_PAY_PATH = "/pay/office";
@@ -83,8 +97,10 @@ export function isOfficePayPath(pathname) {
   return (
     p === "/pay/office" ||
     p === "/pay/office/charge" ||
+    p === "/pay/office/lookup" ||
     p === "/__nesher_pay/office" ||
-    p === "/__nesher_pay/office/charge"
+    p === "/__nesher_pay/office/charge" ||
+    p === "/__nesher_pay/office/lookup"
   );
 }
 
@@ -92,6 +108,13 @@ export function isOfficePayChargePath(pathname) {
   const p = normPath(pathname);
   return p === "/pay/office/charge" || p === "/__nesher_pay/office/charge";
 }
+
+export function isOfficePayLookupPath(pathname) {
+  const p = normPath(pathname);
+  return p === "/pay/office/lookup" || p === "/__nesher_pay/office/lookup";
+}
+
+export const OFFICE_CRM_MISS = "We could not find that CRM reference.";
 
 /**
  * Guest open-amount is Nesher-origin only.
@@ -231,7 +254,8 @@ function httpStatusFor(error) {
     error === "amount_too_large" ||
     error === "payment_token required" ||
     error === "raw_card_rejected" ||
-    error === "open_ref_required"
+    error === "open_ref_required" ||
+    error === "not_found"
   ) {
     return 400;
   }
@@ -354,8 +378,311 @@ export async function chargeOpenPay(opts = {}) {
   };
 }
 
-export function chargeOfficePay(opts = {}) {
-  return chargeOpenPay({ ...opts, office: true });
+export function classifyOfficeRef(value) {
+  const ref = String(value || "").trim();
+  if (!ref) return { kind: "empty" };
+  if (ref.charAt(0) === "{" || /\s/.test(ref)) return { kind: "invalid" };
+  const cust = /^CUST-(\d+)$/i.exec(ref);
+  if (cust && Number(cust[1]) > 0) {
+    return {
+      kind: "crm",
+      crmKind: "customer",
+      ref,
+      customerId: Number(cust[1]),
+    };
+  }
+  const parsed = parseInvoiceNumber(ref);
+  if (parsed) {
+    return { kind: "crm", crmKind: parsed.kind, ref, parsed };
+  }
+  if (/^[a-z0-9]{6,12}$/i.test(ref) && isShortPayCode(ref)) {
+    return { kind: "code", ref };
+  }
+  return { kind: "invalid" };
+}
+
+function missLookup() {
+  return { ok: false, error: "not_found", message: OFFICE_CRM_MISS };
+}
+
+function moneyUsd(n) {
+  const x = Math.round(Number(n) * 100) / 100;
+  return Number.isFinite(x) ? x : 0;
+}
+
+function lookupName(value) {
+  const n = recordName(value);
+  if (!n) return "";
+  return n;
+}
+
+function lookupEmail(value) {
+  const e = recordName(value, 120);
+  if (!e || !e.includes("@")) return "";
+  return e;
+}
+
+/**
+ * Exact CRM / 8-char mint lookup for the office sheet.
+ * Miss is always OFFICE_CRM_MISS — never a store error or JSON dump.
+ */
+export async function lookupOfficeCrmRef(value, deps = {}) {
+  const classified = classifyOfficeRef(value);
+  if (classified.kind === "empty" || classified.kind === "invalid") {
+    return missLookup();
+  }
+  try {
+    if (classified.kind === "code") {
+      const load = deps.loadInvoice || loadInvoice;
+      const verified = await load(classified.ref);
+      if (!verified || !verified.ok || !verified.data) return missLookup();
+      const data = verified.data;
+      const amountUsd = moneyUsd(data.amountUsd);
+      if (!(amountUsd > 0)) return missLookup();
+      return {
+        ok: true,
+        invoiceNumber: String(data.invoiceNumber || classified.ref),
+        customerName: lookupName(data.customerName),
+        email: lookupEmail(data.email || data.customerEmail),
+        amountUsd,
+        amountLocked: true,
+        source: "code",
+      };
+    }
+    if (classified.crmKind === "reservation") {
+      const load =
+        deps.loadReservationPayContextByCode || loadReservationPayContextByCode;
+      const ctx = await load(classified.parsed.code);
+      const amountUsd = moneyUsd(ctx.balance);
+      return {
+        ok: true,
+        invoiceNumber: classified.ref,
+        customerName: lookupName(
+          ctx.reservation?.customer_name || ctx.reservation?.customerName
+        ),
+        email: lookupEmail(ctx.reservation?.customer_email),
+        ...(amountUsd > 0 ? { amountUsd } : {}),
+        amountLocked: false,
+        source: "reservation",
+      };
+    }
+    if (classified.crmKind === "hotel") {
+      const load = deps.loadHotelPayContext || loadHotelPayContext;
+      const ctx = await load(
+        classified.parsed.requestId,
+        classified.parsed.offerId
+      );
+      const price = moneyUsd(
+        ctx.offer?.customer_price || ctx.offer?.customerPrice
+      );
+      const paid = moneyUsd(ctx.payments?.paidUsd);
+      const amountUsd = moneyUsd(price - paid);
+      return {
+        ok: true,
+        invoiceNumber: classified.ref,
+        customerName: lookupName(ctx.request?.customer_name),
+        email: lookupEmail(ctx.request?.email),
+        ...(amountUsd > 0 ? { amountUsd } : {}),
+        amountLocked: false,
+        source: "hotel",
+      };
+    }
+    if (classified.crmKind === "customer") {
+      const loadCust = deps.loadCustomerPayContext || loadCustomerPayContext;
+      const loadTarget = deps.loadCustomerPayTarget || loadCustomerPayTarget;
+      const ctx = await loadCust(classified.customerId);
+      const target = await loadTarget(classified.customerId);
+      const amountUsd = moneyUsd(target?.amountUsd);
+      return {
+        ok: true,
+        invoiceNumber: classified.ref,
+        customerName: lookupName(ctx.customer?.full_name),
+        email: lookupEmail(ctx.customer?.email),
+        ...(amountUsd > 0 ? { amountUsd } : {}),
+        amountLocked: false,
+        source: "customer",
+      };
+    }
+  } catch {
+    return missLookup();
+  }
+  return missLookup();
+}
+
+function missCharge() {
+  return {
+    ok: false,
+    error: "not_found",
+    message: OFFICE_CRM_MISS,
+    httpStatus: 400,
+  };
+}
+
+function lookupDeps(opts = {}) {
+  return {
+    loadInvoice: opts.loadInvoice,
+    loadHotelPayContext: opts.loadHotelPayContext,
+    loadReservationPayContextByCode: opts.loadReservationPayContextByCode,
+    loadCustomerPayContext: opts.loadCustomerPayContext,
+    loadCustomerPayTarget: opts.loadCustomerPayTarget,
+  };
+}
+
+async function resolveCustomerChargeTarget(target, opts = {}) {
+  if (!target || !(moneyUsd(target.amountUsd) > 0.01)) return null;
+  if (target.kind === "reservation" && Number(target.id) > 0) {
+    const load = opts.loadReservationPayContext || loadReservationPayContext;
+    const ctx = await load(Number(target.id));
+    const inv = reservationInvoiceNumber(ctx.reservation?.reservation_code);
+    if (!inv) return null;
+    return { invoiceNumber: inv, kind: "reservation" };
+  }
+  if (
+    (target.kind === "hotel-offer" || target.kind === "hotel") &&
+    Number(target.requestId) > 0
+  ) {
+    const inv = hotelInvoiceNumber(target.requestId, target.id);
+    if (!inv) return null;
+    return { invoiceNumber: inv, kind: "hotel" };
+  }
+  return null;
+}
+
+async function chargeOfficeCrmRef(opts, classified) {
+  const parsed = parseOpenAmountUsd(opts.amountUsd);
+  if (!parsed.ok) {
+    const message = guestCardMessage({ error: parsed.error });
+    return { ok: false, error: parsed.error, message, httpStatus: 400 };
+  }
+  const token = String(opts.paymentToken || "").trim();
+  if (looksLikePan(token)) {
+    const message = guestCardMessage({ error: "raw_card_rejected" });
+    return { ok: false, error: "raw_card_rejected", message, httpStatus: 400 };
+  }
+  if (!token) {
+    const message = guestCardMessage({ error: "payment_token required" });
+    return {
+      ok: false,
+      error: "payment_token required",
+      message,
+      httpStatus: 400,
+    };
+  }
+  let invoiceNumber = classified.ref;
+  let kind =
+    classified.crmKind === "hotel"
+      ? "hotel"
+      : classified.crmKind === "customer"
+        ? "customer"
+        : "reservation";
+  if (classified.crmKind === "customer") {
+    try {
+      const loadTarget = opts.loadCustomerPayTarget || loadCustomerPayTarget;
+      const target = await loadTarget(classified.customerId);
+      const resolved = await resolveCustomerChargeTarget(target, opts);
+      if (!resolved) return missCharge();
+      invoiceNumber = resolved.invoiceNumber;
+      kind = resolved.kind;
+    } catch {
+      return missCharge();
+    }
+  }
+  const customerName = recordName(opts.customerName);
+  const staffName = rosterStaffName(opts.staffName);
+  const notes = recordName(opts.notes || opts.moreInfo, 255);
+  const sale = await chargeWithToken({
+    amountUsd: parsed.amountUsd,
+    invoiceNumber,
+    kind,
+    ...(customerName ? { customerName } : {}),
+    ...(staffName ? { staffName } : {}),
+    ...(notes ? { notes } : {}),
+    ...(recordName(opts.address1 || opts.address, 255)
+      ? { address1: recordName(opts.address1 || opts.address, 255) }
+      : {}),
+    ...(recordName(opts.city, 80) ? { city: recordName(opts.city, 80) } : {}),
+    ...(recordName(opts.state, 40) ? { state: recordName(opts.state, 40) } : {}),
+    ...(recordName(opts.zip || opts.postalCode || opts.postal_code, 20)
+      ? { zip: recordName(opts.zip || opts.postalCode || opts.postal_code, 20) }
+      : {}),
+    ...(recordName(opts.country, 40)
+      ? { country: recordName(opts.country, 40) }
+      : {}),
+    ...(recordName(opts.email, 120)
+      ? { email: recordName(opts.email, 120) }
+      : {}),
+    summary: opts.summary || invoiceNumber,
+    paymentToken: token,
+    fetchImpl: opts.fetchImpl,
+    privateKey: opts.privateKey,
+  });
+  if (!sale.ok) {
+    const err = sale.error || "declined";
+    const message = sale.message || guestCardMessage(sale);
+    return {
+      ok: false,
+      error: err,
+      message,
+      blockedReason: message || sale.blockedReason,
+      httpStatus: httpStatusFor(err),
+    };
+  }
+  if (kind === "hotel" || kind === "reservation") {
+    const record = opts.recordNmiPaidInvoice || recordNmiPaidInvoice;
+    if (typeof record === "function") {
+      try {
+        await record({
+          invoiceNumber,
+          amountUsd: parsed.amountUsd,
+          transactionId: sale.transactionId,
+          paidAt: opts.now || new Date().toISOString(),
+        });
+      } catch (e) {
+        console.warn("recordNmiPaidInvoice failed", e.message);
+      }
+    }
+  }
+  return {
+    ok: true,
+    amountUsd: parsed.amountUsd,
+    invoiceNumber,
+    transactionId: sale.transactionId || null,
+    httpStatus: 200,
+  };
+}
+
+export async function chargeOfficePay(opts = {}) {
+  const classified = classifyOfficeRef(opts.crmRef || opts.ref);
+  if (classified.kind === "empty") {
+    return chargeOpenPay({ ...opts, office: true });
+  }
+  if (classified.kind === "invalid") {
+    return missCharge();
+  }
+  if (classified.kind === "code") {
+    return chargePayCode({
+      code: classified.ref,
+      paymentToken: opts.paymentToken,
+      address1: opts.address1 || opts.address,
+      city: opts.city,
+      state: opts.state,
+      zip: opts.zip || opts.postalCode || opts.postal_code,
+      country: opts.country,
+      email: opts.email,
+      loadInvoice: opts.loadInvoice,
+      claimInvoicePaid: opts.claimInvoicePaid,
+      releaseInvoicePaidClaim: opts.releaseInvoicePaidClaim,
+      markInvoicePaid: opts.markInvoicePaid,
+      claimNmiNote: opts.claimNmiNote,
+      appendReservationNote: opts.appendReservationNote,
+      appendHotelNote: opts.appendHotelNote,
+      fetchImpl: opts.fetchImpl,
+      privateKey: opts.privateKey,
+    });
+  }
+  const looked = await lookupOfficeCrmRef(classified.ref, lookupDeps(opts));
+  if (!looked.ok) return missCharge();
+  return chargeOfficeCrmRef(opts, classified);
 }
 
 export function renderOpenPayErrorHtml(message) {
@@ -382,8 +709,10 @@ function renderCollectJsForm(collectKey, opts = {}) {
   const officeFields = office
     ? `              var staffName=readName("staff-name");
               var notes=readName("more-info",255);
+              var crmRef=readName("crm-ref",80);
               if(staffName) payload.staffName=staffName;
               if(notes) payload.notes=notes;
+              if(crmRef) payload.crmRef=crmRef;
 `
     : "";
   return `<div id="card-form">
@@ -511,6 +840,74 @@ function staffSelectHtml() {
   return `<select id="staff-name" autocomplete="off">${opts.join("")}</select>`;
 }
 
+function officeCrmRefScript() {
+  return `<script>
+      (function(){
+        var input=document.getElementById("crm-ref");
+        var btn=document.getElementById("crm-ref-load");
+        var err=document.getElementById("crm-ref-err");
+        if(!input) return;
+        var miss=${JSON.stringify(OFFICE_CRM_MISS)};
+        function show(m){
+          if(!err) return;
+          if(!m){err.hidden=true;err.textContent="";return;}
+          var s=String(m||"").trim();
+          if(!s || s.charAt(0)==="{" || s.indexOf('"object"')>=0) s=miss;
+          err.hidden=false;
+          err.textContent=s;
+        }
+        function setUrl(v){
+          try{
+            var u=new URL(window.location.href);
+            if(v) u.searchParams.set("ref",v);
+            else u.searchParams.delete("ref");
+            window.history.replaceState(null,"",u.pathname+u.search+u.hash);
+          }catch(e){}
+        }
+        function fill(d){
+          var name=document.getElementById("customer-name");
+          var amt=document.getElementById("amount-usd");
+          var email=document.getElementById("billing-email");
+          if(name && d.customerName) name.value=d.customerName;
+          if(amt){
+            if(d.amountUsd!=null && d.amountUsd!=="") amt.value=d.amountUsd;
+            amt.readOnly=!!d.amountLocked;
+          }
+          if(email && d.email) email.value=d.email;
+        }
+        function load(){
+          var ref=String(input.value||"").replace(/[\\r\\n\\t]+/g," ").trim();
+          input.value=ref;
+          setUrl(ref);
+          if(!ref){
+            show("");
+            var amt=document.getElementById("amount-usd");
+            if(amt) amt.readOnly=false;
+            return;
+          }
+          fetch("/pay/office/lookup",{
+            method:"POST",
+            headers:{"Content-Type":"application/json"},
+            body:JSON.stringify({ref:ref})
+          }).then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j};});})
+          .then(function(x){
+            if(x.j&&x.j.ok){
+              show("");
+              fill(x.j);
+            } else {
+              show((x.j&&x.j.message)||miss);
+            }
+          }).catch(function(){show(miss);});
+        }
+        input.addEventListener("input",function(){
+          setUrl(String(input.value||"").replace(/[\\r\\n\\t]+/g," ").trim());
+        });
+        if(btn) btn.addEventListener("click",function(e){e.preventDefault();load();});
+        if(String(input.value||"").trim()) load();
+      })();
+      </script>`;
+}
+
 function renderPaySheet(data = {}, opts = {}) {
   const office = opts.office === true;
   const collectKey = String(data.collectPublicKey || "").trim();
@@ -520,9 +917,18 @@ function renderPaySheet(data = {}, opts = {}) {
     : `<p class="hint">Card pay is not available right now.</p>`;
   const logo = esc(NESHER_LOGO_URL);
   const logoFallback = esc(NESHER_LOGO_FALLBACK);
+  const crmRefValue = office ? esc(data.crmRef || "") : "";
   const top = office
     ? `<div class="group" id="office-group">
       <h2 class="group-title">Office</h2>
+      <div class="meta-field">
+        <p class="label">CRM reference</p>
+        <div class="ref-row">
+          <input id="crm-ref" type="text" maxlength="80" autocomplete="off" value="${crmRefValue}" />
+          <button type="button" class="btn-load" id="crm-ref-load">Load</button>
+        </div>
+        <p id="crm-ref-err" class="card-err" hidden></p>
+      </div>
       <div class="meta-field">
         <p class="label">Taken by</p>
         ${staffSelectHtml()}
@@ -581,6 +987,13 @@ function renderPaySheet(data = {}, opts = {}) {
     .meta-field { margin: 12px 0 0; }
     .meta-field:first-of-type { margin-top: 0; }
     #guest-name { margin: 0 0 14px; }
+    .ref-row { display: flex; gap: 8px; align-items: stretch; }
+    .ref-row input { flex: 1; min-width: 0; }
+    .btn-load {
+      border: 0; cursor: pointer; font-family: inherit; font-weight: 600;
+      font-size: 14px; padding: 10px 14px; border-radius: 10px;
+      background: #E8EEF2; color: #1F3A4A; white-space: nowrap;
+    }
     .meta-field input, .meta-field select {
       width: 100%; font-size: 15px; font-family: inherit; color: #111;
       border: 1px solid #D8DEE4; border-radius: 10px; padding: 10px 12px;
@@ -706,6 +1119,7 @@ function renderPaySheet(data = {}, opts = {}) {
     </div>
     <p class="foot">Nesher Travel</p>
   </div>
+  ${office ? officeCrmRefScript() : ""}
 </body>
 </html>`;
 }

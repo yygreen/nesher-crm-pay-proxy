@@ -10,6 +10,10 @@ import {
   isOpenPayChargePath,
   isOfficePayPath,
   isOfficePayChargePath,
+  isOfficePayLookupPath,
+  lookupOfficeCrmRef,
+  classifyOfficeRef,
+  OFFICE_CRM_MISS,
   openPayHostAllowed,
   openPayRequestAllowed,
   decideOpenPayPage,
@@ -50,6 +54,14 @@ describe("open-pay paths", () => {
     assert.equal(isOfficePayPath("/pay/open"), false);
     assert.equal(isOfficePayPath("/pay/officer"), false);
     assert.equal(isOfficePayPath("/pay/7wm3td6g"), false);
+    assert.equal(isOfficePayPath("/pay/office/lookup"), true);
+    assert.equal(isOfficePayPath("/__nesher_pay/office/lookup"), true);
+    assert.equal(isOfficePayLookupPath("/pay/office/lookup"), true);
+    assert.equal(isOfficePayLookupPath("/pay/office/lookup/"), true);
+    assert.equal(isOfficePayLookupPath("/pay/office"), false);
+    assert.equal(isOfficePayLookupPath("/pay/office/charge"), false);
+    assert.equal(isOfficePayLookupPath("/pay/open/lookup"), false);
+    assert.equal(isOpenPayPath("/pay/office/lookup"), false);
   });
 
   it("roster is the named desk people, exact strings only", () => {
@@ -320,6 +332,12 @@ describe("renderOpenPayHtml", () => {
     assert.match(html, /if\(customerName\) payload\.customerName=customerName/);
     assert.doesNotMatch(html, /payload\.staffName/);
     assert.doesNotMatch(html, /payload\.notes/);
+    assert.doesNotMatch(html, /payload\.crmRef/);
+    assert.doesNotMatch(html, /CRM reference/);
+    assert.doesNotMatch(html, /id="crm-ref"/);
+    assert.doesNotMatch(html, /crm-ref-load/);
+    assert.doesNotMatch(html, /\/pay\/office\/lookup/);
+    assert.doesNotMatch(html, /replaceState/);
     assert.match(html, /if\(address1\) payload\.address1=address1/);
     assert.match(html, /if\(city\) payload\.city=city/);
     assert.match(html, /if\(state\) payload\.state=state/);
@@ -454,6 +472,15 @@ describe("renderOfficePayHtml", () => {
     assert.doesNotMatch(cardHtml, /id="staff-name"/);
     assert.match(html, /if\(staffName\) payload\.staffName=staffName/);
     assert.match(html, /if\(notes\) payload\.notes=notes/);
+    assert.match(html, /if\(crmRef\) payload\.crmRef=crmRef/);
+    assert.match(html, />CRM reference</);
+    assert.match(html, /id="crm-ref"/);
+    assert.match(html, /id="crm-ref-load"/);
+    assert.match(html, />Load</);
+    assert.match(html, /replaceState/);
+    assert.match(html, /fetch\("\/pay\/office\/lookup"/);
+    assert.match(html, /We could not find that CRM reference\./);
+    assert.doesNotMatch(html, /staff-name"\)\.value/);
     assert.match(html, /fetch\("\/pay\/office\/charge"/);
     assert.doesNotMatch(html, /fetch\("\/pay\/open\/charge"/);
     assert.match(html, /if\(avs\) avs\.hidden=true/);
@@ -894,6 +921,9 @@ describe("CRM amount lock is unchanged", () => {
     assert.doesNotMatch(charge, /amountUsd:/);
     const open = src.slice(openAt, captureAt);
     assert.match(open, /chargeOpenPay\(\{/);
+    assert.match(open, /chargeOfficePay\(\{/);
+    assert.match(open, /lookupOfficeCrmRef/);
+    assert.match(open, /isOfficePayLookupPath/);
     assert.match(open, /amountUsd:/);
     assert.match(open, /customerName:/);
     assert.match(open, /isOfficePayPath/);
@@ -902,6 +932,10 @@ describe("CRM amount lock is unchanged", () => {
     assert.match(open, /office: true/);
     assert.match(open, /staffName:/);
     assert.match(open, /notes:/);
+    assert.match(open, /crmRef:/);
+    assert.match(open, /recordNmiPaidInvoice/);
+    assert.match(open, /loadCustomerPayTarget/);
+    assert.match(open, /loadReservationPayContextByCode/);
     assert.match(open, /renderOfficePayHtml/);
     assert.match(open, /renderOpenPayHtml/);
     assert.match(open, /address1:/);
@@ -923,13 +957,393 @@ describe("CRM amount lock is unchanged", () => {
   });
 });
 
+describe("office CRM reference", () => {
+  let prevKey;
+  let prevJrm;
+  beforeEach(() => {
+    prevKey = process.env.NMI_PRIVATE_KEY;
+    prevJrm = process.env.NMI_JRM_DESCRIPTOR;
+    delete process.env.NMI_JRM_DESCRIPTOR;
+    process.env.NMI_PRIVATE_KEY = "test-private-key";
+  });
+  afterEach(() => {
+    if (prevKey !== undefined) process.env.NMI_PRIVATE_KEY = prevKey;
+    else delete process.env.NMI_PRIVATE_KEY;
+    if (prevJrm !== undefined) process.env.NMI_JRM_DESCRIPTOR = prevJrm;
+    else delete process.env.NMI_JRM_DESCRIPTOR;
+  });
+
+  function saleFetch() {
+    let lastBody;
+    let calls = 0;
+    const fetchImpl = async (_url, init) => {
+      calls += 1;
+      lastBody = JSON.parse(init.body);
+      return {
+        ok: true,
+        status: 200,
+        async text() {
+          return JSON.stringify({ response: "1", id: "txn_crm" });
+        },
+      };
+    };
+    return { fetchImpl, calls: () => calls, lastBody: () => lastBody };
+  }
+
+  it("classifies 8-char, RES-, JRM-1, CUST-n; junk is invalid", () => {
+    assert.equal(classifyOfficeRef("").kind, "empty");
+    assert.equal(classifyOfficeRef("7wm3td6g").kind, "code");
+    assert.equal(classifyOfficeRef("RES-AFV2WG").kind, "crm");
+    assert.equal(classifyOfficeRef("RES-AFV2WG").crmKind, "reservation");
+    assert.equal(classifyOfficeRef("JRM-190").kind, "crm");
+    assert.equal(classifyOfficeRef("JRM-190").crmKind, "hotel");
+    assert.equal(classifyOfficeRef("CUST-12").kind, "crm");
+    assert.equal(classifyOfficeRef("CUST-12").crmKind, "customer");
+    assert.equal(classifyOfficeRef("nope").kind, "invalid");
+    assert.equal(classifyOfficeRef("{ok:true}").kind, "invalid");
+    assert.equal(classifyOfficeRef("RES AFV2WG").kind, "invalid");
+  });
+
+  it("lookup miss is the office sentence, never JSON", async () => {
+    const miss = await lookupOfficeCrmRef("nope");
+    assert.equal(miss.ok, false);
+    assert.equal(miss.message, OFFICE_CRM_MISS);
+    assert.doesNotMatch(JSON.stringify(miss), /\{"object"/);
+    assert.doesNotMatch(JSON.stringify(miss), /stack/);
+    const thrown = await lookupOfficeCrmRef("RES-NONE", {
+      loadReservationPayContextByCode: async () => {
+        throw new Error('{"object":"transaction"}');
+      },
+    });
+    assert.equal(thrown.ok, false);
+    assert.equal(thrown.message, OFFICE_CRM_MISS);
+    assert.doesNotMatch(JSON.stringify(thrown), /transaction/);
+  });
+
+  it("lookup hit 8-char fills name/amount/email and locks amount", async () => {
+    let saw;
+    const hit = await lookupOfficeCrmRef("7wm3td6g", {
+      loadInvoice: async (code) => {
+        saw = code;
+        return {
+          ok: true,
+          data: {
+            amountUsd: 55.55,
+            customerName: "Ada",
+            email: "ada@example.com",
+            invoiceNumber: "RES-555TRAIN",
+          },
+        };
+      },
+    });
+    assert.equal(saw, "7wm3td6g");
+    assert.equal(hit.ok, true);
+    assert.equal(hit.amountUsd, 55.55);
+    assert.equal(hit.amountLocked, true);
+    assert.equal(hit.customerName, "Ada");
+    assert.equal(hit.email, "ada@example.com");
+    assert.doesNotMatch(JSON.stringify(hit), /Guest/);
+  });
+
+  it("lookup hit RES- fills remaining due and does not invent Guest", async () => {
+    let saw;
+    const hit = await lookupOfficeCrmRef("RES-AFV2WG", {
+      loadInvoice: async () => {
+        throw new Error("store should not run");
+      },
+      loadReservationPayContextByCode: async (code) => {
+        saw = code;
+        return {
+          reservation: { customer_name: "Ada Levi", customer_email: "ada@x.com" },
+          balance: 100.5,
+        };
+      },
+    });
+    assert.equal(saw, "AFV2WG");
+    assert.equal(hit.ok, true);
+    assert.equal(hit.amountUsd, 100.5);
+    assert.equal(hit.amountLocked, false);
+    assert.equal(hit.customerName, "Ada Levi");
+    assert.equal(hit.email, "ada@x.com");
+    const blank = await lookupOfficeCrmRef("RES-X1", {
+      loadReservationPayContextByCode: async () => ({
+        reservation: { customer_name: "", customer_email: "" },
+        balance: 10,
+      }),
+    });
+    assert.equal(blank.ok, true);
+    assert.equal(blank.customerName, "");
+    assert.doesNotMatch(JSON.stringify(blank), /Guest/);
+  });
+
+  it("lookup hit JRM-1 remaining is quote minus paid", async () => {
+    const hit = await lookupOfficeCrmRef("JRM-190", {
+      loadHotelPayContext: async (id, offerId) => {
+        assert.equal(id, 90);
+        assert.equal(offerId, null);
+        return {
+          request: { customer_name: "Chaim", email: "c@x.com" },
+          offer: { customer_price: 200 },
+          payments: { paidUsd: 50 },
+        };
+      },
+    });
+    assert.equal(hit.ok, true);
+    assert.equal(hit.amountUsd, 150);
+    assert.equal(hit.customerName, "Chaim");
+    assert.equal(hit.email, "c@x.com");
+    assert.equal(hit.amountLocked, false);
+  });
+
+  it("guest HTML ignores crmRef and ?ref=", () => {
+    const html = renderOpenPayHtml({
+      collectPublicKey: "pk_test_collect",
+      crmRef: "RES-AFV2WG",
+    });
+    assert.doesNotMatch(html, /CRM reference/);
+    assert.doesNotMatch(html, /id="crm-ref"/);
+    assert.doesNotMatch(html, /RES-AFV2WG/);
+    assert.doesNotMatch(html, /replaceState/);
+    const office = renderOfficePayHtml({
+      collectPublicKey: "pk_test_collect",
+      crmRef: "RES-AFV2WG",
+    });
+    assert.match(office, /value="RES-AFV2WG"/);
+    assert.match(office, /id="staff-name"/);
+  });
+
+  it("empty CRM ref still mints OPEN- and skips the CRM writer", async () => {
+    const sale = saleFetch();
+    let wrote = 0;
+    const out = await chargeOfficePay({
+      amountUsd: 10,
+      paymentToken: "tok_collect",
+      fetchImpl: sale.fetchImpl,
+      recordNmiPaidInvoice: async () => {
+        wrote += 1;
+        return { ok: true };
+      },
+    });
+    assert.equal(out.ok, true);
+    assert.match(out.invoiceNumber, /^OPEN-/);
+    assert.match(sale.lastBody().order_details.id, /^OPEN-/);
+    assert.equal(wrote, 0);
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(sale.lastBody(), "payment_descriptor"),
+      false
+    );
+  });
+
+  it("guest charge ignores posted crmRef and stays OPEN-", async () => {
+    const sale = saleFetch();
+    let wrote = 0;
+    const out = await chargeOpenPay({
+      amountUsd: 10,
+      paymentToken: "tok_collect",
+      crmRef: "RES-AFV2WG",
+      ref: "RES-AFV2WG",
+      fetchImpl: sale.fetchImpl,
+      recordNmiPaidInvoice: async () => {
+        wrote += 1;
+        return { ok: true };
+      },
+    });
+    assert.equal(out.ok, true);
+    assert.match(out.invoiceNumber, /^OPEN-/);
+    assert.match(sale.lastBody().order_details.id, /^OPEN-/);
+    assert.equal(wrote, 0);
+  });
+
+  it("8-char office charge locks the stored amount", async () => {
+    const sale = saleFetch();
+    const out = await chargeOfficePay({
+      crmRef: "7wm3td6g",
+      amountUsd: 1,
+      paymentToken: "tok_collect",
+      loadInvoice: async () => ({
+        ok: true,
+        data: {
+          amountUsd: 55.55,
+          invoiceNumber: "RES-555TRAIN",
+          customerName: "Ada",
+          kind: "reservation",
+        },
+      }),
+      claimInvoicePaid: async () => ({ ok: true, paidAt: "t" }),
+      markInvoicePaid: async () => ({ ok: true }),
+      fetchImpl: sale.fetchImpl,
+      privateKey: "test-private-key",
+    });
+    assert.equal(out.ok, true);
+    assert.equal(sale.lastBody().amount, "55.55");
+    assert.notEqual(Number(sale.lastBody().amount), 1);
+    assert.equal(sale.lastBody().order_details.id, "RES-555TRAIN");
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(sale.lastBody(), "payment_descriptor"),
+      false
+    );
+  });
+
+  it("CRM-shaped miss is 400 and never hits NMI: RES-NONE / JRM-19999 / CUST-0", async () => {
+    let called = 0;
+    const fetchImpl = async () => {
+      called += 1;
+      throw new Error("no fetch");
+    };
+    for (const ref of ["RES-NONE", "JRM-19999", "CUST-0"]) {
+      const out = await chargeOfficePay({
+        crmRef: ref,
+        amountUsd: 10,
+        paymentToken: "tok_collect",
+        fetchImpl,
+        loadReservationPayContextByCode: async () => {
+          throw new Error('{"object":"missing"}');
+        },
+        loadHotelPayContext: async () => {
+          throw new Error("Hotel request 9999 not found");
+        },
+      });
+      assert.equal(out.ok, false);
+      assert.equal(out.httpStatus, 400);
+      assert.equal(out.message, OFFICE_CRM_MISS);
+      assert.doesNotMatch(JSON.stringify(out), /Hotel request/);
+      assert.doesNotMatch(JSON.stringify(out), /"object"/);
+      assert.doesNotMatch(out.message, /\{/);
+    }
+    assert.equal(called, 0);
+  });
+
+  it("CUST-n with no unpaid booking is 400 and never hits NMI", async () => {
+    let called = 0;
+    const out = await chargeOfficePay({
+      crmRef: "CUST-12",
+      amountUsd: 10,
+      paymentToken: "tok_collect",
+      fetchImpl: async () => {
+        called += 1;
+        throw new Error("no fetch");
+      },
+      loadCustomerPayContext: async () => ({
+        customer: { full_name: "Ada", email: "ada@x.com" },
+      }),
+      loadCustomerPayTarget: async () => ({
+        kind: "customer",
+        id: 12,
+        amountUsd: 0,
+      }),
+    });
+    assert.equal(out.ok, false);
+    assert.equal(out.httpStatus, 400);
+    assert.equal(out.message, OFFICE_CRM_MISS);
+    assert.equal(called, 0);
+  });
+
+  it("CUST-n unpaid reservation charges that RES- id and writes CRM", async () => {
+    const sale = saleFetch();
+    let recorded;
+    const out = await chargeOfficePay({
+      crmRef: "CUST-12",
+      amountUsd: 40,
+      paymentToken: "tok_collect",
+      customerName: "Ada",
+      fetchImpl: sale.fetchImpl,
+      loadCustomerPayContext: async (id) => {
+        assert.equal(id, 12);
+        return { customer: { full_name: "Ada", email: "ada@x.com" } };
+      },
+      loadCustomerPayTarget: async () => ({
+        kind: "reservation",
+        id: 347,
+        amountUsd: 40,
+      }),
+      loadReservationPayContext: async (id) => {
+        assert.equal(id, 347);
+        return {
+          reservation: { id: 347, reservation_code: "AFV2WG" },
+          balance: 40,
+        };
+      },
+      recordNmiPaidInvoice: async (args) => {
+        recorded = args;
+        return { ok: true };
+      },
+    });
+    assert.equal(out.ok, true);
+    assert.equal(out.invoiceNumber, "RES-AFV2WG");
+    assert.equal(sale.lastBody().order_details.id, "RES-AFV2WG");
+    assert.doesNotMatch(sale.lastBody().order_details.id, /^CUST-/);
+    assert.equal(recorded.invoiceNumber, "RES-AFV2WG");
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(sale.lastBody(), "payment_descriptor"),
+      false
+    );
+  });
+
+  it("RES- office charge uses that order id and the CRM writer", async () => {
+    const sale = saleFetch();
+    let recorded;
+    const out = await chargeOfficePay({
+      crmRef: "RES-AFV2WG",
+      amountUsd: 40,
+      paymentToken: "tok_collect",
+      customerName: "Ada",
+      staffName: "Hershy",
+      fetchImpl: sale.fetchImpl,
+      loadReservationPayContextByCode: async (code) => {
+        assert.equal(code, "AFV2WG");
+        return {
+          reservation: {
+            customer_name: "Ada",
+            customer_email: "ada@x.com",
+            reservation_code: "AFV2WG",
+          },
+          balance: 40,
+        };
+      },
+      recordNmiPaidInvoice: async (args) => {
+        recorded = args;
+        return { ok: true, recorded: ["ok"] };
+      },
+    });
+    assert.equal(out.ok, true);
+    assert.equal(out.invoiceNumber, "RES-AFV2WG");
+    assert.equal(sale.lastBody().amount, "40.00");
+    assert.equal(sale.lastBody().order_details.id, "RES-AFV2WG");
+    assert.equal(sale.lastBody().merchant_defined_fields.field_5, "Hershy");
+    assert.doesNotMatch(sale.lastBody().order_details.id, /^OPEN-/);
+    assert.equal(recorded.invoiceNumber, "RES-AFV2WG");
+    assert.equal(recorded.amountUsd, 40);
+    assert.equal(recorded.transactionId, "txn_crm");
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(sale.lastBody(), "payment_descriptor"),
+      false
+    );
+    assert.doesNotMatch(JSON.stringify(sale.lastBody()), /payment_descriptor/);
+  });
+
+  it("crm and jrm hosts still 404 the office page and lookup path is allowlisted", () => {
+    const page = decideOfficePayPage(
+      { host: "crm.flynesher.com" },
+      { collectPublicKey: "pk" }
+    );
+    assert.equal(page.status, 404);
+    assert.doesNotMatch(page.html, /CRM reference/);
+    assert.doesNotMatch(page.html, /Collect\.js/);
+    const jrm = decideOfficePayPage({ host: "www.jrmhotels.com" });
+    assert.equal(jrm.status, 404);
+    assert.equal(openPayRequestAllowed({ host: "crm.flynesher.com" }), false);
+    assert.equal(openPayRequestAllowed({ host: "www.jrmhotels.com" }), false);
+    assert.equal(isOfficePayLookupPath("/pay/office/lookup"), true);
+  });
+});
+
 describe("wiring", () => {
   it("Dockerfile COPY includes open-pay.js and health tag is bumped", () => {
     const docker = fs.readFileSync(new URL("../Dockerfile", import.meta.url), "utf8");
     assert.match(docker, /\bopen-pay\.js\b/);
     const src = fs.readFileSync(new URL("../server.js", import.meta.url), "utf8");
     assert.match(src, /from "\.\/open-pay\.js"/);
-    assert.match(src, /build: "2026-09-10-address-group"/);
+    assert.match(src, /build: "2026-09-10-office-crm"/);
     assert.match(src, /isOpenPayPath\(url\.pathname\)/);
     assert.match(src, /isOfficePayPath\(url\.pathname\)/);
     assert.match(src, /openPayRequestAllowed\(req\.headers\)/);

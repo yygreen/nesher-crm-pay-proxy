@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { parseInvoiceNumber, syncPaidInvoices } from "../payments-sync.js";
+import { parseInvoiceNumber, syncPaidInvoices, recordNmiPaidInvoice } from "../payments-sync.js";
 
 describe("parseInvoiceNumber", () => {
   it("maps JRM numbers to request/offer", () => {
@@ -150,5 +150,75 @@ describe("syncPaidInvoices", () => {
     });
     assert.equal(out.recorded.length, 1);
     assert.match(out.skipped[0], /unrecognized/);
+  });
+});
+
+describe("recordNmiPaidInvoice", () => {
+  it("records a hotel NMI payment with nmi: marker and no Mercury prefix", async () => {
+    const pool = fakePool([
+      { match: /FROM core_jrmhoteloffer/, rows: () => [{ request_id: 90 }] },
+      { match: /FROM core_jrmhotelrequest WHERE id/, rows: () => [{ id: 90 }] },
+    ]);
+    const out = await recordNmiPaidInvoice({
+      pool,
+      invoiceNumber: "JRM-190-O48",
+      amountUsd: 40,
+      transactionId: "txn_crm",
+    });
+    assert.equal(out.ok, true);
+    assert.equal(out.recorded.length, 1);
+    const ins = pool.calls.filter((c) => c.sql.startsWith("INSERT"));
+    assert.equal(ins.length, 2);
+    assert.match(ins[0].sql, /core_jrmhotelpayment/);
+    assert.ok(ins[0].params.some((p) => String(p).includes("nmi:txn_crm")));
+    assert.ok(ins[0].params.includes("card"));
+    assert.equal(ins[0].params.includes("nmi"), false);
+    assert.equal(
+      ins[0].params.some((p) => String(p).includes("[Mercury")),
+      false
+    );
+    assert.equal(
+      ins[1].params.some((p) => String(p).includes("[Mercury Pay]")),
+      false
+    );
+    assert.match(String(ins[1].params[0]), /NMI card \$40\.00 USD txn txn_crm/);
+  });
+
+  it("records a reservation NMI payment without [Mercury Pay]", async () => {
+    const pool = fakePool([
+      { match: /FROM core_reservation WHERE UPPER/, rows: () => [{ id: 347, amount_paid: "0.00" }] },
+    ]);
+    const out = await recordNmiPaidInvoice({
+      pool,
+      invoiceNumber: "RES-AFV2WG",
+      amountUsd: 40,
+      transactionId: "txn_res",
+    });
+    assert.equal(out.ok, true);
+    const notes = pool.calls.flatMap((c) => c.params.map(String));
+    assert.equal(notes.some((p) => p.includes("[Mercury Pay]")), false);
+    assert.equal(notes.some((p) => p.includes("[Mercury sync]")), false);
+    assert.ok(notes.some((p) => p.includes("nmi:txn_res")));
+    assert.ok(notes.some((p) => p.includes("NMI card $40.00")));
+    assert.ok(pool.calls.some((c) => c.sql.includes("INSERT INTO core_payment")));
+    assert.ok(
+      pool.calls.some((c) => c.sql.includes("amount_paid = COALESCE(amount_paid, 0) + $1"))
+    );
+  });
+
+  it("is idempotent on the nmi: marker", async () => {
+    const pool = fakePool([
+      { match: /WHERE notes LIKE/, rows: () => [{ id: 1 }] },
+    ]);
+    const out = await recordNmiPaidInvoice({
+      pool,
+      invoiceNumber: "RES-AFV2WG",
+      amountUsd: 40,
+      transactionId: "txn_res",
+    });
+    assert.equal(out.ok, true);
+    assert.equal(out.recorded.length, 0);
+    assert.match(out.skipped[0], /already synced/);
+    assert.equal(pool.calls.filter((c) => c.sql.startsWith("INSERT")).length, 0);
   });
 });

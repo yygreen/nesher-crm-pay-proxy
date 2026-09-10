@@ -33,11 +33,14 @@ import {
   isOpenPayChargePath,
   isOfficePayPath,
   isOfficePayChargePath,
+  isOfficePayLookupPath,
   openPayRequestAllowed,
   renderOpenPayHtml,
   renderOfficePayHtml,
   renderOpenPayErrorHtml,
   chargeOpenPay,
+  chargeOfficePay,
+  lookupOfficeCrmRef,
 } from "./open-pay.js";
 import {
   storeInvoice,
@@ -68,12 +71,13 @@ import {
   loadHotelPayContext,
   loadHotelOfferPayContext,
   loadReservationPayContext,
+  loadReservationPayContextByCode,
   loadCustomerPayContext,
   loadCustomerPayTarget,
   appendHotelNote,
   appendReservationNote,
 } from "./db.js";
-import { syncPaidInvoices } from "./payments-sync.js";
+import { syncPaidInvoices, recordNmiPaidInvoice } from "./payments-sync.js";
 import { validateStaffSession, extractSessionId } from "./auth.js";
 import {
   buildReservationDraft,
@@ -1050,6 +1054,44 @@ const server = http.createServer(async (req, res) => {
       );
       return;
     }
+    if (isOfficePayLookupPath(url.pathname)) {
+      if ((req.method || "") !== "POST") {
+        sendJson(res, 405, { ok: false, error: "POST only" });
+        return;
+      }
+      let lookupBody = {};
+      try {
+        lookupBody = await readJson(req);
+      } catch {
+        lookupBody = {};
+      }
+      const looked = await lookupOfficeCrmRef(
+        lookupBody.ref || lookupBody.crmRef || lookupBody.code || "",
+        {
+          loadInvoice,
+          loadHotelPayContext,
+          loadReservationPayContextByCode,
+          loadCustomerPayContext,
+          loadCustomerPayTarget,
+        }
+      );
+      if (!looked.ok) {
+        sendJson(res, 404, {
+          ok: false,
+          message: looked.message || "We could not find that CRM reference.",
+        });
+        return;
+      }
+      sendJson(res, 200, {
+        ok: true,
+        customerName: looked.customerName || "",
+        email: looked.email || "",
+        amountUsd: looked.amountUsd,
+        amountLocked: Boolean(looked.amountLocked),
+        invoiceNumber: looked.invoiceNumber || "",
+      });
+      return;
+    }
     if (isOpenPayChargePath(url.pathname) || isOfficePayChargePath(url.pathname)) {
       if ((req.method || "") !== "POST") {
         sendJson(res, 405, { ok: false, error: "POST only" });
@@ -1071,34 +1113,61 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       const officeCharge = isOfficePayChargePath(url.pathname);
-      const openResult = await chargeOpenPay({
-        paymentToken:
-          openBody.payment_token ||
-          openBody.paymentToken ||
-          openBody.token ||
-          "",
-        amountUsd: openBody.amountUsd,
-        customerName: openBody.customerName || openBody.customer_name || "",
-        ...(officeCharge
-          ? {
-              office: true,
-              staffName:
-                openBody.staffName ||
-                openBody.staff_name ||
-                openBody.processor ||
-                "",
-              notes:
-                openBody.notes || openBody.moreInfo || openBody.more_info || "",
-            }
-          : {}),
-        address1: openBody.address1 || openBody.address || "",
-        city: openBody.city || "",
-        state: openBody.state || "",
-        zip: openBody.zip || openBody.postalCode || openBody.postal_code || "",
-        country: openBody.country || "",
-        email: openBody.email || "",
-        kind: "open",
-      });
+      const openResult = officeCharge
+        ? await chargeOfficePay({
+            paymentToken:
+              openBody.payment_token ||
+              openBody.paymentToken ||
+              openBody.token ||
+              "",
+            amountUsd: openBody.amountUsd,
+            customerName: openBody.customerName || openBody.customer_name || "",
+            office: true,
+            staffName:
+              openBody.staffName ||
+              openBody.staff_name ||
+              openBody.processor ||
+              "",
+            notes:
+              openBody.notes || openBody.moreInfo || openBody.more_info || "",
+            crmRef: openBody.crmRef || openBody.ref || "",
+            address1: openBody.address1 || openBody.address || "",
+            city: openBody.city || "",
+            state: openBody.state || "",
+            zip: openBody.zip || openBody.postalCode || openBody.postal_code || "",
+            country: openBody.country || "",
+            email: openBody.email || "",
+            loadInvoice,
+            claimInvoicePaid,
+            releaseInvoicePaidClaim,
+            markInvoicePaid,
+            claimNmiNote,
+            appendHotelNote,
+            appendReservationNote,
+            loadHotelPayContext,
+            loadReservationPayContext,
+            loadReservationPayContextByCode,
+            loadCustomerPayContext,
+            loadCustomerPayTarget,
+            recordNmiPaidInvoice: (args) =>
+              recordNmiPaidInvoice({ pool: getPool(), ...args }),
+          })
+        : await chargeOpenPay({
+            paymentToken:
+              openBody.payment_token ||
+              openBody.paymentToken ||
+              openBody.token ||
+              "",
+            amountUsd: openBody.amountUsd,
+            customerName: openBody.customerName || openBody.customer_name || "",
+            address1: openBody.address1 || openBody.address || "",
+            city: openBody.city || "",
+            state: openBody.state || "",
+            zip: openBody.zip || openBody.postalCode || openBody.postal_code || "",
+            country: openBody.country || "",
+            email: openBody.email || "",
+            kind: "open",
+          });
       if (openResult.ok) {
         sendJson(res, 200, {
           ok: true,
@@ -1117,7 +1186,10 @@ const server = http.createServer(async (req, res) => {
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     res.writeHead(200);
     const pageHtml = isOfficePayPath(url.pathname)
-      ? renderOfficePayHtml({ collectPublicKey: nmiPublicKey() })
+      ? renderOfficePayHtml({
+          collectPublicKey: nmiPublicKey(),
+          crmRef: String(url.searchParams.get("ref") || "").trim(),
+        })
       : renderOpenPayHtml({ collectPublicKey: nmiPublicKey() });
     res.end(pageHtml);
     return;
@@ -1215,7 +1287,7 @@ const server = http.createServer(async (req, res) => {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-09-10-address-group",
+      build: "2026-09-10-office-crm",
       snapEngage: {
         enabled: SNAPENGAGE_ENABLED,
         widgetId: SNAPENGAGE_WIDGET_ID,

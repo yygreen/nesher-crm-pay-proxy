@@ -31,18 +31,52 @@ function marker(inv) {
   return `mercury:${inv.id}`;
 }
 
+function nmiMarker(transactionId) {
+  const txn = String(transactionId || "").trim() || "unknown";
+  return `nmi:${txn}`;
+}
+
+function describeChannel(inv, channel = "mercury") {
+  const amount = Number(inv.amount);
+  const amt = Number.isFinite(amount) ? amount.toFixed(2) : "0.00";
+  if (channel === "nmi") {
+    const txn = String(inv.id || "").trim() || "unknown";
+    const mark = nmiMarker(txn);
+    return {
+      marker: mark,
+      method: "card",
+      paymentReference: `${inv.invoiceNumber} ${mark}`,
+      paymentNote: `NMI card $${amt} USD txn ${txn}.`,
+      staffNote: `NMI card $${amt} USD txn ${txn}.`,
+      reservationPaymentNotes: `NMI card $${amt} USD txn ${txn}. ${mark}`,
+      reservationAppend: `\nNMI card $${amt} USD txn ${txn}.`,
+    };
+  }
+  const mark = marker(inv);
+  return {
+    marker: mark,
+    method: "mercury",
+    paymentReference: `Mercury ${inv.invoiceNumber} ${mark}`,
+    paymentNote: `[Mercury sync] Invoice ${inv.invoiceNumber} paid $${amt} USD via Mercury pay link (card or ACH bank debit — Mercury does not disclose which).`,
+    staffNote: `[Mercury sync] PAID $${amt} USD — invoice ${inv.invoiceNumber}. Payment recorded; reserve with the hotel and confirm to the guest.`,
+    reservationPaymentNotes: `[Mercury sync] Invoice ${inv.invoiceNumber} paid via Mercury pay link (card or ACH bank debit — Mercury does not disclose which). ${mark}`,
+    reservationAppend: `\n[Mercury sync] PAID $${amt} USD — invoice ${inv.invoiceNumber}.`,
+  };
+}
+
 function paidAtOf(inv) {
   const t = inv.paidAt || inv.paidDate || inv.updatedAt || null;
   const d = t ? new Date(t) : new Date();
   return isNaN(d.getTime()) ? new Date() : d;
 }
 
-async function recordHotelPayment(pool, inv, target, out) {
+async function recordHotelPayment(pool, inv, target, out, channel = "mercury") {
   const amount = Number(inv.amount);
+  const ch = describeChannel(inv, channel);
   // Already recorded by a previous sync run?
   const dup = await pool.query(
     `SELECT id FROM core_jrmhotelpayment WHERE reference LIKE $1 LIMIT 1`,
-    [`%${marker(inv)}%`]
+    [`%${ch.marker}%`]
   );
   if (dup.rows.length) {
     out.skipped.push(`${inv.invoiceNumber}: already synced`);
@@ -83,12 +117,13 @@ async function recordHotelPayment(pool, inv, target, out) {
     `INSERT INTO core_jrmhotelpayment
        (payment_date, amount, currency, method, reference, note, created_at,
         created_by_id, offer_id, request_id, card_last4)
-     VALUES ($1, $2, 'USD', 'mercury', $3, $4, NOW(), NULL, $5, $6, '')`,
+     VALUES ($1, $2, 'USD', $3, $4, $5, NOW(), NULL, $6, $7, '')`,
     [
       paidAtOf(inv),
       amount,
-      `Mercury ${inv.invoiceNumber} ${marker(inv)}`,
-      `[Mercury sync] Invoice ${inv.invoiceNumber} paid $${amount.toFixed(2)} USD via Mercury pay link (card or ACH bank debit — Mercury does not disclose which).`,
+      ch.method,
+      ch.paymentReference,
+      ch.paymentNote,
       offerId,
       target.requestId,
     ]
@@ -96,19 +131,17 @@ async function recordHotelPayment(pool, inv, target, out) {
   await pool.query(
     `INSERT INTO core_jrmhotelnote (note, created_at, created_by_id, request_id)
      VALUES ($1, NOW(), NULL, $2)`,
-    [
-      `[Mercury sync] PAID $${amount.toFixed(2)} USD — invoice ${inv.invoiceNumber}. Payment recorded; reserve with the hotel and confirm to the guest.`,
-      target.requestId,
-    ]
+    [ch.staffNote, target.requestId]
   );
   out.recorded.push(`${inv.invoiceNumber}: $${amount.toFixed(2)} → hotel request #${target.requestId}`);
 }
 
-async function recordReservationPayment(pool, inv, target, out) {
+async function recordReservationPayment(pool, inv, target, out, channel = "mercury") {
   const amount = Number(inv.amount);
+  const ch = describeChannel(inv, channel);
   const dup = await pool.query(
     `SELECT id FROM core_payment WHERE notes LIKE $1 LIMIT 1`,
-    [`%${marker(inv)}%`]
+    [`%${ch.marker}%`]
   );
   if (dup.rows.length) {
     out.skipped.push(`${inv.invoiceNumber}: already synced`);
@@ -146,11 +179,12 @@ async function recordReservationPayment(pool, inv, target, out) {
           reservation_id, cash_location, cash_location_other,
           points_account_id, points_qty, transfer_details, zelle_address,
           points_cost_per_point)
-       VALUES ($1, 'mercury', $2, $3, NOW(), NULL, $4, '', '', NULL, 0, '', '', 0)`,
+       VALUES ($1, $2, $3, $4, NOW(), NULL, $5, '', '', NULL, 0, '', '', 0)`,
       [
         amount,
+        ch.method,
         paidAtOf(inv),
-        `[Mercury sync] Invoice ${inv.invoiceNumber} paid via Mercury pay link (card or ACH bank debit — Mercury does not disclose which). ${marker(inv)}`,
+        ch.reservationPaymentNotes,
         reservationId,
       ]
     );
@@ -160,11 +194,7 @@ async function recordReservationPayment(pool, inv, target, out) {
            notes = COALESCE(notes,'') || $2,
            updated_at = NOW()
        WHERE id = $3`,
-      [
-        amount,
-        `\n[Mercury sync] PAID $${amount.toFixed(2)} USD — invoice ${inv.invoiceNumber}.`,
-        reservationId,
-      ]
+      [amount, ch.reservationAppend, reservationId]
     );
     await client.query("COMMIT");
   } catch (e) {
@@ -174,6 +204,43 @@ async function recordReservationPayment(pool, inv, target, out) {
     client.release();
   }
   out.recorded.push(`${inv.invoiceNumber}: $${amount.toFixed(2)} → reservation #${reservationId}`);
+}
+
+/**
+ * Card sale → CRM payment row. Same inserts as Mercury sync, marker nmi:<txn>.
+ * Notes never carry [Mercury Pay] / [Mercury sync]. Idempotent on the marker.
+ */
+export async function recordNmiPaidInvoice({
+  pool,
+  invoiceNumber,
+  amountUsd,
+  transactionId,
+  paidAt,
+} = {}) {
+  const out = { ok: false, recorded: [], skipped: [], errors: [] };
+  const target = parseInvoiceNumber(invoiceNumber);
+  if (!target || (target.kind !== "hotel" && target.kind !== "reservation")) {
+    out.errors.push("unrecognized invoice number pattern");
+    return out;
+  }
+  const amount = Number(amountUsd);
+  if (!(amount > 0)) {
+    out.errors.push("amount");
+    return out;
+  }
+  const inv = {
+    id: String(transactionId || "").trim() || "unknown",
+    invoiceNumber: String(invoiceNumber || "").trim(),
+    amount,
+    paidAt: paidAt || new Date().toISOString(),
+  };
+  if (target.kind === "hotel") {
+    await recordHotelPayment(pool, inv, target, out, "nmi");
+  } else {
+    await recordReservationPayment(pool, inv, target, out, "nmi");
+  }
+  out.ok = out.errors.length === 0;
+  return out;
 }
 
 /**

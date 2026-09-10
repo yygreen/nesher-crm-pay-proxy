@@ -393,6 +393,25 @@ export async function loadReservationPayContext(reservationId) {
   };
 }
 
+/**
+ * Exact reservation_code match (same cleaner as payments-sync).
+ * Zero or many rows is a miss — never pick the nearest.
+ */
+export async function loadReservationPayContextByCode(code) {
+  const p = getPool();
+  const clean = String(code || "")
+    .replace(/[^A-Za-z0-9_-]/g, "")
+    .toUpperCase();
+  if (!clean) throw new Error("not found");
+  const r = await p.query(
+    `SELECT id FROM core_reservation
+     WHERE UPPER(regexp_replace(reservation_code, '[^A-Za-z0-9_-]', '', 'g')) = $1`,
+    [clean]
+  );
+  if (r.rows.length !== 1) throw new Error("not found");
+  return loadReservationPayContext(Number(r.rows[0].id));
+}
+
 function roundUsd(n) {
   return Math.round(Number(n) * 100) / 100;
 }
