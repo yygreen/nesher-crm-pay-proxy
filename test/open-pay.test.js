@@ -228,7 +228,8 @@ describe("renderOpenPayHtml", () => {
     assert.match(html, /Pay with card/);
     assert.match(html, /id="customer-name"/);
     assert.match(html, /id="guest-name"/);
-    assert.match(html, />Name</);
+    assert.match(html, />Customer name</);
+    assert.doesNotMatch(html, />Name</);
     assert.doesNotMatch(html, /id="staff-name"/);
     assert.doesNotMatch(html, /id="more-info"/);
     assert.doesNotMatch(html, /id="office-group"/);
@@ -240,7 +241,6 @@ describe("renderOpenPayHtml", () => {
     assert.doesNotMatch(html, /Richter/);
     assert.doesNotMatch(html, /Goldie/);
     assert.doesNotMatch(html, /<select/);
-    assert.doesNotMatch(html, />Customer name</);
     assert.doesNotMatch(html, />More info</);
     assert.match(html, /id="card-group"/);
     assert.match(html, /<h2 class="group-title">Card<\/h2>/);
@@ -264,7 +264,7 @@ describe("renderOpenPayHtml", () => {
     assert.doesNotMatch(html, /id="billing-zip"[^>]*required/);
     assert.doesNotMatch(html, /id="billing-country"[^>]*required/);
     assert.doesNotMatch(html, /id="billing-email"[^>]*required/);
-    const nameAt = html.indexOf(">Name<");
+    const nameAt = html.indexOf(">Customer name<");
     const cardAt = html.indexOf(">Card<");
     const amountAt = html.indexOf('id="amount-usd"');
     assert.ok(nameAt > 0 && nameAt < cardAt);
@@ -349,7 +349,7 @@ describe("renderOpenPayHtml", () => {
 describe("renderOfficePayHtml", () => {
   const html = renderOfficePayHtml({ collectPublicKey: "pk_test_collect" });
 
-  it("Office then Card: Taken by select, Name, More info, none required", () => {
+  it("Office then Card: Taken by select, Customer name, More info, none required", () => {
     assert.match(html, /id="office-group"/);
     assert.match(html, /<h2 class="group-title">Office<\/h2>/);
     assert.match(html, /<h2 class="group-title">Card<\/h2>/);
@@ -369,7 +369,8 @@ describe("renderOfficePayHtml", () => {
     assert.match(html, /<option value="Kimberly">Kimberly<\/option>/);
     assert.doesNotMatch(html, /Hershey/);
     assert.doesNotMatch(html, />Processor</);
-    assert.match(html, />Name</);
+    assert.match(html, />Customer name</);
+    assert.doesNotMatch(html, />Name</);
     assert.match(html, /id="customer-name"/);
     assert.match(html, />More info</);
     assert.match(html, /id="more-info"/);
@@ -393,7 +394,8 @@ describe("renderOfficePayHtml", () => {
     assert.match(officeHtml, /id="customer-name"/);
     assert.match(officeHtml, /id="more-info"/);
     assert.match(officeHtml, />Taken by</);
-    assert.match(officeHtml, />Name</);
+    assert.match(officeHtml, />Customer name</);
+    assert.doesNotMatch(officeHtml, />Name</);
     assert.match(officeHtml, />More info</);
     assert.doesNotMatch(officeHtml, /id="billing-address"/);
     assert.doesNotMatch(officeHtml, /id="amount-usd"/);
@@ -877,7 +879,7 @@ describe("wiring", () => {
     assert.match(docker, /\bopen-pay\.js\b/);
     const src = fs.readFileSync(new URL("../server.js", import.meta.url), "utf8");
     assert.match(src, /from "\.\/open-pay\.js"/);
-    assert.match(src, /build: "2026-09-09-open-staff"/);
+    assert.match(src, /build: "2026-09-10-customer-name"/);
     assert.match(src, /isOpenPayPath\(url\.pathname\)/);
     assert.match(src, /isOfficePayPath\(url\.pathname\)/);
     assert.match(src, /openPayRequestAllowed\(req\.headers\)/);

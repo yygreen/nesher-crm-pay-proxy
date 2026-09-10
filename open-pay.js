@@ -1,10 +1,10 @@
 /**
  * Nesher open-amount card pages.
  * External (the link they send): https://www.flynesher.com/pay/open
- *   Name, then Card (amount, AVS, Collect.js). POST /pay/open/charge
+ *   Customer name, then Card (amount, AVS, Collect.js). POST /pay/open/charge
  *   ignores staffName / processor / notes even if posted.
  * Internal (office fills): https://www.flynesher.com/pay/office
- *   Office (Taken by roster select, Name, More info) then Card.
+ *   Office (Taken by roster select, Customer name, More info) then Card.
  *   POST /pay/office/charge accepts staffName only when it is exactly
  *   one of OPEN_PAY_STAFF; otherwise omit field_5 (still charge).
  * Empty omitted. Address is AVS, never a descriptor. Never Guest.
@@ -526,7 +526,7 @@ function renderPaySheet(data = {}, opts = {}) {
         ${staffSelectHtml()}
       </div>
       <div class="meta-field">
-        <p class="label">Name</p>
+        <p class="label">Customer name</p>
         <input id="customer-name" type="text" maxlength="80" autocomplete="name" />
       </div>
       <div class="meta-field">
@@ -535,7 +535,7 @@ function renderPaySheet(data = {}, opts = {}) {
       </div>
     </div>`
     : `<div class="meta-field" id="guest-name">
-      <p class="label">Name</p>
+      <p class="label">Customer name</p>
       <input id="customer-name" type="text" maxlength="80" autocomplete="name" />
     </div>`;
 
