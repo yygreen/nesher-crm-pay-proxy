@@ -367,15 +367,16 @@ describe("injectPayButtons", () => {
     assert.doesNotMatch(out, /square\.link|squareup\.com|checkout\.stripe/);
   });
 
-  it("staff modal names the brand website and tells staff JRM card uses Nesher for now (Joseph 2026-09-08)", () => {
+  it("staff modal names the brand website and JRM statement JRM HOTELS", () => {
     const html = `<html><body><a href="/jrm/hotels/1/">x</a></body></html>`;
     const out = injectPayButtons(html, "/jrm/hotels/");
     assert.match(out, /nesher-brand-line/);
     assert.match(out, /guest link on jrmhotels\.com/);
     assert.match(out, /guest link on flynesher\.com/);
-    assert.match(out, /Card works on Nesher for now/);
-    assert.match(out, /Statement shows FLYNESHER\.COM/);
-    assert.match(out, /tell the guest/);
+    assert.match(out, /Statement shows JRM HOTELS/);
+    assert.doesNotMatch(out, /FLYNESHER\.COM/);
+    assert.doesNotMatch(out, /Card works on Nesher for now/);
+    assert.doesNotMatch(out, /tell the guest/);
     assert.doesNotMatch(out, /second DBA/);
     assert.doesNotMatch(out, /Card waits on a Pinpoint/);
   });

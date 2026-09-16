@@ -7,6 +7,9 @@ import {
   brandFromKind,
   brandFromRecord,
   descriptorFor,
+  processorIdFor,
+  NESHER_PROCESSOR_ID,
+  JRM_PROCESSOR_ID,
   guestPayOrigin,
   paymentDescriptorPayload,
   isAllowedCardUrl,
@@ -72,25 +75,33 @@ describe("brand + descriptor mapping", () => {
     assert.equal(guestPayOrigin(brandFromKind("customer", "CUST-12")), "https://www.flynesher.com");
   });
 
-  it("JRM falls back to Nesher FLYNESHER.COM until a JRM MID env is set (Joseph 2026-09-08)", () => {
+  it("JRM copy is JRM HOTELS; Nesher stays FLYNESHER.COM; route by processor_id", () => {
     const prev = process.env.NMI_JRM_DESCRIPTOR;
+    const prevProc = process.env.NMI_JRM_PROCESSOR_ID;
     delete process.env.NMI_JRM_DESCRIPTOR;
+    delete process.env.NMI_JRM_PROCESSOR_ID;
     try {
       assert.equal(
         descriptorFor(brandFromInvoiceNumber("JRM-1")),
-        "FLYNESHER.COM"
+        "JRM HOTELS"
       );
       assert.equal(
         descriptorFor(brandFromInvoiceNumber("RES-1")),
         "FLYNESHER.COM"
       );
-      assert.notEqual(
+      assert.equal(
         descriptorFor(brandFromInvoiceNumber("JRM-1")),
         BRANDS.jrm.defaultDescriptor
       );
+      assert.equal(processorIdFor(BRANDS.jrm), JRM_PROCESSOR_ID);
+      assert.equal(processorIdFor(BRANDS.nesher), NESHER_PROCESSOR_ID);
+      assert.equal(JRM_PROCESSOR_ID, "mav2083");
+      assert.equal(NESHER_PROCESSOR_ID, "mav7067");
     } finally {
       if (prev !== undefined) process.env.NMI_JRM_DESCRIPTOR = prev;
       else delete process.env.NMI_JRM_DESCRIPTOR;
+      if (prevProc !== undefined) process.env.NMI_JRM_PROCESSOR_ID = prevProc;
+      else delete process.env.NMI_JRM_PROCESSOR_ID;
     }
   });
 
@@ -113,20 +124,21 @@ describe("brand + descriptor mapping", () => {
     );
   });
 
-  it("v5 sale never sends payment_descriptor; processor uses boarded DBA", () => {
+  it("v5 sale never sends payment_descriptor; JRM routes processor_id mav2083", () => {
     const src = fs.readFileSync(new URL("../nmi-card.js", import.meta.url), "utf8");
     assert.doesNotMatch(src, /body\.payment_descriptor/);
     assert.doesNotMatch(src, /payment_descriptor\s*=/);
+    assert.match(src, /body\.processor_id = processorId/);
     assert.equal(paymentDescriptorPayload(BRANDS.nesher), null);
     assert.equal(paymentDescriptorPayload(BRANDS.jrm), null);
     assert.equal(descriptorFor(BRANDS.nesher), "FLYNESHER.COM");
     const prev = process.env.NMI_JRM_DESCRIPTOR;
     delete process.env.NMI_JRM_DESCRIPTOR;
     try {
-      assert.equal(descriptorFor(BRANDS.jrm), "FLYNESHER.COM");
-      assert.notEqual(descriptorFor(BRANDS.jrm), BRANDS.jrm.defaultDescriptor);
+      assert.equal(descriptorFor(BRANDS.jrm), "JRM HOTELS");
       process.env.NMI_JRM_DESCRIPTOR = "JRM HOTELS";
       assert.equal(paymentDescriptorPayload(BRANDS.jrm), null);
+      assert.equal(processorIdFor(BRANDS.jrm), "mav2083");
     } finally {
       if (prev !== undefined) process.env.NMI_JRM_DESCRIPTOR = prev;
       else delete process.env.NMI_JRM_DESCRIPTOR;
@@ -216,7 +228,7 @@ describe("mintCardCheckout", () => {
     assert.equal(out.sku, "NESHER-PAY");
   });
 
-  it("mints JRM-189 Collect.js on Nesher FLYNESHER.COM (Joseph 2026-09-08)", async () => {
+  it("mints JRM-189 Collect.js with JRM HOTELS copy and mav2083 (not a v5 descriptor)", async () => {
     process.env.NMI_PRIVATE_KEY = "test-private-key";
     let called = 0;
     const fetchImpl = async () => {
@@ -239,7 +251,8 @@ describe("mintCardCheckout", () => {
     });
     assert.equal(out.ok, true);
     assert.equal(out.capture, "collectjs");
-    assert.equal(out.descriptor, "FLYNESHER.COM");
+    assert.equal(out.descriptor, "JRM HOTELS");
+    assert.equal(out.processorId, "mav2083");
     assert.equal(out.cardUrl, null);
     assert.equal(out.brand.id, "jrm");
     assert.equal(out.invoicesProvisioned, false);
@@ -259,8 +272,13 @@ describe("mintCardCheckout", () => {
     assert.equal(offer.ok, true);
     assert.equal(offer.brand.id, "jrm");
     assert.equal(offer.capture, "collectjs");
-    assert.equal(offer.descriptor, "FLYNESHER.COM");
+    assert.equal(offer.descriptor, "JRM HOTELS");
+    assert.equal(offer.processorId, "mav2083");
     assert.equal(staffCardFields(offer).cardBlockedReason, null);
+    assert.equal(
+      guestPayOrigin(out.brand),
+      "https://www.jrmhotels.com"
+    );
   });
 
   it("mints JRM once a second descriptor is configured", async () => {
@@ -421,13 +439,14 @@ describe("chargeWithToken", () => {
     assert.equal(body.merchant_defined_fields.field_4, "Ada Lovelace");
     assert.notEqual(body.merchant_defined_fields.field_1, "RES-9FSGMN");
     assert.notEqual(body.merchant_defined_fields.field_3, "FLYNESHER.COM");
+    assert.equal(body.processor_id, "mav7067");
     assert.equal(body.payment_descriptor, undefined);
     assert.equal(Object.prototype.hasOwnProperty.call(body, "payment_descriptor"), false);
     assert.doesNotMatch(captured.init.body, /payment_descriptor/);
     assert.doesNotMatch(captured.init.body, /"descriptor"/);
   });
 
-  it("charges JRM-189 Collect.js under FLYNESHER.COM (Joseph 2026-09-08)", async () => {
+  it("charges JRM-189 Collect.js with processor_id mav2083 and no payment_descriptor", async () => {
     process.env.NMI_PRIVATE_KEY = "test-private-key";
     let captured;
     const fetchImpl = async (url, init) => {
@@ -448,7 +467,8 @@ describe("chargeWithToken", () => {
       fetchImpl,
     });
     assert.equal(out.ok, true);
-    assert.equal(out.descriptor, "FLYNESHER.COM");
+    assert.equal(out.descriptor, "JRM HOTELS");
+    assert.equal(out.processorId, "mav2083");
     assert.equal(out.brand.id, "jrm");
     assert.equal(out.transactionId, "txn_jrm189");
     const body = JSON.parse(captured.init.body);
@@ -459,11 +479,39 @@ describe("chargeWithToken", () => {
     assert.equal(body.merchant_defined_fields.field_5, undefined);
     assert.equal(body.billing_address, undefined);
     assert.equal(body.payment_details.payment_token, "tok_collect");
+    assert.equal(body.processor_id, "mav2083");
+    assert.notEqual(body.processor_id, "mav7067");
     assert.equal(body.payment_descriptor, undefined);
     assert.equal(Object.prototype.hasOwnProperty.call(body, "payment_descriptor"), false);
     assert.doesNotMatch(captured.init.body, /payment_descriptor/);
     assert.doesNotMatch(captured.init.body, /JRM HOTELS/);
+    assert.doesNotMatch(captured.init.body, /FLYNESHER/);
     assert.doesNotMatch(captured.init.body, /Guest/);
+  });
+
+  it("JRM sale fails closed if processor_id would be the Nesher processor", async () => {
+    process.env.NMI_PRIVATE_KEY = "test-private-key";
+    const prevProc = process.env.NMI_JRM_PROCESSOR_ID;
+    process.env.NMI_JRM_PROCESSOR_ID = "mav7067";
+    let called = 0;
+    try {
+      const out = await chargeWithToken({
+        amountUsd: 189,
+        invoiceNumber: "JRM-189-O50",
+        kind: "hotel",
+        paymentToken: "tok_collect",
+        fetchImpl: async () => {
+          called += 1;
+          throw new Error("no fetch");
+        },
+      });
+      assert.equal(out.ok, false);
+      assert.equal(out.error, "processor_id_required");
+      assert.equal(called, 0);
+    } finally {
+      if (prevProc !== undefined) process.env.NMI_JRM_PROCESSOR_ID = prevProc;
+      else delete process.env.NMI_JRM_PROCESSOR_ID;
+    }
   });
 
   it("maps customer and processor names to field_4 and field_5, never descriptor", async () => {
@@ -1288,7 +1336,7 @@ describe("chargePayCode", () => {
     assert.doesNotMatch(out.message, /\{/);
   });
 
-  it("guest JRM-189 chargePayCode uses FLYNESHER.COM without NMI_JRM_DESCRIPTOR (Joseph 2026-09-08)", async () => {
+  it("guest JRM-189 chargePayCode sends processor_id mav2083 and no payment_descriptor", async () => {
     const prev = process.env.NMI_JRM_DESCRIPTOR;
     delete process.env.NMI_JRM_DESCRIPTOR;
     try {
@@ -1315,6 +1363,8 @@ describe("chargePayCode", () => {
       });
       assert.equal(out.ok, true);
       assert.equal(hotels.length, 1);
+      assert.equal(sale.lastBody().processor_id, "mav2083");
+      assert.equal(sale.lastBody().merchant_defined_fields.field_1, "jrm");
       assert.equal(sale.lastBody().payment_descriptor, undefined);
       assert.equal(
         Object.prototype.hasOwnProperty.call(sale.lastBody(), "payment_descriptor"),
@@ -1322,6 +1372,7 @@ describe("chargePayCode", () => {
       );
       assert.doesNotMatch(JSON.stringify(sale.lastBody()), /payment_descriptor/);
       assert.doesNotMatch(JSON.stringify(sale.lastBody()), /JRM HOTELS/);
+      assert.doesNotMatch(JSON.stringify(sale.lastBody()), /FLYNESHER/);
     } finally {
       if (prev !== undefined) process.env.NMI_JRM_DESCRIPTOR = prev;
       else delete process.env.NMI_JRM_DESCRIPTOR;
@@ -1432,7 +1483,7 @@ describe("chargePayCode", () => {
   it("mint JSON and guest charge live on the brand website origin", () => {
     const src = fs.readFileSync(new URL("../server.js", import.meta.url), "utf8");
     assert.match(src, /guestPayOrigin\(/);
-    assert.match(src, /build: "2026-09-10-office-crm"/);
+    assert.match(src, /build: "2026-09-16-jrm-card"/);
     assert.doesNotMatch(
       src.slice(src.indexOf("const stored = await storeInvoice"), src.indexOf("const shareUrl")),
       /publicHostFor\(req\)/
@@ -1499,9 +1550,9 @@ describe("agent paste leftover", () => {
     assert.match(text, /JRM-189-O50/);
     assert.match(text, /https:\/\/www\.jrmhotels\.com\/pay\/abc12xyz/);
     assert.match(text, /Card processed by Air Today Travel Inc/);
-    assert.match(text, /Statement shows FLYNESHER\.COM/);
+    assert.match(text, /Statement shows JRM HOTELS/);
     assert.match(text, /Bank: Air Today Travel \(Mercury \/ Bank Hapoalim\)/);
-    assert.doesNotMatch(text, /JRM HOTELS/);
+    assert.doesNotMatch(text, /FLYNESHER\.COM/);
     assert.doesNotMatch(text, /Pinpoint|NMI/);
     assert.doesNotMatch(text, /square|stripe/i);
   });
@@ -1527,7 +1578,7 @@ describe("processed-by copy", () => {
     );
   });
 
-  it("JRM staff paste names FLYNESHER.COM until a JRM MID exists (Joseph 2026-09-08)", () => {
+  it("JRM staff paste names JRM HOTELS, never FLYNESHER.COM", () => {
     const prev = process.env.NMI_JRM_DESCRIPTOR;
     delete process.env.NMI_JRM_DESCRIPTOR;
     try {
@@ -1536,14 +1587,15 @@ describe("processed-by copy", () => {
         hasCard: true,
       });
       assert.equal(f.showCard, true);
-      assert.equal(f.descriptor, "FLYNESHER.COM");
+      assert.equal(f.descriptor, "JRM HOTELS");
+      assert.equal(f.dba, "JRM Hotels");
       const line = processedByPasteLine({
         brand: brandFromInvoiceNumber("JRM-1"),
         hasCard: true,
       });
       assert.match(line, /Card processed by Air Today Travel Inc/);
-      assert.match(line, /Statement shows FLYNESHER\.COM/);
-      assert.doesNotMatch(line, /JRM HOTELS/);
+      assert.match(line, /Statement shows JRM HOTELS/);
+      assert.doesNotMatch(line, /FLYNESHER\.COM/);
     } finally {
       if (prev !== undefined) process.env.NMI_JRM_DESCRIPTOR = prev;
       else delete process.env.NMI_JRM_DESCRIPTOR;

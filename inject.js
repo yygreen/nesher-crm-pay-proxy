@@ -901,7 +901,7 @@ const SCRIPT = `
   function brandLineHtml(data) {
     var jrm = isJrmRecord(data);
     if (jrm) {
-      return '<div class="nesher-brand-line jrm" id="nesher-brand-line"><b>JRM Hotels</b> · guest link on jrmhotels.com. Card works on Nesher for now. Statement shows FLYNESHER.COM — tell the guest.</div>';
+      return '<div class="nesher-brand-line jrm" id="nesher-brand-line"><b>JRM Hotels</b> · guest link on jrmhotels.com. Statement shows JRM HOTELS.</div>';
     }
     return '<div class="nesher-brand-line" id="nesher-brand-line"><b>Nesher</b> · guest link on flynesher.com. Card (Pinpoint) + bank.</div>';
   }

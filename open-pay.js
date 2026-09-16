@@ -1,9 +1,13 @@
 /**
- * Nesher open-amount card pages.
- * External (the link they send): https://www.flynesher.com/pay/open
+ * Open-amount card pages.
+ * Nesher guest: https://www.flynesher.com/pay/open
  *   Customer name, then Card (amount, AVS, Collect.js). POST /pay/open/charge
  *   ignores staffName / processor / notes / crmRef even if posted. Ignores ?ref=.
- * Internal (office fills): https://www.flynesher.com/pay/office
+ * JRM guest: https://www.jrmhotels.com/pay/open (rewrite Host is crm;
+ *   brand from X-Forwarded-Host). Same UX, JRM logo, processor_id mav2083,
+ *   field_1=jrm. Never FLYNESHER.COM. Never serve JRM on flynesher.com or
+ *   Nesher on jrmhotels.com. crm.flynesher.com alone is 404.
+ * Internal (office fills): https://www.flynesher.com/pay/office — Nesher only.
  *   Office (optional CRM reference, Taken by roster select, Customer name,
  *   More info) then Address then Card. ?ref= prefills + loads. Empty CRM ref
  *   still charges as OPEN- (Pinpoint only, no CRM write).
@@ -49,6 +53,7 @@ export const OPEN_PAY_MAX_USD = 25000;
 export const NESHER_LOGO_URL = "https://assets.flynesher.com/nesher-logo.jpg";
 const NESHER_LOGO_FALLBACK =
   "https://www.flynesher.com/static/core/images/nesher_logo.png";
+export const JRM_LOGO_URL = "https://jrmhotels.com/images/logos/jrm-logo.png";
 
 /** Hardcoded desk roster. Exact strings only. No CRM fetch. */
 export const OPEN_PAY_STAFF = [
@@ -117,13 +122,17 @@ export function isOfficePayLookupPath(pathname) {
 export const OFFICE_CRM_MISS = "We could not find that CRM reference.";
 
 /**
- * Guest open-amount is Nesher-origin only.
- * Allowlist: flynesher.com and www.flynesher.com.
- * crm.flynesher.com is the live JRM /pay/:code rewrite destination
- * (Host becomes crm; the browser URL stays jrmhotels.com) — never serve
- * Collect.js / FLYNESHER.COM there. Empty or unknown Host is 404.
+ * Guest open-amount brands from Host + X-Forwarded-Host + Forwarded.
+ * Nesher: flynesher.com / www.flynesher.com (Host must be Nesher).
+ * JRM: jrmhotels.com / www.jrmhotels.com, or crm.flynesher.com Host with
+ * a JRM forwarded host (the jrmhotels.com /pay rewrite).
+ * crm.flynesher.com alone is the staff host — 404. Mixed brands 404.
+ * Office stays Nesher-origin only.
  */
-const OPEN_PAY_ALLOWED_HOSTS = new Set(["flynesher.com", "www.flynesher.com"]);
+const NESHER_OPEN_HOSTS = new Set(["flynesher.com", "www.flynesher.com"]);
+const JRM_OPEN_HOSTS = new Set(["jrmhotels.com", "www.jrmhotels.com"]);
+const CRM_REWRITE_HOST = "crm.flynesher.com";
+const OPEN_PAY_ALLOWED_HOSTS = NESHER_OPEN_HOSTS;
 
 export function normalizeOpenPayHost(value) {
   let h = String(value || "")
@@ -142,7 +151,12 @@ export function normalizeOpenPayHost(value) {
 
 export function openPayHostAllowed(host) {
   const h = normalizeOpenPayHost(host);
-  return Boolean(h) && OPEN_PAY_ALLOWED_HOSTS.has(h);
+  return Boolean(h) && NESHER_OPEN_HOSTS.has(h);
+}
+
+export function jrmOpenPayHostAllowed(host) {
+  const h = normalizeOpenPayHost(host);
+  return Boolean(h) && JRM_OPEN_HOSTS.has(h);
 }
 
 function forwardedHosts(raw) {
@@ -166,26 +180,60 @@ function headerValue(headers, name) {
   return "";
 }
 
-/** Host, X-Forwarded-Host, and Forwarded must each be Nesher or absent. */
-export function openPayRequestAllowed(headers = {}) {
-  if (!openPayHostAllowed(headerValue(headers, "host"))) return false;
+function requestHostList(headers = {}) {
+  const out = [];
+  const host = headerValue(headers, "host");
+  if (host) out.push(host);
   const xfh = headerValue(headers, "x-forwarded-host").trim();
   if (xfh) {
     for (const part of xfh.split(",")) {
-      if (!openPayHostAllowed(part)) return false;
+      if (part.trim()) out.push(part);
     }
   }
   const fwd = headerValue(headers, "forwarded").trim();
   if (fwd) {
     for (const h of forwardedHosts(fwd)) {
-      if (!openPayHostAllowed(h)) return false;
+      if (h) out.push(h);
     }
   }
-  return true;
+  return out.map(normalizeOpenPayHost).filter(Boolean);
+}
+
+/**
+ * nesher | jrm | null. Host is the hop; forwarded hosts are the browser URL.
+ * crm.flynesher.com is only a rewrite hop for JRM, never a guest brand.
+ */
+export function resolveOpenPayBrand(headers = {}) {
+  const host = normalizeOpenPayHost(headerValue(headers, "host"));
+  if (!host) return null;
+  const all = requestHostList(headers);
+  let hasNesher = false;
+  let hasJrm = false;
+  for (const h of all) {
+    if (NESHER_OPEN_HOSTS.has(h)) hasNesher = true;
+    else if (JRM_OPEN_HOSTS.has(h)) hasJrm = true;
+    else if (h !== CRM_REWRITE_HOST) return null;
+  }
+  if (hasNesher && hasJrm) return null;
+  if (hasJrm) {
+    if (JRM_OPEN_HOSTS.has(host) || host === CRM_REWRITE_HOST) return "jrm";
+    return null;
+  }
+  if (hasNesher) {
+    if (NESHER_OPEN_HOSTS.has(host)) return "nesher";
+    return null;
+  }
+  return null;
+}
+
+/** Nesher-origin only (office + legacy). JRM guest uses resolveOpenPayBrand. */
+export function openPayRequestAllowed(headers = {}) {
+  return resolveOpenPayBrand(headers) === "nesher";
 }
 
 export function decideOpenPayPage(headers, data = {}) {
-  if (!openPayRequestAllowed(headers)) {
+  const brandId = resolveOpenPayBrand(headers);
+  if (!brandId) {
     return {
       status: 404,
       html: renderOpenPayErrorHtml("This payment page is not available here."),
@@ -193,7 +241,7 @@ export function decideOpenPayPage(headers, data = {}) {
   }
   return {
     status: 200,
-    html: renderOpenPayHtml(data),
+    html: renderOpenPayHtml({ ...data, brandId }),
   };
 }
 
@@ -284,11 +332,11 @@ function httpStatusFor(error) {
  */
 export async function chargeOpenPay(opts = {}) {
   const kind = String(opts.kind || "open").toLowerCase();
-  const brandId = String(opts.brandId || "").toLowerCase();
-  if (brandId === "jrm" || kind === "hotel" || kind === "hotel-offer") {
+  if (kind === "hotel" || kind === "hotel-offer") {
     const message = guestCardMessage({ error: "keys_missing" });
     return { ok: false, error: "jrm_not_supported", message, httpStatus: 403 };
   }
+  const brandId = String(opts.brandId || "").toLowerCase() === "jrm" ? "jrm" : "nesher";
   const parsed = parseOpenAmountUsd(opts.amountUsd);
   if (!parsed.ok) {
     const message = guestCardMessage({ error: parsed.error });
@@ -344,6 +392,7 @@ export async function chargeOpenPay(opts = {}) {
     amountUsd: parsed.amountUsd,
     invoiceNumber,
     kind: "open",
+    brandId,
     ...(customerName ? { customerName } : {}),
     ...(staffName ? { staffName } : {}),
     ...(notes ? { notes } : {}),
@@ -910,13 +959,42 @@ function officeCrmRefScript() {
 
 function renderPaySheet(data = {}, opts = {}) {
   const office = opts.office === true;
+  const isJrm = !office && String(data.brandId || opts.brandId || "").toLowerCase() === "jrm";
   const collectKey = String(data.collectPublicKey || "").trim();
   const collectOn = Boolean(collectKey);
   const card = collectOn
     ? renderCollectJsForm(collectKey, { office })
     : `<p class="hint">Card pay is not available right now.</p>`;
-  const logo = esc(NESHER_LOGO_URL);
-  const logoFallback = esc(NESHER_LOGO_FALLBACK);
+  const logo = esc(isJrm ? JRM_LOGO_URL : NESHER_LOGO_URL);
+  const logoAlt = isJrm ? "JRM Hotels" : "Nesher Travel";
+  const logoFallback = isJrm ? "" : esc(NESHER_LOGO_FALLBACK);
+  const logoOnError = isJrm
+    ? ""
+    : ` data-fallback="${logoFallback}" onerror="this.onerror=null;this.src=this.getAttribute('data-fallback')"`;
+  const title = isJrm ? "Pay JRM Hotels" : "Pay Nesher";
+  const foot = isJrm ? "JRM Hotels" : "Nesher Travel";
+  const brandClass = isJrm ? "pay-brand-jrm" : "pay-brand-nesher";
+  const jrmCss = isJrm
+    ? `
+    body.pay-brand-jrm { background: #FAF6EC; }
+    body.pay-brand-jrm .logo img {
+      filter: brightness(0) sepia(1) hue-rotate(0deg) saturate(0.5);
+    }
+    body.pay-brand-jrm .btn-primary { background: #5C4528; }
+    body.pay-brand-jrm .btn-primary:hover { background: #3D3229; }
+    body.pay-brand-jrm .card-field:focus-within {
+      border-color: #5C4528;
+      box-shadow: 0 0 0 3px rgba(92,69,40,.18);
+    }
+    body.pay-brand-jrm .meta-field input:focus, body.pay-brand-jrm .meta-field textarea:focus, body.pay-brand-jrm .meta-field select:focus {
+      border-color: #5C4528;
+      box-shadow: 0 0 0 3px rgba(92,69,40,.18);
+    }
+    body.pay-brand-jrm #amount-usd:focus {
+      border-color: #5C4528;
+      box-shadow: 0 0 0 3px rgba(92,69,40,.18);
+    }`
+    : "";
   const crmRefValue = office ? esc(data.crmRef || "") : "";
   const top = office
     ? `<div class="group" id="office-group">
@@ -953,7 +1031,7 @@ function renderPaySheet(data = {}, opts = {}) {
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="robots" content="noindex,nofollow" />
-  <title>Pay Nesher</title>
+  <title>${title}</title>
   <style>
     * { box-sizing: border-box; }
     body {
@@ -1066,11 +1144,12 @@ function renderPaySheet(data = {}, opts = {}) {
     .foot {
       margin-top: 28px; font-size: 12px; color: #aaa; text-align: center;
     }
+    ${jrmCss}
   </style>
 </head>
-<body class="pay-brand-nesher">
+<body class="${brandClass}">
   <div class="sheet">
-    <p class="logo"><img src="${logo}" alt="Nesher Travel" height="40" data-fallback="${logoFallback}" onerror="this.onerror=null;this.src=this.getAttribute('data-fallback')"></p>
+    <p class="logo"><img src="${logo}" alt="${logoAlt}" height="40"${logoOnError}></p>
     ${top}
     <div class="group" id="address-group">
       <h2 class="group-title">Address</h2>
@@ -1117,7 +1196,7 @@ function renderPaySheet(data = {}, opts = {}) {
       </div>
       ${card}
     </div>
-    <p class="foot">Nesher Travel</p>
+    <p class="foot">${foot}</p>
   </div>
   ${office ? officeCrmRefScript() : ""}
 </body>

@@ -6,6 +6,7 @@ import {
   OPEN_PAY_MIN_USD,
   OPEN_PAY_STAFF,
   NESHER_LOGO_URL,
+  JRM_LOGO_URL,
   isOpenPayPath,
   isOpenPayChargePath,
   isOfficePayPath,
@@ -15,7 +16,9 @@ import {
   classifyOfficeRef,
   OFFICE_CRM_MISS,
   openPayHostAllowed,
+  jrmOpenPayHostAllowed,
   openPayRequestAllowed,
+  resolveOpenPayBrand,
   decideOpenPayPage,
   decideOfficePayPage,
   parseOpenAmountUsd,
@@ -88,7 +91,7 @@ describe("open-pay paths", () => {
     assert.equal(rosterStaffName(""), "");
   });
 
-  it("allowlists only flynesher.com and www.flynesher.com", () => {
+  it("allowlists Nesher hosts for Nesher; JRM hosts are a separate brand", () => {
     assert.equal(openPayHostAllowed("www.flynesher.com"), true);
     assert.equal(openPayHostAllowed("flynesher.com"), true);
     assert.equal(openPayHostAllowed("www.flynesher.com:443"), true);
@@ -98,9 +101,14 @@ describe("open-pay paths", () => {
     assert.equal(openPayHostAllowed(""), false);
     assert.equal(openPayHostAllowed(undefined), false);
     assert.equal(openPayHostAllowed("nesher-crm-pay-proxy.up.railway.app"), false);
+    assert.equal(jrmOpenPayHostAllowed("www.jrmhotels.com"), true);
+    assert.equal(jrmOpenPayHostAllowed("jrmhotels.com"), true);
+    assert.equal(jrmOpenPayHostAllowed("www.jrmhotels.com:443"), true);
+    assert.equal(jrmOpenPayHostAllowed("www.flynesher.com"), false);
+    assert.equal(jrmOpenPayHostAllowed("crm.flynesher.com"), false);
   });
 
-  it("refuses crm, JRM, empty Host, and forwarded JRM hosts", () => {
+  it("refuses crm, empty Host, mixed brands; JRM rewrite hop is JRM guest only", () => {
     assert.equal(openPayRequestAllowed({ host: "www.flynesher.com" }), true);
     assert.equal(openPayRequestAllowed({ host: "flynesher.com" }), true);
     assert.equal(openPayRequestAllowed({ host: "crm.flynesher.com" }), false);
@@ -108,6 +116,17 @@ describe("open-pay paths", () => {
     assert.equal(openPayRequestAllowed({ host: "jrmhotels.com" }), false);
     assert.equal(openPayRequestAllowed({}), false);
     assert.equal(openPayRequestAllowed({ host: "" }), false);
+    assert.equal(resolveOpenPayBrand({ host: "www.flynesher.com" }), "nesher");
+    assert.equal(resolveOpenPayBrand({ host: "www.jrmhotels.com" }), "jrm");
+    assert.equal(resolveOpenPayBrand({ host: "jrmhotels.com" }), "jrm");
+    assert.equal(
+      resolveOpenPayBrand({
+        host: "crm.flynesher.com",
+        "x-forwarded-host": "www.jrmhotels.com",
+      }),
+      "jrm"
+    );
+    assert.equal(resolveOpenPayBrand({ host: "crm.flynesher.com" }), null);
     assert.equal(
       openPayRequestAllowed({
         host: "crm.flynesher.com",
@@ -121,6 +140,13 @@ describe("open-pay paths", () => {
         "x-forwarded-host": "www.jrmhotels.com",
       }),
       false
+    );
+    assert.equal(
+      resolveOpenPayBrand({
+        host: "www.flynesher.com",
+        "x-forwarded-host": "www.jrmhotels.com",
+      }),
+      null
     );
     assert.equal(
       openPayRequestAllowed({
@@ -138,7 +164,7 @@ describe("open-pay paths", () => {
     );
   });
 
-  it("jrmhotels.com, crm.flynesher.com, and empty Host never paint Collect.js", () => {
+  it("crm.flynesher.com and empty Host never paint Collect.js; JRM hosts paint JRM", () => {
     const collect = { collectPublicKey: "pk_test_collect" };
     function assertClosed(headers) {
       const page = decideOpenPayPage(headers, collect);
@@ -148,13 +174,7 @@ describe("open-pay paths", () => {
       assert.doesNotMatch(page.html, /Pay with card/);
       assert.doesNotMatch(page.html, /data-tokenization-key/);
     }
-    assertClosed({ host: "www.jrmhotels.com" });
-    assertClosed({ host: "jrmhotels.com" });
     assertClosed({ host: "crm.flynesher.com" });
-    assertClosed({
-      host: "crm.flynesher.com",
-      "x-forwarded-host": "www.jrmhotels.com",
-    });
     assertClosed({});
     assertClosed({ host: "" });
     function assertOfficeClosed(headers) {
@@ -167,6 +187,10 @@ describe("open-pay paths", () => {
     assertOfficeClosed({ host: "www.jrmhotels.com" });
     assertOfficeClosed({ host: "jrmhotels.com" });
     assertOfficeClosed({ host: "crm.flynesher.com" });
+    assertOfficeClosed({
+      host: "crm.flynesher.com",
+      "x-forwarded-host": "www.jrmhotels.com",
+    });
     assertOfficeClosed({});
     assertOfficeClosed({ host: "" });
     const ok = decideOpenPayPage({ host: "www.flynesher.com" }, collect);
@@ -174,8 +198,29 @@ describe("open-pay paths", () => {
     assert.match(ok.html, /Collect\.js/);
     assert.match(ok.html, /id="amount-usd"/);
     assert.match(ok.html, /Pay with card/);
+    assert.match(ok.html, /alt="Nesher Travel"/);
     assert.doesNotMatch(ok.html, /Taken by/);
     assert.doesNotMatch(ok.html, /Processor/);
+    assert.doesNotMatch(ok.html, /jrm-logo/);
+    assert.doesNotMatch(ok.html, /JRM Hotels/);
+    const jrm = decideOpenPayPage({ host: "www.jrmhotels.com" }, collect);
+    assert.equal(jrm.status, 200);
+    assert.match(jrm.html, /Collect\.js/);
+    assert.match(jrm.html, /alt="JRM Hotels"/);
+    assert.match(jrm.html, /jrm-logo\.png/);
+    assert.doesNotMatch(jrm.html, /FLYNESHER\.COM/);
+    assert.doesNotMatch(jrm.html, /Taken by/);
+    const rewrite = decideOpenPayPage(
+      {
+        host: "crm.flynesher.com",
+        "x-forwarded-host": "www.jrmhotels.com",
+      },
+      collect
+    );
+    assert.equal(rewrite.status, 200);
+    assert.match(rewrite.html, /Collect\.js/);
+    assert.match(rewrite.html, /alt="JRM Hotels"/);
+    assert.doesNotMatch(rewrite.html, /FLYNESHER\.COM/);
     const officeOk = decideOfficePayPage({ host: "www.flynesher.com" }, collect);
     assert.equal(officeOk.status, 200);
     assert.match(officeOk.html, /Collect\.js/);
@@ -387,6 +432,34 @@ describe("renderOpenPayHtml", () => {
     assert.match(err, /nope/);
     assert.doesNotMatch(err, /Card processed by/);
   });
+
+  it("JRM twin has JRM logo, Collect.js, Customer name, Address, no FLYNESHER sermon", () => {
+    const html = renderOpenPayHtml({
+      collectPublicKey: "pk_test_collect",
+      brandId: "jrm",
+    });
+    assert.match(html, /<title>Pay JRM Hotels<\/title>/);
+    assert.equal(html.includes(JRM_LOGO_URL), true);
+    assert.match(html, /src="https:\/\/jrmhotels\.com\/images\/logos\/jrm-logo\.png"/);
+    assert.match(html, /alt="JRM Hotels"/);
+    assert.match(html, /pay-brand-jrm/);
+    assert.match(html, /filter: brightness\(0\) sepia\(1\)/);
+    assert.match(html, />Customer name</);
+    assert.match(html, /Used to match the card\./);
+    assert.match(html, /id="card-group"/);
+    assert.match(html, /token\/Collect\.js/);
+    assert.match(html, /Pay with card/);
+    assert.match(html, /fetch\("\/pay\/open\/charge"/);
+    assert.doesNotMatch(html, /FLYNESHER\.COM/);
+    assert.doesNotMatch(html, /Nesher Travel/);
+    assert.doesNotMatch(html, /Card processed by/);
+    assert.doesNotMatch(html, /Air Today Travel/);
+    assert.doesNotMatch(html, /Stripe/i);
+    assert.doesNotMatch(html, /Taken by/);
+    assert.doesNotMatch(html, /NESHER-PAY|JRM-PAY/);
+    assert.doesNotMatch(html, /customPayment/);
+    assert.doesNotMatch(html, /<input[^>]*(ccnumber|ccexp|cvv|pan)/i);
+  });
 });
 
 describe("renderOfficePayHtml", () => {
@@ -546,6 +619,7 @@ describe("chargeOpenPay", () => {
     assert.equal(sale.lastBody().payment_details.payment_token, "tok_collect");
     assert.equal(sale.lastBody().order_details.id, "OPEN-20260908-test01");
     assert.equal(sale.lastBody().merchant_defined_fields.field_1, "nesher");
+    assert.equal(sale.lastBody().processor_id, "mav7067");
     assert.equal(sale.lastBody().merchant_defined_fields.field_4, undefined);
     assert.equal(sale.lastBody().merchant_defined_fields.field_5, undefined);
     assert.equal(sale.lastBody().merchant_defined_fields.field_6, undefined);
@@ -783,12 +857,12 @@ describe("chargeOpenPay", () => {
     assert.equal(called, 0);
   });
 
-  it("rejects JRM brand and never charges", async () => {
+  it("rejects hotel kind and never charges", async () => {
     let called = 0;
     const out = await chargeOpenPay({
       amountUsd: 10,
       paymentToken: "tok_collect",
-      brandId: "jrm",
+      kind: "hotel",
       fetchImpl: async () => {
         called += 1;
         throw new Error("no fetch");
@@ -798,6 +872,36 @@ describe("chargeOpenPay", () => {
     assert.equal(out.error, "jrm_not_supported");
     assert.equal(out.httpStatus, 403);
     assert.equal(called, 0);
+  });
+
+  it("JRM open charge sends processor_id mav2083, field_1=jrm, no payment_descriptor", async () => {
+    const sale = saleFetch();
+    const out = await chargeOpenPay({
+      amountUsd: 55.55,
+      paymentToken: "tok_collect",
+      invoiceNumber: "OPEN-20260916-jrm01",
+      brandId: "jrm",
+      customerName: "Chaim Cohen",
+      staffName: "Hershy",
+      fetchImpl: sale.fetchImpl,
+    });
+    assert.equal(out.ok, true);
+    const body = sale.lastBody();
+    assert.equal(body.processor_id, "mav2083");
+    assert.notEqual(body.processor_id, "mav7067");
+    assert.equal(body.merchant_defined_fields.field_1, "jrm");
+    assert.equal(body.merchant_defined_fields.field_4, "Chaim Cohen");
+    assert.equal(body.merchant_defined_fields.field_5, undefined);
+    assert.equal(body.payment_descriptor, undefined);
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(body, "payment_descriptor"),
+      false
+    );
+    assert.doesNotMatch(JSON.stringify(body), /payment_descriptor/);
+    assert.doesNotMatch(JSON.stringify(body), /JRM HOTELS/);
+    assert.doesNotMatch(JSON.stringify(body), /FLYNESHER/);
+    assert.doesNotMatch(JSON.stringify(body), /NESHER-PAY|JRM-PAY/);
+    assert.doesNotMatch(JSON.stringify(body), /Hershy/);
   });
 
   it("requires a payment token", async () => {
@@ -1343,9 +1447,10 @@ describe("wiring", () => {
     assert.match(docker, /\bopen-pay\.js\b/);
     const src = fs.readFileSync(new URL("../server.js", import.meta.url), "utf8");
     assert.match(src, /from "\.\/open-pay\.js"/);
-    assert.match(src, /build: "2026-09-10-office-crm"/);
+    assert.match(src, /build: "2026-09-16-jrm-card"/);
     assert.match(src, /isOpenPayPath\(url\.pathname\)/);
     assert.match(src, /isOfficePayPath\(url\.pathname\)/);
+    assert.match(src, /resolveOpenPayBrand\(req\.headers\)/);
     assert.match(src, /openPayRequestAllowed\(req\.headers\)/);
     assert.match(src, /\/pay\/open/);
     assert.match(src, /\/pay\/office/);

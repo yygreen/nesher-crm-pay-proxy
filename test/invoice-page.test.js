@@ -204,7 +204,7 @@ describe("unified invoice token", () => {
     assert.doesNotMatch(html, /googlePay|applePay|vault/i);
   });
 
-  it("renders Collect.js for JRM-189 on Nesher FLYNESHER.COM without a guest sermon (Joseph 2026-09-08)", () => {
+  it("renders Collect.js for JRM-189 with JRM logo and no guest sermon", () => {
     const prev = process.env.NMI_JRM_DESCRIPTOR;
     delete process.env.NMI_JRM_DESCRIPTOR;
     try {

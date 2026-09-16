@@ -35,6 +35,7 @@ import {
   isOfficePayChargePath,
   isOfficePayLookupPath,
   openPayRequestAllowed,
+  resolveOpenPayBrand,
   renderOpenPayHtml,
   renderOfficePayHtml,
   renderOpenPayErrorHtml,
@@ -1043,9 +1044,14 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Public Nesher open-amount /pay/open (guest) and /pay/office (staff).
+  // Public open-amount /pay/open (Nesher or JRM guest) and /pay/office (Nesher staff).
   if (isOpenPayPath(url.pathname) || isOfficePayPath(url.pathname)) {
-    if (!openPayRequestAllowed(req.headers)) {
+    const officePath = isOfficePayPath(url.pathname);
+    const openBrand = officePath ? null : resolveOpenPayBrand(req.headers);
+    const allowed = officePath
+      ? openPayRequestAllowed(req.headers)
+      : Boolean(openBrand);
+    if (!allowed) {
       res.setHeader("Cache-Control", "no-store");
       res.setHeader("Content-Type", "text/html; charset=utf-8");
       res.writeHead(404);
@@ -1167,6 +1173,7 @@ const server = http.createServer(async (req, res) => {
             country: openBody.country || "",
             email: openBody.email || "",
             kind: "open",
+            brandId: openBrand === "jrm" ? "jrm" : "nesher",
           });
       if (openResult.ok) {
         sendJson(res, 200, {
@@ -1190,7 +1197,10 @@ const server = http.createServer(async (req, res) => {
           collectPublicKey: nmiPublicKey(),
           crmRef: String(url.searchParams.get("ref") || "").trim(),
         })
-      : renderOpenPayHtml({ collectPublicKey: nmiPublicKey() });
+      : renderOpenPayHtml({
+          collectPublicKey: nmiPublicKey(),
+          brandId: openBrand === "jrm" ? "jrm" : "nesher",
+        });
     res.end(pageHtml);
     return;
   }
@@ -1287,7 +1297,7 @@ const server = http.createServer(async (req, res) => {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-09-10-office-crm",
+      build: "2026-09-16-jrm-card",
       snapEngage: {
         enabled: SNAPENGAGE_ENABLED,
         widgetId: SNAPENGAGE_WIDGET_ID,

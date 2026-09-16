@@ -3,13 +3,15 @@
  * One function: CRM record + amount + brand → { cardUrl, orderId, descriptor, brand }.
  * Mercury bank stays on the same guest page. Square/Stripe hosts are never returned.
  *
- * Dual-brand rule: this MID's boarded DBA is flynesher.com. Pinpoint
- * 2026-09-09: "Custom descriptors are not allowed for this processor" —
- * never send v5 payment_descriptor or Classic descriptor on sale.
- * Joseph 2026-09-08: JRM hotel quotes take cards on this Nesher MID until
- * a new MID exists. Staff tell the guest the statement shows FLYNESHER.COM
- * (boarded DBA, not an API field). Do not set NMI_JRM_DESCRIPTOR. Never
- * fall back to "JRM HOTELS". Guest HTML stays sermon-free.
+ * Dual-brand rule: one gateway, two processors. Pinpoint 2026-09-09:
+ * "Custom descriptors are not allowed for this processor" — never send v5
+ * payment_descriptor or Classic descriptor on sale. Brand is the boarded
+ * DBA of the processor you route to:
+ *   Nesher  processor_id mav7067  MID 30120057067  DBA FLYNESHER.COM
+ *   JRM     processor_id mav2083  MID 30120062083  DBA JRM Hotels
+ * (Pinpoint 2026-09-15). A JRM sale that omits processor_id would print
+ * FLYNESHER.COM — that is a fail. NMI_JRM_DESCRIPTOR is staff/guest copy
+ * only (JRM HOTELS), never a v5 field. Guest HTML stays sermon-free.
  */
 
 export const NMI_HOST = (
@@ -70,16 +72,26 @@ export function guestPayOrigin(brand) {
 }
 
 /**
- * Boarded DBA on MID 30120057067. Pinpoint prints this on the statement.
- * Not a v5 override — this processor rejects custom descriptors.
+ * Boarded DBA on Nesher MID 30120057067. Pinpoint prints this on the
+ * statement when the sale is routed to mav7067. Not a v5 override.
  */
 export const BOARDED_DBA = "FLYNESHER.COM";
 
+/** Query API / v5 sale processor_id. Lowercase. Never a custom descriptor. */
+export const NESHER_PROCESSOR_ID = "mav7067";
+export const JRM_PROCESSOR_ID = "mav2083";
+
 const DESCRIPTOR_RE = /^[A-Za-z0-9._\- &]{1,60}$/;
+const PROCESSOR_ID_RE = /^[a-z0-9][a-z0-9_-]{0,49}$/;
 
 export function sanitizeDescriptor(value) {
   const s = String(value || "").trim().slice(0, 60);
   return DESCRIPTOR_RE.test(s) ? s : null;
+}
+
+export function sanitizeProcessorId(value) {
+  const s = String(value || "").trim().toLowerCase();
+  return PROCESSOR_ID_RE.test(s) ? s : "";
 }
 
 function boardedDba() {
@@ -89,25 +101,43 @@ function boardedDba() {
 }
 
 /**
+ * v5 POST /payments/sale processor_id. JRM must be mav2083 (or NMI_JRM_PROCESSOR_ID).
+ * Nesher is mav7067 (or NMI_NESHER_PROCESSOR_ID). Mixing Nesher onto a JRM
+ * charge would print FLYNESHER.COM.
+ */
+export function processorIdFor(brand) {
+  const b = brand && brand.id ? brand : BRANDS.nesher;
+  if (b.id === "jrm") {
+    const explicit = sanitizeProcessorId(process.env.NMI_JRM_PROCESSOR_ID);
+    return explicit || JRM_PROCESSOR_ID;
+  }
+  const explicit = sanitizeProcessorId(process.env.NMI_NESHER_PROCESSOR_ID);
+  return explicit || NESHER_PROCESSOR_ID;
+}
+
+/**
  * Staff/display copy of what the statement prints. Not a charge gate and
- * not a v5 field. JRM without env uses the boarded DBA, never "JRM HOTELS".
+ * not a v5 field. JRM copy is JRM HOTELS (env or default). Nesher is the
+ * boarded DBA FLYNESHER.COM.
  */
 export function descriptorFor(brand) {
   const b = brand && brand.id ? brand : BRANDS.nesher;
   if (b.id === "jrm") {
     const explicit = String(process.env.NMI_JRM_DESCRIPTOR || "").trim();
-    if (explicit) return sanitizeDescriptor(explicit);
-    return boardedDba();
+    return (
+      sanitizeDescriptor(explicit) ||
+      sanitizeDescriptor(b.defaultDescriptor)
+    );
   }
   return boardedDba();
 }
 
-/** Always null on this MID. Charge must omit payment_descriptor. */
+/** Always null. Charge must omit payment_descriptor. */
 export function paymentDescriptorPayload(_brand) {
   return null;
 }
 
-/** Legal merchant / bank copy. Card statement is the boarded DBA. */
+/** Legal merchant / bank copy. Card statement is the processor DBA. */
 export const MERCHANT = {
   legal: "Air Today Travel Inc",
   dba: "Nesher Travel",
@@ -117,19 +147,20 @@ export const MERCHANT = {
 
 /**
  * One truth for staff-paste processed-by copy. Guest HTML does not print
- * this (Joseph banned the sermon). Staff paste names the boarded DBA
- * FLYNESHER.COM — that is what Pinpoint prints, not an API field.
+ * this (Joseph banned the sermon). JRM card paste names JRM HOTELS, never
+ * FLYNESHER.COM. Nesher names the boarded DBA.
  */
 export function processedByFacts({ brand, hasCard } = {}) {
   const b = brand && brand.id ? brand : BRANDS.nesher;
-  const descriptor = boardedDba();
+  const isJrm = b.id === "jrm";
+  const descriptor = descriptorFor(b);
   const showCard = Boolean(hasCard) && Boolean(descriptor);
   return {
     brandId: b.id,
     showCard,
     descriptor: showCard ? descriptor : null,
     merchant: MERCHANT.legal,
-    dba: MERCHANT.dba,
+    dba: isJrm ? "JRM Hotels" : MERCHANT.dba,
     bankBeneficiary: MERCHANT.bankBeneficiary,
     bankRail: MERCHANT.bankRail,
   };
@@ -774,11 +805,13 @@ export async function mintCardCheckout(opts = {}) {
   const amount = money2(opts.amountUsd);
   const brand = brandFromKind(opts.kind, invoiceNumber);
   const descriptor = descriptorFor(brand);
+  const processorId = processorIdFor(brand);
   const orderId = invoiceNumber.slice(0, 50);
   const base = {
     brand,
     orderId,
     descriptor,
+    processorId,
     sku: brand.sku,
     amountUsd: amount ? Number(amount) : 0,
   };
@@ -908,14 +941,20 @@ export async function mintCardCheckout(opts = {}) {
 export async function chargeWithToken(opts = {}) {
   const invoiceNumber = String(opts.invoiceNumber || "").trim();
   const amount = money2(opts.amountUsd);
-  const brand = brandFromKind(opts.kind, invoiceNumber);
+  const brand = brandFromRecord({
+    brandId: opts.brandId,
+    kind: opts.kind,
+    invoiceNumber,
+  });
   const descriptor = descriptorFor(brand);
+  const processorId = processorIdFor(brand);
   const token = String(opts.paymentToken || "").trim();
   const orderId = invoiceNumber.slice(0, 50);
   const base = {
     brand,
     orderId,
     descriptor,
+    processorId,
     amountUsd: amount ? Number(amount) : 0,
   };
   if (!amount) {
@@ -951,9 +990,22 @@ export async function chargeWithToken(opts = {}) {
   const orderDescription = staffName
     ? `${descBase} · ${staffName}`.slice(0, 100)
     : descBase.slice(0, 100);
-  // No payment_descriptor / Classic descriptor: this MID refuses custom DBA.
+  // No payment_descriptor / Classic descriptor: this processor refuses custom DBA.
+  // Brand is processor_id (mav7067 Nesher / mav2083 JRM). A JRM sale that
+  // omits processor_id would print FLYNESHER.COM — fail closed.
   // field_4 Guest / field_5 Processor / field_6 More info — records only.
   // billing_address AVS (address1/city/state/zip/country) is not a descriptor.
+  if (brand.id === "jrm") {
+    if (!processorId || processorId === NESHER_PROCESSOR_ID) {
+      const message = guestCardMessage({ error: "processor_error" });
+      return {
+        ok: false,
+        error: "processor_id_required",
+        message,
+        ...base,
+      };
+    }
+  }
   const body = {
     amount,
     currency: "USD",
@@ -973,6 +1025,7 @@ export async function chargeWithToken(opts = {}) {
       ...(notes ? { field_6: notes } : {}),
     },
   };
+  if (processorId) body.processor_id = processorId;
   const fetchImpl = opts.fetchImpl || fetch;
   const res = await fetchImpl(`${NMI_HOST}/api/v5/payments/sale`, {
     method: "POST",
