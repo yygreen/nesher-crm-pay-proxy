@@ -200,6 +200,24 @@ function requestHostList(headers = {}) {
 }
 
 /**
+ * The jrmhotels.com /pay rewrite reaches this proxy through Vercel's edge and
+ * then Railway's edge. Measured 2026-09-22 on the live proxy: Railway strips or
+ * overwrites a client X-Forwarded-Host (crm Host + "X-Forwarded-Host:
+ * jrmhotels.com" answered 404) while it passes Forwarded untouched (crm Host +
+ * "Forwarded: host=jrmhotels.com" painted the JRM sheet) - and Vercel sends no
+ * Forwarded. What Vercel's edge does send on a proxied request is x-vercel-id
+ * (Vercel documents it as the loop-prevention marker). jrmhotels.com is the
+ * ONLY Vercel project that rewrites into crm.flynesher.com (flynesher.com is a
+ * Railway domain on this proxy itself), so a crm-Host request that carries
+ * x-vercel-id and names no brand host anywhere IS the JRM hop. Absent the
+ * marker the request stays 404 (fail closed). A forged marker only paints the
+ * JRM sheet on the staff host - the same page jrmhotels.com serves.
+ */
+function viaVercelEdge(headers = {}) {
+  return headerValue(headers, "x-vercel-id").trim() !== "";
+}
+
+/**
  * nesher | jrm | null. Host is the hop; forwarded hosts are the browser URL.
  * crm.flynesher.com is only a rewrite hop for JRM, never a guest brand.
  */
@@ -223,7 +241,38 @@ export function resolveOpenPayBrand(headers = {}) {
     if (NESHER_OPEN_HOSTS.has(host)) return "nesher";
     return null;
   }
+  if (host === CRM_REWRITE_HOST && viaVercelEdge(headers)) return "jrm";
   return null;
+}
+
+/** Header names whose VALUES may be logged. Everything else is a name only. */
+const HOP_VALUE_ALLOWLIST = [
+  "host",
+  "x-forwarded-host",
+  "forwarded",
+  "x-forwarded-proto",
+  "x-vercel-id",
+  "x-vercel-deployment-url",
+  "x-railway-edge",
+  "x-railway-request-id",
+];
+
+/**
+ * What the hop actually delivered, for the refuse-branch log. Values only for
+ * the allowlist above (all public routing facts, never a cookie, token or
+ * authorization); every other header contributes its NAME only.
+ */
+export function describeOpenPayHop(headers = {}) {
+  const src = headers && typeof headers === "object" ? headers : {};
+  const names = Object.keys(src)
+    .map((k) => String(k).toLowerCase())
+    .sort();
+  const values = {};
+  for (const name of HOP_VALUE_ALLOWLIST) {
+    const v = headerValue(src, name).trim();
+    if (v) values[name] = v.slice(0, 200);
+  }
+  return { brand: resolveOpenPayBrand(src), values, names };
 }
 
 /** Nesher-origin only (office + legacy). JRM guest uses resolveOpenPayBrand. */

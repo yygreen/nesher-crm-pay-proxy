@@ -36,6 +36,7 @@ import {
   isOfficePayLookupPath,
   openPayRequestAllowed,
   resolveOpenPayBrand,
+  describeOpenPayHop,
   renderOpenPayHtml,
   renderOfficePayHtml,
   renderOpenPayErrorHtml,
@@ -1052,6 +1053,18 @@ const server = http.createServer(async (req, res) => {
       ? openPayRequestAllowed(req.headers)
       : Boolean(openBrand);
     if (!allowed) {
+      if (!officePath) {
+        // A 404 on a guest pay page is worth one line: which hop, which
+        // headers (names only outside the allowlist), so the next fix is
+        // measured, not guessed.
+        console.warn(
+          "open-pay refused " +
+            JSON.stringify({
+              path: url.pathname,
+              ...describeOpenPayHop(req.headers),
+            })
+        );
+      }
       res.setHeader("Cache-Control", "no-store");
       res.setHeader("Content-Type", "text/html; charset=utf-8");
       res.writeHead(404);
@@ -1297,7 +1310,7 @@ const server = http.createServer(async (req, res) => {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-09-16-jrm-card",
+      build: "2026-09-22-jrm-hop",
       snapEngage: {
         enabled: SNAPENGAGE_ENABLED,
         widgetId: SNAPENGAGE_WIDGET_ID,

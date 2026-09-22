@@ -19,6 +19,7 @@ import {
   jrmOpenPayHostAllowed,
   openPayRequestAllowed,
   resolveOpenPayBrand,
+  describeOpenPayHop,
   decideOpenPayPage,
   decideOfficePayPage,
   parseOpenAmountUsd,
@@ -1441,17 +1442,119 @@ describe("office CRM reference", () => {
   });
 });
 
+describe("jrmhotels.com rewrite hop (Railway strips X-Forwarded-Host, 2026-09-22)", () => {
+  const collect = { collectPublicKey: "pk_test_collect" };
+  // What the container actually sees on the hop: Host = crm (Vercel's
+  // destination), X-Forwarded-Host rewritten by Railway to crm, Vercel's own
+  // x-vercel-id marker, no Forwarded.
+  const hop = {
+    host: "crm.flynesher.com",
+    "x-forwarded-host": "crm.flynesher.com",
+    "x-forwarded-proto": "https",
+    "x-vercel-id": "fra1::abc12-1790092689555-79b2f50f574a",
+  };
+
+  it("crm Host + x-vercel-id + no brand host anywhere = the JRM hop", () => {
+    assert.equal(resolveOpenPayBrand(hop), "jrm");
+    const page = decideOpenPayPage(hop, collect);
+    assert.equal(page.status, 200);
+    assert.match(page.html, /alt="JRM Hotels"/);
+    assert.match(page.html, /pay-brand-jrm/);
+    assert.match(page.html, /Collect\.js/);
+    assert.doesNotMatch(page.html, /FLYNESHER/);
+    assert.doesNotMatch(page.html, /alt="Nesher Travel"/);
+  });
+
+  it("without the marker the crm Host stays closed (fail closed, unchanged)", () => {
+    const bare = { ...hop };
+    delete bare["x-vercel-id"];
+    assert.equal(resolveOpenPayBrand(bare), null);
+    assert.equal(decideOpenPayPage(bare, collect).status, 404);
+    assert.equal(resolveOpenPayBrand({ ...bare, "x-vercel-id": "   " }), null);
+  });
+
+  it("the marker never flips a named brand and never opens a Nesher hop", () => {
+    assert.equal(
+      resolveOpenPayBrand({ host: "www.flynesher.com", "x-vercel-id": "x" }),
+      "nesher"
+    );
+    assert.equal(
+      resolveOpenPayBrand({ host: "jrmhotels.com", "x-vercel-id": "x" }),
+      "jrm"
+    );
+    assert.equal(
+      resolveOpenPayBrand({
+        host: "crm.flynesher.com",
+        "x-vercel-id": "x",
+        forwarded: "host=www.flynesher.com",
+      }),
+      null
+    );
+    assert.equal(
+      resolveOpenPayBrand({
+        host: "crm.flynesher.com",
+        "x-vercel-id": "x",
+        "x-forwarded-host": "evil.example",
+      }),
+      null
+    );
+    assert.equal(
+      resolveOpenPayBrand({ host: "www.example.com", "x-vercel-id": "x" }),
+      null
+    );
+    // The office door is untouched by the marker.
+    assert.equal(decideOfficePayPage(hop, collect).status, 404);
+  });
+
+  it("describeOpenPayHop logs allowlisted values and names only for the rest", () => {
+    const d = describeOpenPayHop({
+      ...hop,
+      Cookie: "sessionid=SECRET-COOKIE-VALUE",
+      authorization: "Bearer SECRET-BEARER-VALUE",
+      "x-custom-thing": "SECRET-CUSTOM-VALUE",
+    });
+    assert.equal(d.brand, "jrm");
+    assert.equal(d.values.host, "crm.flynesher.com");
+    assert.equal(d.values["x-forwarded-host"], "crm.flynesher.com");
+    assert.equal(d.values["x-vercel-id"], hop["x-vercel-id"]);
+    assert.deepEqual(
+      d.names,
+      [
+        "authorization",
+        "cookie",
+        "host",
+        "x-custom-thing",
+        "x-forwarded-host",
+        "x-forwarded-proto",
+        "x-vercel-id",
+      ]
+    );
+    const json = JSON.stringify(d);
+    assert.doesNotMatch(json, /SECRET-COOKIE-VALUE/);
+    assert.doesNotMatch(json, /SECRET-BEARER-VALUE/);
+    assert.doesNotMatch(json, /SECRET-CUSTOM-VALUE/);
+    assert.equal(describeOpenPayHop({ host: "crm.flynesher.com" }).brand, null);
+    assert.deepEqual(describeOpenPayHop(null).names, []);
+  });
+});
+
 describe("wiring", () => {
   it("Dockerfile COPY includes open-pay.js and health tag is bumped", () => {
     const docker = fs.readFileSync(new URL("../Dockerfile", import.meta.url), "utf8");
     assert.match(docker, /\bopen-pay\.js\b/);
     const src = fs.readFileSync(new URL("../server.js", import.meta.url), "utf8");
     assert.match(src, /from "\.\/open-pay\.js"/);
-    assert.match(src, /build: "2026-09-16-jrm-card"/);
+    assert.match(src, /build: "2026-09-22-jrm-hop"/);
     assert.match(src, /isOpenPayPath\(url\.pathname\)/);
     assert.match(src, /isOfficePayPath\(url\.pathname\)/);
     assert.match(src, /resolveOpenPayBrand\(req\.headers\)/);
     assert.match(src, /openPayRequestAllowed\(req\.headers\)/);
+    // A refused guest pay page logs the hop it saw (names only outside the
+    // allowlist), and only for the guest door - office 404s stay quiet.
+    assert.match(
+      src,
+      /if \(!officePath\) \{[\s\S]{0,400}"open-pay refused " \+[\s\S]{0,200}describeOpenPayHop\(req\.headers\)/
+    );
     assert.match(src, /\/pay\/open/);
     assert.match(src, /\/pay\/office/);
   });
