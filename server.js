@@ -85,6 +85,7 @@ import { injectPublicHomeUi } from "./public-ui.js";
 import { injectStatusExtra, handleStatusPost, STATUS_POST_RE } from "./status-extra.js";
 import { injectNeedsAxis } from "./needs-axis.js";
 import { handleBoardPage, handleBoardDone } from "./board.js";
+import { createMoneyHop } from "./money-hop.js";
 import {
   getPool,
   loadHotelPayContext,
@@ -998,8 +999,20 @@ function proxyWithInject(req, res) {
   proxy.web(req, fakeRes);
 }
 
+// Mr Money hop (money-hop.js): the money seat on Joseph's PC polls this service; a caller's
+// signed GET /__money_hop/<seat path> becomes one job for the seat. MONEY_HOP_KEY unset = 503.
+const moneyHop = createMoneyHop({ key: process.env.MONEY_HOP_KEY || "" });
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+
+  // ── Mr Money hop: read-only GETs to the money seat, signed both ways ──────
+  // The seat is never exposed: it dials out and long-polls here. Five GETs only
+  // (health, balances, transactions, caps, state); the seat verifies again.
+  if (url.pathname.startsWith("/__money_hop/")) {
+    await moneyHop.handle(req, res);
+    return;
+  }
 
   // ── Mercury AR relay for the JRM Concierge booking machine ────────────────
   // Vercel egress IPs rotate and cannot sit on the Mercury token's IP
@@ -1349,7 +1362,7 @@ const server = http.createServer(async (req, res) => {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-09-23-ocr-endpoint",
+      build: "2026-09-23-ocr-hop",
       snapEngage: {
         enabled: SNAPENGAGE_ENABLED,
         widgetId: SNAPENGAGE_WIDGET_ID,
@@ -1372,6 +1385,7 @@ const server = http.createServer(async (req, res) => {
       hasDb: Boolean(process.env.DATABASE_URL || process.env.DATABASE_PUBLIC_URL),
       hasWhatsApp: wa.configured,
       hasMercuryRelay: (process.env.MERCURY_RELAY_KEY || "").length >= 24,
+      moneyHop: moneyHop.health(),
       whatsappWebhook: {
         path: "/__nesher_wa/webhook/",
         verifyTokenConfigured: Boolean(webhookVerifyToken()),

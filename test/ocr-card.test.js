@@ -701,7 +701,7 @@ describe("wiring", () => {
     assert.ok(src.indexOf("isOcrPath(url.pathname)") < src.indexOf("isOpenPayPath(url.pathname)"), "reader answers before the pay pages");
     assert.ok(src.indexOf("isOcrPath(url.pathname)") < src.lastIndexOf("proxyWithInject(req, res)"), "reader answers before the proxy");
     assert.match(src, /ocr: \{\s*enabled: ocrEnabled\(\)/);
-    assert.match(src, /build: "2026-09-23-ocr-endpoint"/);
+    assert.match(src, /build: "2026-09-23-ocr-hop"/);
     assert.match(src, /startCardRefSweeper\(/);
     assert.match(src, /ocr route disabled: OCR_TICKET_SECRET not set/);
     const docker = fs.readFileSync(new URL("../Dockerfile", import.meta.url), "utf8");
