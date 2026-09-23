@@ -123,10 +123,10 @@ describe("money-hop route", () => {
     } finally { await t.close(); }
   });
 
-  it("forwards only the five GETs; anything else is 405 not_forwardable and never becomes a job", async () => {
+  it("forwards only the six GETs (plan 17.4 added /invoices); anything else is 405 not_forwardable and never becomes a job", async () => {
     const t = await rig();
     try {
-      assert.deepEqual(MONEY_HOP_FORWARDABLE, ["/health", "/balances", "/transactions", "/caps", "/state"]);
+      assert.deepEqual(MONEY_HOP_FORWARDABLE, ["/health", "/balances", "/transactions", "/caps", "/state", "/invoices"]);
       for (const [m, p] of [["POST", "/balances"], ["GET", "/send"], ["GET", "/balances/x"], ["GET", "/transfer?amount=1"], ["GET", "/recipients"], ["DELETE", "/state"]]) {
         const r = await call(t, m, p, { body: m === "POST" ? "{}" : null });
         assert.equal(r.status, 405, m + " " + p);
@@ -283,11 +283,41 @@ describe("wiring", () => {
     assert.match(src, /url\.pathname\.startsWith\("\/__money_hop\/"\)/);
     assert.match(src, /await moneyHop\.handle\(req, res\)/);
     assert.match(src, /moneyHop: moneyHop\.health\(\)/);
-    assert.match(src, /build: "2026-09-23-money-posting"/);
+    assert.match(src, /build: "2026-09-23-collect-shadow"/);
     // the hop is mounted before the Mercury relay and everything behind it
     assert.ok(src.indexOf('url.pathname.startsWith("/__money_hop/")') < src.indexOf("/^\\/__mercury_relay\\/(.+)$/"));
     // no Mercury token or send path anywhere in the module
     const mod = fs.readFileSync(new URL("../money-hop.js", import.meta.url), "utf8");
     assert.doesNotMatch(mod, /MERCURY_TOKEN|api\.mercury\.com|send-money|\/send\b/);
+  });
+});
+
+describe("read() - the service's own signed read through the seat (plan 17.4)", () => {
+  it("queues one signed GET job the seat can verify, and returns the seat's answer", async () => {
+    const t = await rig();
+    try {
+      const pollP = call(t, "GET", "/poll");
+      await new Promise((r) => setTimeout(r, 20));
+      const readP = t.hop.read("/invoices");
+      const poll = await pollP;
+      const job = poll.json.jobs[0];
+      assert.equal(job.method, "GET");
+      assert.equal(job.path, "/invoices");
+      const v = createHopVerifier(KEY, { now: () => t.clock.now }).verify("GET", "/invoices", job.headers, Buffer.alloc(0));
+      assert.equal(v.ok, true);
+      const res = await call(t, "POST", "/result", { body: { id: job.id, status: 200, body: '{"complete":true,"invoices":[]}' } });
+      assert.equal(res.status, 200);
+      assert.deepEqual(await readP, { status: 200, body: '{"complete":true,"invoices":[]}' });
+    } finally { await t.close(); }
+  });
+  it("refuses anything off the list, and says offline when the seat is not polling", async () => {
+    const t = await rig();
+    try {
+      for (const p of ["/send", "https://evil/invoices", "invoices", "/invoices#x"]) {
+        assert.equal((await t.hop.read(p)).status, 405, p);
+      }
+      assert.equal((await t.hop.read("/invoices")).status, 503);
+      assert.equal(JSON.parse((await t.hop.read("/invoices")).body).error, "seat_offline");
+    } finally { await t.close(); }
   });
 });

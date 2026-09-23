@@ -14,6 +14,8 @@
  * only (JRM HOTELS), never a v5 field. Guest HTML stays sermon-free.
  */
 
+import { observeSafely } from "./payment-posts.js";
+
 export const NMI_HOST = (
   process.env.NMI_HOST || "https://pinpointpayments.transactiongateway.com"
 ).replace(/\/$/, "");
@@ -1071,14 +1073,25 @@ export async function chargeWithToken(opts = {}) {
   } catch {
     return unknown();
   }
-  let json = {};
+  // Outcome classes (NMI v5: success is HTTP 200 + response "1", a decline is
+  // response "2", a validation failure is HTTP 4xx with error_code/details):
+  // - any 4xx except 408 = the gateway refused the REQUEST, no sale exists, so
+  //   the paid claim may be released and the guest may try again;
+  // - a thrown fetch, 408, 5xx, an unreadable body or a 2xx without a known
+  //   response code = we do not know whether money moved: keep the claim and
+  //   never send a second sale (plan 16.2). The webhook or a person resolves it.
+  const status = Number(res.status) || 0;
+  let json = null;
   try {
     json = JSON.parse(text);
   } catch {
-    return unknown();
+    json = null;
   }
+  const refusedRequest = status >= 400 && status < 500 && status !== 408;
+  if (!refusedRequest && (!json || typeof json !== "object")) return unknown();
+  if (!json || typeof json !== "object") json = {};
   const response = String(json.response ?? json.action?.success ?? "");
-  if (res.status >= 500 || !["0", "1", "2", "3"].includes(response)) return unknown();
+  if (!refusedRequest && (status >= 500 || status === 408 || !["0", "1", "2", "3"].includes(response))) return unknown();
   const approved = response === "1";
   if (!res.ok || !approved) {
     const message = guestCardMessage({
@@ -1105,7 +1118,32 @@ export async function chargeWithToken(opts = {}) {
     authCode: json.auth_code ? String(json.auth_code) : null,
     avsResponse: json.avs_response ? String(json.avs_response) : null,
     cvvResponse: json.cvv_response ? String(json.cvv_response) : null,
+    cardLast4: cardLastFour(json),
   };
+}
+
+/**
+ * Last four digits of the card from a gateway answer or webhook body, or null.
+ * Reads only fields that are already masked or already last-four; never keeps
+ * more than four digits, and a value that is not exactly a mask + 4 digits is
+ * ignored rather than guessed at.
+ */
+export function cardLastFour(obj) {
+  if (!obj || typeof obj !== "object") return null;
+  const cands = [
+    obj.card_last4, obj.last_four, obj.cc_last4,
+    obj.card?.last_four, obj.card?.last4, obj.card?.cc_number, obj.card?.card_number,
+    obj.payment_details?.card?.last_four, obj.payment_details?.card?.last4,
+    obj.payment_details?.card?.card_number, obj.payment_details?.card_number,
+    obj.cc_number,
+  ];
+  for (const c of cands) {
+    const v = String(c ?? "").replace(/[\s-]/g, "");
+    if (/^\d{4}$/.test(v)) return v;
+    const m = v.match(/^\d{0,6}[Xx*•]{4,}(\d{4})$/);
+    if (m) return m[1];
+  }
+  return null;
 }
 
 async function nmiJson(path, { method = "POST", body, fetchImpl, privateKey } = {}) {
@@ -1326,11 +1364,27 @@ export async function chargePayCode(opts = {}) {
     };
   }
 
+  const paidAtFinal = claimed.paidAt || claimedAt;
+  const rep = String(opts.staffName || invoice.staffName || "").trim() || null;
+  // Shadow (MONEY_POSTING_MODE unset): record what the new path WOULD post,
+  // BEFORE the legacy write below, bounded and never able to fail the sale.
+  await observeSafely(opts.shadowPayment, {
+    path: opts.path === "office" ? "office" : "guest",
+    invoiceNumber: invoice.invoiceNumber,
+    amountUsd: invoice.amountUsd,
+    transactionId: sale.transactionId,
+    paidAt: paidAtFinal,
+    cardLast4: sale.cardLast4 || null,
+    rep,
+    decision: { action: "post" },
+  });
   const recorded = await recordNmiPaid({
     code,
     invoice,
     transactionId: sale.transactionId,
-    paidAt: claimed.paidAt || claimedAt,
+    paidAt: paidAtFinal,
+    ...(sale.cardLast4 ? { cardLast4: sale.cardLast4 } : {}),
+    ...(rep ? { rep } : {}),
     markInvoicePaid: opts.markInvoicePaid,
     claimNmiNote: opts.claimNmiNote,
     appendReservationNote: opts.appendReservationNote,
@@ -1382,6 +1436,8 @@ export async function recordNmiPaid(opts = {}) {
         amountUsd: invoice.amountUsd,
         transactionId,
         paidAt,
+        ...(opts.cardLast4 ? { cardLast4: opts.cardLast4 } : {}),
+        ...(opts.rep ? { rep: opts.rep } : {}),
         ...(invoiceConflict ? { reviewReason: "invoice_transaction_conflict" } : {}),
       });
     } catch {

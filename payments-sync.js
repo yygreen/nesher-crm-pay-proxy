@@ -10,7 +10,7 @@
 
 import { fetchWithTimeout } from "./http.js";
 import { mercuryApiBase, normalizeToken } from "./mercury.js";
-import { postConfirmedPayment } from "./payment-posts.js";
+import { postConfirmedPayment, observeShadowPayment, recordPaymentException } from "./payment-posts.js";
 
 /** JRM-1{req}[-O{offer}] | RES-{code} → CRM target. */
 export function parseInvoiceNumber(num) {
@@ -37,26 +37,57 @@ function nmiMarker(transactionId) {
   return `nmi:${txn}`;
 }
 
+/**
+ * CRM user id for the rep who took a card payment, or null. The office roster
+ * (open-pay OPEN_PAY_STAFF) mapped onto auth_user, verified by read on
+ * 23 Sep 2026: goldy=2, Hershy=3, sgrunfeld=7, joseph=10. Richter has no CRM
+ * user, so he stays null (the note still names him). Never guessed.
+ */
+export const REP_USER_IDS = Object.freeze({ goldie: 2, goldy: 2, hershy: 3, sruly: 7, joseph: 10 });
+export function repUserId(name) {
+  const k = String(name || "").trim().toLowerCase();
+  return Object.prototype.hasOwnProperty.call(REP_USER_IDS, k) ? REP_USER_IDS[k] : null;
+}
+
+/**
+ * CRM method for a paid Mercury invoice. "mercury" is not a choice in the CRM
+ * (Payment / JRMHotelPayment method choices: cash card bank zelle check other
+ * points seller_credit), and the AR invoice never says HOW it was paid. When
+ * the invoice offered ACH only, the only way it could be paid is a bank debit;
+ * otherwise it is honestly "other" and the note says Mercury pay link.
+ * Going forward only: rows already written are previewed, never rewritten.
+ */
+export function mercuryMethod(inv = {}) {
+  return inv.creditCardEnabled === false && inv.achDebitEnabled !== false ? "bank" : "other";
+}
+
 function describeChannel(inv, channel = "mercury") {
   const amount = Number(inv.amount);
   const amt = Number.isFinite(amount) ? amount.toFixed(2) : "0.00";
   if (channel === "nmi") {
     const txn = String(inv.id || "").trim() || "unknown";
     const mark = nmiMarker(txn);
+    const last4 = /^\d{4}$/.test(String(inv.cardLast4 || "")) ? String(inv.cardLast4) : "";
+    const rep = String(inv.rep || "").trim().slice(0, 40);
+    const extra = `${last4 ? ` card ending ${last4}` : ""}${rep ? `, taken by ${rep}` : ""}`;
     return {
       marker: mark,
       method: "card",
+      cardLast4: last4,
+      createdById: repUserId(rep),
       paymentReference: `${inv.invoiceNumber} ${mark}`,
-      paymentNote: `NMI card $${amt} USD txn ${txn}.`,
-      staffNote: `NMI card $${amt} USD txn ${txn}.`,
-      reservationPaymentNotes: `NMI card $${amt} USD txn ${txn}. ${mark}`,
+      paymentNote: `NMI card $${amt} USD txn ${txn}.${extra}`,
+      staffNote: `NMI card $${amt} USD txn ${txn}.${extra}`,
+      reservationPaymentNotes: `NMI card $${amt} USD txn ${txn}.${extra} ${mark}`,
       reservationAppend: `\nNMI card $${amt} USD txn ${txn}.`,
     };
   }
   const mark = marker(inv);
   return {
     marker: mark,
-    method: "mercury",
+    method: mercuryMethod(inv),
+    cardLast4: "",
+    createdById: null,
     paymentReference: `Mercury ${inv.invoiceNumber} ${mark}`,
     paymentNote: `[Mercury sync] Invoice ${inv.invoiceNumber} paid $${amt} USD via Mercury pay link (card or ACH bank debit — Mercury does not disclose which).`,
     staffNote: `[Mercury sync] PAID $${amt} USD — invoice ${inv.invoiceNumber}. Payment recorded; reserve with the hotel and confirm to the guest.`,
@@ -71,18 +102,21 @@ function paidAtOf(inv) {
   return isNaN(d.getTime()) ? new Date() : d;
 }
 
-async function recordHotelPayment(pool, inv, target, out, channel = "mercury") {
+async function recordHotelPayment(pool, inv, target, out, channel = "mercury", { strict = channel === "nmi" } = {}) {
+  // strict = the new posting path (anchored marker, conflicts go to review).
+  // strict false on channel "nmi" = the legacy office writer, byte-for-byte
+  // the 6133cd2 rules, which keeps the real CRM writes while shadow runs.
   const amount = Number(inv.amount);
   const ch = describeChannel(inv, channel);
   // Already recorded by a previous sync run?
   const dup = await pool.query(
-    channel === "nmi"
+    strict
       ? `SELECT id, request_id, amount, currency FROM core_jrmhotelpayment WHERE reference ~ $1 LIMIT 1`
       : `SELECT id FROM core_jrmhotelpayment WHERE reference LIKE $1 LIMIT 1`,
-    [channel === "nmi" ? `(^|[[:space:]])${ch.marker}($|[[:space:]])` : `%${ch.marker}%`]
+    [strict ? `(^|[[:space:]])${ch.marker}($|[[:space:]])` : `%${ch.marker}%`]
   );
   if (dup.rows.length) {
-    if (channel === "nmi" && (Number(dup.rows[0].request_id) !== target.requestId || Math.round(Number(dup.rows[0].amount) * 100) !== Math.round(amount * 100) || !['USD', 'US$', '$'].includes(String(dup.rows[0].currency || '').trim().toUpperCase()))) {
+    if (strict && (Number(dup.rows[0].request_id) !== target.requestId || Math.round(Number(dup.rows[0].amount) * 100) !== Math.round(amount * 100) || !['USD', 'US$', '$'].includes(String(dup.rows[0].currency || '').trim().toUpperCase()))) {
       out.errors.push("legacy_transaction_conflict");
       return;
     }
@@ -93,7 +127,7 @@ async function recordHotelPayment(pool, inv, target, out, channel = "mercury") {
   const manual = await pool.query(
     `SELECT id FROM core_jrmhotelpayment
      WHERE request_id = $1 AND ABS(amount - $2) < 0.01
-       ${channel === "nmi" ? "AND COALESCE(reference, '') !~ '(mercury|nmi):[A-Za-z0-9_-]+'" : ""} LIMIT 1`,
+       ${strict ? "AND COALESCE(reference, '') !~ '(mercury|nmi):[A-Za-z0-9_-]+'" : ""} LIMIT 1`,
     [target.requestId, amount]
   );
   if (manual.rows.length) {
@@ -111,7 +145,7 @@ async function recordHotelPayment(pool, inv, target, out, channel = "mercury") {
     );
     if (off.rows.length && Number(off.rows[0].request_id) === target.requestId) {
       offerId = target.offerId;
-    } else if (channel === "nmi") {
+    } else if (strict) {
       out.errors.push("hotel_offer_mismatch");
       return;
     }
@@ -128,7 +162,7 @@ async function recordHotelPayment(pool, inv, target, out, channel = "mercury") {
     `INSERT INTO core_jrmhotelpayment
        (payment_date, amount, currency, method, reference, note, created_at,
         created_by_id, offer_id, request_id, card_last4)
-     VALUES ($1, $2, 'USD', $3, $4, $5, NOW(), NULL, $6, $7, '')`,
+     VALUES ($1, $2, 'USD', $3, $4, $5, NOW(), $8, $6, $7, $9)`,
     [
       paidAtOf(inv),
       amount,
@@ -137,26 +171,28 @@ async function recordHotelPayment(pool, inv, target, out, channel = "mercury") {
       ch.paymentNote,
       offerId,
       target.requestId,
+      ch.createdById,
+      ch.cardLast4,
     ]
   );
   await pool.query(
     `INSERT INTO core_jrmhotelnote (note, created_at, created_by_id, request_id)
-     VALUES ($1, NOW(), NULL, $2)`,
-    [ch.staffNote, target.requestId]
+     VALUES ($1, NOW(), $3, $2)`,
+    [ch.staffNote, target.requestId, ch.createdById]
   );
   out.recorded.push(`${inv.invoiceNumber}: $${amount.toFixed(2)} → hotel request #${target.requestId}`);
 }
 
-async function recordReservationPayment(pool, inv, target, out, channel = "mercury", inTransaction = false) {
+async function recordReservationPayment(pool, inv, target, out, channel = "mercury", inTransaction = false, { strict = channel === "nmi" } = {}) {
   const amount = Number(inv.amount);
   const ch = describeChannel(inv, channel);
   const dup = await pool.query(
-    channel === "nmi"
+    strict
       ? `SELECT id, reservation_id, amount FROM core_payment WHERE notes ~ $1 LIMIT 1`
       : `SELECT id FROM core_payment WHERE notes LIKE $1 LIMIT 1`,
-    [channel === "nmi" ? `(^|[[:space:]])${ch.marker}($|[[:space:]])` : `%${ch.marker}%`]
+    [strict ? `(^|[[:space:]])${ch.marker}($|[[:space:]])` : `%${ch.marker}%`]
   );
-  if (dup.rows.length && channel !== "nmi") {
+  if (dup.rows.length && !strict) {
     out.skipped.push(`${inv.invoiceNumber}: already synced`);
     return;
   }
@@ -181,7 +217,7 @@ async function recordReservationPayment(pool, inv, target, out, channel = "mercu
   const manual = await pool.query(
     `SELECT id FROM core_payment
      WHERE reservation_id = $1 AND ABS(amount - $2) < 0.01
-       ${channel === "nmi" ? "AND COALESCE(notes, '') !~ '(mercury|nmi):[A-Za-z0-9_-]+'" : ""} LIMIT 1`,
+       ${strict ? "AND COALESCE(notes, '') !~ '(mercury|nmi):[A-Za-z0-9_-]+'" : ""} LIMIT 1`,
     [reservationId, amount]
   );
   if (manual.rows.length) {
@@ -199,13 +235,14 @@ async function recordReservationPayment(pool, inv, target, out, channel = "mercu
           reservation_id, cash_location, cash_location_other,
           points_account_id, points_qty, transfer_details, zelle_address,
           points_cost_per_point)
-       VALUES ($1, $2, $3, $4, NOW(), NULL, $5, '', '', NULL, 0, '', '', 0)`,
+       VALUES ($1, $2, $3, $4, NOW(), $6, $5, '', '', NULL, 0, '', '', 0)`,
       [
         amount,
         ch.method,
         paidAtOf(inv),
         ch.reservationPaymentNotes,
         reservationId,
+        ch.createdById,
       ]
     );
     await client.query(
@@ -227,9 +264,53 @@ async function recordReservationPayment(pool, inv, target, out, channel = "mercu
 }
 
 /**
- * Card sale → CRM payment row. Same inserts as Mercury sync, marker nmi:<txn>.
+ * Card sale -> CRM payment row. Same inserts as Mercury sync, marker nmi:<txn>.
  * Notes never carry [Mercury Pay] / [Mercury sync]. Idempotent on the marker.
  */
+function nmiInput({ invoiceNumber, amountUsd, transactionId, paidAt, cardLast4, rep }) {
+  const target = parseInvoiceNumber(invoiceNumber);
+  if (!target || (target.kind !== "hotel" && target.kind !== "reservation")) {
+    return { error: "unrecognized invoice number pattern" };
+  }
+  const amount = Number(amountUsd);
+  if (!Number.isFinite(amount) || !(amount > 0)) return { error: "amount" };
+  return {
+    target,
+    brand: target.kind === "hotel" ? "jrm" : "nesher",
+    inv: {
+      id: String(transactionId || "").trim(),
+      invoiceNumber: String(invoiceNumber || "").trim(),
+      amount,
+      paidAt: paidAt || new Date().toISOString(),
+      cardLast4: /^\d{4}$/.test(String(cardLast4 || "")) ? String(cardLast4) : "",
+      rep: String(rep || "").trim().slice(0, 40),
+    },
+  };
+}
+
+/** The new path's CRM write, shared by live posting and the shadow plan. */
+function nmiWrite({ target, inv }, reviewReason) {
+  return async (client, result) => {
+    if (reviewReason) {
+      result.errors.push(["invoice_transaction_conflict", "invoice_amount_mismatch", "invoice_reference_missing"].includes(reviewReason) ? reviewReason : "review_required");
+      return;
+    }
+    // A transaction imported before the event table existed may already be
+    // recorded under the other brand. Preserve it for review, never copy it.
+    const other = await client.query(target.kind === "hotel"
+      ? `SELECT id FROM core_payment WHERE notes ~ $1 LIMIT 1`
+      : `SELECT id FROM core_jrmhotelpayment WHERE reference ~ $1 LIMIT 1`,
+    [`(^|[[:space:]])nmi:${inv.id}($|[[:space:]])`]);
+    if (other.rows.length) {
+      result.errors.push("legacy_transaction_conflict");
+      return;
+    }
+    if (target.kind === "hotel") await recordHotelPayment(client, inv, target, result, "nmi");
+    else await recordReservationPayment(client, inv, target, result, "nmi", true);
+  };
+}
+
+/** LIVE mode: post a confirmed card payment exactly once (ledger first). */
 export async function recordNmiPaidInvoice({
   pool,
   invoiceNumber,
@@ -237,71 +318,118 @@ export async function recordNmiPaidInvoice({
   transactionId,
   paidAt,
   reviewReason,
+  path,
+  cardLast4,
+  rep,
+} = {}) {
+  const input = nmiInput({ invoiceNumber, amountUsd, transactionId, paidAt, cardLast4, rep });
+  if (input.error) return { ok: false, recorded: [], skipped: [], errors: [input.error] };
+  const { inv, brand } = input;
+  return postConfirmedPayment({
+    pool, invoiceNumber: inv.invoiceNumber, amountUsd: inv.amount, transactionId: inv.id,
+    paidAt: inv.paidAt, brand, path, cardLast4: inv.cardLast4, rep: inv.rep,
+    write: nmiWrite(input, reviewReason),
+  });
+}
+
+/**
+ * SHADOW mode's real writer for the office CRM-ref charge: the 6133cd2 rules
+ * unchanged (LIKE marker, same-amount skip, offer dropped when it does not
+ * belong), plus the rep and last four going forward. No ledger here.
+ */
+export async function recordNmiPaidInvoiceLegacy({
+  pool,
+  invoiceNumber,
+  amountUsd,
+  transactionId,
+  paidAt,
+  cardLast4,
+  rep,
 } = {}) {
   const out = { ok: false, recorded: [], skipped: [], errors: [] };
-  const target = parseInvoiceNumber(invoiceNumber);
-  if (!target || (target.kind !== "hotel" && target.kind !== "reservation")) {
-    out.errors.push("unrecognized invoice number pattern");
+  const input = nmiInput({ invoiceNumber, amountUsd, transactionId, paidAt, cardLast4, rep });
+  if (input.error) {
+    out.errors.push(input.error);
     return out;
   }
-  const amount = Number(amountUsd);
-  if (!Number.isFinite(amount) || !(amount > 0)) {
-    out.errors.push("amount");
-    return out;
+  const inv = { ...input.inv, id: input.inv.id || "unknown" };
+  if (input.target.kind === "hotel") {
+    await recordHotelPayment(pool, inv, input.target, out, "nmi", { strict: false });
+  } else {
+    await recordReservationPayment(pool, inv, input.target, out, "nmi", false, { strict: false });
   }
-  const inv = {
-    id: String(transactionId || "").trim(),
-    invoiceNumber: String(invoiceNumber || "").trim(),
-    amount,
-    paidAt: paidAt || new Date().toISOString(),
-  };
-  return postConfirmedPayment({
-    pool, invoiceNumber: inv.invoiceNumber, amountUsd: amount, transactionId: inv.id,
-    paidAt: inv.paidAt, brand: target.kind === "hotel" ? "jrm" : "nesher",
-    write: async (client, result) => {
-      if (reviewReason) {
-        result.errors.push(["invoice_transaction_conflict", "invoice_amount_mismatch", "invoice_reference_missing"].includes(reviewReason) ? reviewReason : "review_required");
-        return;
-      }
-      // A transaction imported before the event table existed may already be
-      // recorded under the other brand. Preserve it for review, never copy it.
-      const other = await client.query(target.kind === "hotel"
-        ? `SELECT id FROM core_payment WHERE notes ~ $1 LIMIT 1`
-        : `SELECT id FROM core_jrmhotelpayment WHERE reference ~ $1 LIMIT 1`,
-      [`(^|[[:space:]])nmi:${inv.id}($|[[:space:]])`]);
-      if (other.rows.length) {
-        result.errors.push("legacy_transaction_conflict");
-        return;
-      }
-      if (target.kind === "hotel") await recordHotelPayment(client, inv, target, result, "nmi");
-      else await recordReservationPayment(client, inv, target, result, "nmi", true);
-    },
+  out.ok = out.errors.length === 0;
+  return out;
+}
+
+/**
+ * SHADOW mode observer: ledger row + what the new path WOULD post, planned by
+ * the same nmiWrite against a capture client in a READ ONLY transaction.
+ * ev = {invoiceNumber, amountUsd, transactionId, paidAt, path, brand?,
+ * cardLast4?, rep?, decision:{action:'post'|'exception', reason?}}.
+ */
+export async function shadowNmiPayment({ pool, ...ev } = {}) {
+  const input = nmiInput(ev);
+  const brand = input.brand || (["nesher", "jrm"].includes(ev.brand) ? ev.brand : null);
+  if (!brand) return { ok: false, error: "brand_unknown" };
+  const decision = input.error
+    ? { action: "exception", reason: ev.decision?.reason || "no_crm_reference" }
+    : ev.decision || { action: "post" };
+  return observeShadowPayment({
+    pool,
+    ev: { ...ev, brand, decision, amountUsd: Number(ev.amountUsd) },
+    write: input.error ? null : nmiWrite(input, null),
   });
+}
+
+/** LIVE mode exception door (never a CRM write). */
+export async function recordNmiException({ pool, reason, brand, ...ev } = {}) {
+  const input = nmiInput(ev);
+  const b = input.brand || (["nesher", "jrm"].includes(brand) ? brand : null);
+  if (!b) return { ok: false, durable: false, errors: ["brand_unknown"] };
+  return recordPaymentException({ pool, ...ev, brand: b, reason });
 }
 
 /**
  * One sync pass. Never throws for a single bad invoice — collects per-invoice
  * results so one failure cannot stall the rest.
  */
-export async function syncPaidInvoices({ token, pool, fetchImpl }) {
+export async function syncPaidInvoices({ token, pool, fetchImpl, listInvoices }) {
   const rawFetch = fetchImpl || fetch;
   const doFetch = (url, init = {}) =>
     fetchWithTimeout(url, { timeoutMs: 15000, ...init }, rawFetch);
-  const out = { checked: 0, recorded: [], skipped: [], errors: [], at: new Date().toISOString() };
+  const out = { checked: 0, recorded: [], skipped: [], errors: [], at: new Date().toISOString(), source: listInvoices ? "money-seat" : "mercury-api" };
 
-  const t = normalizeToken(token);
-  if (!t) {
-    out.errors.push("MERCURY_TOKEN missing");
-    return out;
+  let invoices;
+  if (typeof listInvoices === "function") {
+    // Plan 17.4: the AR listing read through the money seat's outbound hop
+    // (no tunnel, no inbound port). A failed or partial read is an error for
+    // this cycle, never an empty "nothing paid".
+    try {
+      invoices = await listInvoices();
+    } catch (e) {
+      out.errors.push(`Invoice source failed: ${String(e?.message || e).slice(0, 80)}`);
+      return out;
+    }
+    if (!Array.isArray(invoices)) {
+      out.errors.push("Invoice source failed: invalid");
+      return out;
+    }
+  } else {
+    const t = normalizeToken(token);
+    if (!t) {
+      out.errors.push("MERCURY_TOKEN missing");
+      return out;
+    }
+    const listRes = await doFetch(`${mercuryApiBase()}/ar/invoices`, {
+      headers: { Authorization: `Bearer ${t}`, Accept: "application/json" },
+    });
+    if (!listRes.ok) {
+      out.errors.push(`Mercury list failed: ${listRes.status}`);
+      return out;
+    }
+    invoices = (await listRes.json()).invoices || [];
   }
-  const listRes = await doFetch(`${mercuryApiBase()}/ar/invoices`, {
-    headers: { Authorization: `Bearer ${t}`, Accept: "application/json" },
-  });
-  if (!listRes.ok) {
-    out.errors.push(`Mercury list failed: ${listRes.status}`);
-    return out;
-  }
-  const invoices = (await listRes.json()).invoices || [];
   const paid = invoices.filter(
     (i) => String(i.status || "").toLowerCase() === "paid"
   );
@@ -328,4 +456,28 @@ export async function syncPaidInvoices({ token, pool, fetchImpl }) {
     }
   }
   return out;
+}
+
+/**
+ * The paid-invoice listing through the money seat's hop (plan 17.4). The seat
+ * reads Mercury AR from Joseph's PC with its own token and answers only the
+ * minimal fields; this throws on anything but a clean, complete answer.
+ */
+export async function listInvoicesViaSeat(hop) {
+  if (!hop || typeof hop.read !== "function") throw new Error("seat_unavailable");
+  const r = await hop.read("/invoices");
+  if (!r || r.status !== 200) throw new Error(`seat_${r?.status || "no_answer"}`);
+  let body;
+  try {
+    body = JSON.parse(r.body);
+  } catch {
+    throw new Error("seat_invalid");
+  }
+  if (!body || !Array.isArray(body.invoices) || body.complete !== true) throw new Error("seat_incomplete");
+  const seen = new Set();
+  for (const inv of body.invoices) {
+    if (!inv || typeof inv.id !== "string" || !inv.id || seen.has(inv.id)) throw new Error("seat_bad_invoice");
+    seen.add(inv.id);
+  }
+  return body.invoices;
 }

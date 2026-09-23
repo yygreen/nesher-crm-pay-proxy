@@ -37,6 +37,7 @@ import {
 } from "./nmi-card.js";
 import { parseInvoiceNumber, recordNmiPaidInvoice } from "./payments-sync.js";
 import { loadInvoice } from "./invoice-store.js";
+import { observeSafely } from "./payment-posts.js";
 import {
   loadHotelPayContext,
   loadReservationPayContext,
@@ -467,11 +468,33 @@ export async function chargeOpenPay(opts = {}) {
       httpStatus: httpStatusFor(err),
     };
   }
+  const ev = {
+    path: office ? "office" : "open",
+    invoiceNumber,
+    amountUsd: parsed.amountUsd,
+    transactionId: sale.transactionId,
+    paidAt: opts.now || new Date().toISOString(),
+    brand: brandId,
+    ...(sale.cardLast4 ? { cardLast4: sale.cardLast4 } : {}),
+    ...(staffName ? { rep: staffName } : {}),
+    reason: "no_crm_reference",
+  };
+  await observeSafely(opts.shadowPayment, { ...ev, decision: { action: "exception", reason: ev.reason } });
+  let needsReview = false;
+  if (typeof opts.recordPaymentException === "function") {
+    try {
+      const kept = await opts.recordPaymentException(ev);
+      needsReview = Boolean(kept?.durable);
+    } catch {
+      console.warn("recordPaymentException failed");
+    }
+  }
   return {
     ok: true,
     amountUsd: parsed.amountUsd,
     invoiceNumber,
     transactionId: sale.transactionId || null,
+    ...(needsReview ? { needsReview } : {}),
     httpStatus: 200,
   };
 }
@@ -728,14 +751,25 @@ async function chargeOfficeCrmRef(opts, classified) {
   let crmRecorded = false;
   let crmPending = false;
   if (kind === "hotel" || kind === "reservation") {
-    const record = opts.recordNmiPaidInvoice || recordNmiPaidInvoice;
+    const paidAt = opts.now || new Date().toISOString();
+    await observeSafely(opts.shadowPayment, {
+      path: "office", invoiceNumber, amountUsd: parsed.amountUsd,
+      transactionId: sale.transactionId, paidAt,
+      ...(sale.cardLast4 ? { cardLast4: sale.cardLast4 } : {}),
+      ...(staffName ? { rep: staffName } : {}),
+      decision: { action: "post" },
+    });
+    // live: the ledger poster; shadow: the legacy writer (real CRM write).
+    const record = opts.recordNmiPaidInvoice || opts.recordOfficeCrmPayment || recordNmiPaidInvoice;
     if (typeof record === "function") {
       try {
         const posted = await record({
           invoiceNumber,
           amountUsd: parsed.amountUsd,
           transactionId: sale.transactionId,
-          paidAt: opts.now || new Date().toISOString(),
+          paidAt,
+          ...(sale.cardLast4 ? { cardLast4: sale.cardLast4 } : {}),
+          ...(staffName ? { rep: staffName } : {}),
         });
         crmRecorded = posted?.ok === true;
         crmPending = !crmRecorded;
@@ -782,6 +816,9 @@ export async function chargeOfficePay(opts = {}) {
       appendReservationNote: opts.appendReservationNote,
       appendHotelNote: opts.appendHotelNote,
       recordNmiPaidInvoice: opts.recordNmiPaidInvoice,
+      shadowPayment: opts.shadowPayment,
+      path: "office",
+      ...(rosterStaffName(opts.staffName) ? { staffName: rosterStaffName(opts.staffName) } : {}),
       fetchImpl: opts.fetchImpl,
       privateKey: opts.privateKey,
     });

@@ -13,9 +13,11 @@
 import crypto from "node:crypto";
 import {
   amountsMatch,
+  cardLastFour,
   isShortPayCode,
   recordNmiPaid,
 } from "./nmi-card.js";
+import { observeSafely } from "./payment-posts.js";
 
 export const NMI_WEBHOOK_PATH = "/__nesher_pay/nmi-webhook";
 
@@ -187,12 +189,17 @@ export function parseNmiWebhook(body) {
     const x = Math.round(Number(amountRaw) * 100) / 100;
     return Number.isFinite(x) && x > 0 ? x : null;
   })();
+  const brandHint = String(mdf(inner, 1) || mdf(root, 1) || "").toLowerCase();
+  const rep = String(mdf(inner, 5) || mdf(root, 5) || "").trim();
   return {
     eventType,
     transactionId: transactionId || null,
     orderId: orderId || null,
     amountUsd: amountFixed,
     actionType: String(action?.action_type || inner.action_type || "").toLowerCase(),
+    brand: brandHint === "jrm" || brandHint === "nesher" ? brandHint : null,
+    rep: /^[A-Za-z][A-Za-z .'-]{0,39}$/.test(rep) ? rep : null,
+    cardLast4: cardLastFour(inner) || cardLastFour(inner.card ? { card: inner.card } : null),
   };
 }
 
@@ -231,33 +238,59 @@ export async function applyNmiSaleSuccess(parsed, opts = {}) {
     return { ok: false, error: "store_missing", httpStatus: 503 };
   }
 
-  // Signed successful CRM sales that cannot be assigned to a stored request
-  // are real money, too. Keep them as explicit durable exceptions. A failure
-  // to persist must return 503 so delivery can retry; it is never a new sale.
-  const review = async (reason, ignored) => {
-    if (typeof opts.recordNmiPaidInvoice !== "function" || !/^(?:RES-|JRM-1\d+)/i.test(orderId)) {
-      return { ok: true, ignored };
-    }
-    const posted = await opts.recordNmiPaidInvoice({ invoiceNumber: orderId,
-      amountUsd: parsed.amountUsd, transactionId, paidAt: opts.now || new Date().toISOString(), reviewReason: reason });
-    if (posted?.durable) return { ok: true, ignored, needsReview: posted.state === 'review' };
-    return { ok: false, error: 'exception_recording_failed', httpStatus: 503 };
+  const paidAt = opts.now || new Date().toISOString();
+  const ev = {
+    path: "webhook",
+    invoiceNumber: orderId,
+    amountUsd: parsed.amountUsd,
+    transactionId,
+    paidAt,
+    ...(parsed.brand ? { brand: parsed.brand } : {}),
+    ...(parsed.cardLast4 ? { cardLast4: parsed.cardLast4 } : {}),
+    ...(parsed.rep ? { rep: parsed.rep } : {}),
+  };
+  const crmShaped = /^(?:RES-[A-Za-z0-9_-]+|JRM-1[0-9]+(?:-O[0-9]+)?)$/i.test(orderId);
+  // Signed successful sales that cannot be applied to a stored request are
+  // real money too. The EXCEPTION door keeps them as durable review rows; it
+  // never touches a CRM table, and it is a different door from CRM posting.
+  // A failure to persist returns 503 so NMI redelivers; it is never a new sale.
+  const exception = async (reason, ignored) => {
+    await observeSafely(opts.shadowPayment, { ...ev, decision: { action: "exception", reason } });
+    if (typeof opts.recordPaymentException !== "function") return { ok: true, ignored };
+    const kept = await opts.recordPaymentException({ ...ev, reason });
+    if (kept?.durable) return { ok: true, ignored, needsReview: true };
+    return { ok: false, error: "exception_recording_failed", httpStatus: 503 };
   };
 
   const rows = await opts.findInvoicesByOrderId(orderId);
-  if (!rows || !rows.length) return review('invoice_reference_missing', 'not_found');
+  if (!rows || !rows.length) {
+    if (!crmShaped) return exception("no_crm_reference", "not_found");
+    // A CRM-reference sale (office /pay/office with a RES-/JRM- ref): the
+    // webhook is the second, durable completion path for the same
+    // transaction id, so a lost office response still gets posted, once.
+    await observeSafely(opts.shadowPayment, { ...ev, decision: { action: "post" } });
+    if (typeof opts.recordNmiPaidInvoice !== "function") return { ok: true, ignored: "not_found" };
+    const posted = await opts.recordNmiPaidInvoice({
+      invoiceNumber: orderId, amountUsd: parsed.amountUsd, transactionId, paidAt,
+      ...(parsed.cardLast4 ? { cardLast4: parsed.cardLast4 } : {}),
+      ...(parsed.rep ? { rep: parsed.rep } : {}),
+    });
+    if (posted?.ok) return { ok: true, transactionId, crmRecorded: true, httpStatus: 200 };
+    if (posted?.durable) return { ok: true, transactionId, crmRecorded: false, needsReview: true, httpStatus: 200 };
+    return { ok: false, error: "crm_posting_pending", httpStatus: 503 };
+  }
   const row = pickInvoiceRow(rows, transactionId);
   if (!row || !isShortPayCode(row.id)) return { ok: true, ignored: "not_found" };
   const invoice = row.payload || {};
   if (!amountsMatch(parsed.amountUsd, invoice.amountUsd)) {
-    return review('invoice_amount_mismatch', 'amount_mismatch');
+    return exception("invoice_amount_mismatch", "amount_mismatch");
   }
   const existingTxn = String(invoice.transactionId || "").trim();
   if (invoice.paidAt && existingTxn && existingTxn !== transactionId) {
-    return { ...await review('invoice_transaction_conflict', 'other_txn'), already: true };
+    return { ...await exception("invoice_transaction_conflict", "other_txn"), already: true };
   }
+  await observeSafely(opts.shadowPayment, { ...ev, rep: ev.rep || invoice.staffName || undefined, decision: { action: "post" } });
 
-  const paidAt = opts.now || new Date().toISOString();
   if (!invoice.paidAt) {
     if (typeof opts.claimInvoicePaid !== "function") {
       return { ok: false, error: "store_missing", httpStatus: 503 };
@@ -284,6 +317,8 @@ export async function applyNmiSaleSuccess(parsed, opts = {}) {
     appendReservationNote: opts.appendReservationNote,
     appendHotelNote: opts.appendHotelNote,
     recordNmiPaidInvoice: opts.recordNmiPaidInvoice,
+    ...(parsed.cardLast4 ? { cardLast4: parsed.cardLast4 } : {}),
+    ...(parsed.rep ? { rep: parsed.rep } : {}),
   });
   if (recorded.ok === false) {
     if (recorded.durable && recorded.postingState === 'review') {

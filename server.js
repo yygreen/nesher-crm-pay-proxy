@@ -97,8 +97,21 @@ import {
   appendHotelNote,
   appendReservationNote,
 } from "./db.js";
-import { syncPaidInvoices, recordNmiPaidInvoice } from "./payments-sync.js";
-import { retryPaymentPosts, listPaymentPostExceptions } from "./payment-posts.js";
+import {
+  syncPaidInvoices,
+  recordNmiPaidInvoice,
+  recordNmiPaidInvoiceLegacy,
+  shadowNmiPayment,
+  recordNmiException,
+  listInvoicesViaSeat,
+} from "./payments-sync.js";
+import {
+  retryPaymentPosts,
+  listPaymentPostExceptions,
+  postingMode,
+  shadowReport,
+} from "./payment-posts.js";
+import { runNmiRecovery } from "./nmi-recovery.js";
 import { validateStaffSession, extractSessionId } from "./auth.js";
 import {
   buildReservationDraft,
@@ -134,6 +147,44 @@ import {
 } from "./whatsapp-webhook.js";
 
 const PORT = Number(process.env.PORT || 8080);
+
+// ── Money posting mode (plan 17.3): "shadow" unless MONEY_POSTING_MODE is
+// exactly "live". Shadow: the legacy writers keep every real CRM write; the
+// new path runs on every confirmed event and writes ONLY its ledger table
+// (nesher_money_payment_posts) with what it WOULD post. Live: the ledger
+// poster owns the CRM write, exactly once per transaction id.
+const POSTING_MODE = postingMode();
+const shadowStats = { observed: 0, planned: 0, errors: 0, lastAt: null, lastError: null };
+function moneyDoors(path) {
+  if (POSTING_MODE === "live") {
+    return {
+      recordNmiPaidInvoice: (args) => recordNmiPaidInvoice({ pool: getPool(), path, ...args }),
+      recordPaymentException: (ev) => recordNmiException({ pool: getPool(), path, ...ev }),
+    };
+  }
+  return {
+    // the office CRM-ref charge's real writer, the 6133cd2 rules
+    recordOfficeCrmPayment: (args) => recordNmiPaidInvoiceLegacy({ pool: getPool(), ...args }),
+    shadowPayment: async (ev) => {
+      try {
+        const r = await shadowNmiPayment({ pool: getPool(), ...ev, path: ev.path || path });
+        shadowStats.lastAt = new Date().toISOString();
+        if (r?.ok) {
+          shadowStats.observed++;
+          if (r.inserted) shadowStats.planned++;
+        } else {
+          shadowStats.errors++;
+          shadowStats.lastError = String(r?.error || "observe_failed").slice(0, 60);
+        }
+        return r;
+      } catch (e) {
+        shadowStats.errors++;
+        shadowStats.lastError = "observe_threw";
+        throw e;
+      }
+    },
+  };
+}
 
 // One id per running process, minted at boot. The card reader holds a card in
 // THIS process's memory for five minutes, which is only correct while one
@@ -1228,8 +1279,7 @@ const server = http.createServer(async (req, res) => {
             loadReservationPayContextByCode,
             loadCustomerPayContext,
             loadCustomerPayTarget,
-            recordNmiPaidInvoice: (args) =>
-              recordNmiPaidInvoice({ pool: getPool(), ...args }),
+            ...moneyDoors("office"),
           })
         : await chargeOpenPay({
             paymentToken:
@@ -1247,6 +1297,7 @@ const server = http.createServer(async (req, res) => {
             email: openBody.email || "",
             kind: "open",
             brandId: openBrand === "jrm" ? "jrm" : "nesher",
+            ...moneyDoors("open"),
           });
       if (openResult.ok) {
         sendJson(res, 200, {
@@ -1310,7 +1361,7 @@ const server = http.createServer(async (req, res) => {
       claimNmiNote,
       appendHotelNote,
       appendReservationNote,
-      recordNmiPaidInvoice: (args) => recordNmiPaidInvoice({ pool: getPool(), ...args }),
+      ...moneyDoors("guest"),
     });
     if (result.ok) {
       sendJson(res, 200, {
@@ -1367,6 +1418,33 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Shadow comparison report (read-only, key-gated, never a CRM write).
+  if (url.pathname === "/__nesher_pay/posting-shadow") {
+    if (req.method !== "GET") { sendJson(res, 405, { error: "GET only" }); return; }
+    const want = String(process.env.MONEY_POSTING_REPORT_KEY || "");
+    const given = String(req.headers["x-report-key"] || "");
+    if (want.length < 32) { sendJson(res, 503, { ok: false, error: "report_key_not_configured" }); return; }
+    if (given.length !== want.length || !crypto.timingSafeEqual(Buffer.from(given), Buffer.from(want))) {
+      sendJson(res, 401, { ok: false, error: "report_key" });
+      return;
+    }
+    try {
+      const limit = Number(url.searchParams.get("limit") || 200);
+      const report = await shadowReport({ pool: getPool(), limit });
+      sendJson(res, 200, {
+        ok: true,
+        mode: POSTING_MODE,
+        at: new Date().toISOString(),
+        shadow: shadowStats,
+        recovery: lastNmiRecovery,
+        ...report,
+      });
+    } catch {
+      sendJson(res, 503, { ok: false, error: "shadow_report_unavailable" });
+    }
+    return;
+  }
+
   if (url.pathname === "/__nesher_pay/posting-exceptions") {
     if (req.method !== "GET") { sendJson(res, 405, { error: "GET only" }); return; }
     if (!(await requireStaff(req, res))) return;
@@ -1383,7 +1461,7 @@ const server = http.createServer(async (req, res) => {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-09-23-money-posting",
+      build: "2026-09-23-collect-shadow",
       instance: INSTANCE_ID,
       snapEngage: {
         enabled: SNAPENGAGE_ENABLED,
@@ -1398,9 +1476,14 @@ const server = http.createServer(async (req, res) => {
             recorded: lastPaySync.recorded.length,
             skipped: lastPaySync.skipped.length,
             errors: lastPaySync.errors.length,
+            source: lastPaySync.source || null,
+            lastSuccessAt: lastPaySyncSuccessAt,
           }
         : null,
       paymentPosting: lastPaymentPosting,
+      postingMode: POSTING_MODE,
+      postingShadow: POSTING_MODE === "shadow" ? shadowStats : null,
+      nmiRecovery: lastNmiRecovery,
       hasMercury: Boolean(
         process.env.MERCURY_TOKEN_NESHER || process.env.MERCURY_TOKEN
       ),
@@ -1481,7 +1564,7 @@ const server = http.createServer(async (req, res) => {
         claimNmiNote,
         appendHotelNote,
         appendReservationNote,
-        recordNmiPaidInvoice: (args) => recordNmiPaidInvoice({ pool: getPool(), ...args }),
+        ...moneyDoors("webhook"),
       });
       if (result.ok === false) {
         sendJson(res, result.httpStatus || 503, {
@@ -1761,23 +1844,73 @@ async function runPaymentPosting() {
     paymentPostingBusy = false;
   }
 }
-if (process.env.DATABASE_URL || process.env.DATABASE_PUBLIC_URL) {
+if (POSTING_MODE === "live" && (process.env.DATABASE_URL || process.env.DATABASE_PUBLIC_URL)) {
   setTimeout(runPaymentPosting, 10 * 1000).unref();
   setInterval(runPaymentPosting, 60 * 1000).unref();
 }
 
+// ── NMI recovery sweep (plan 16.2): READ ONLY query.php over the last days,
+// each processor-confirmed transaction handed to the doors of this mode.
+// First sweep reaches back 45 days, then every 15 minutes over 3 days.
+let lastNmiRecovery = null;
+let nmiRecoveryBusy = false;
+async function runNmiRecoverySweep(days) {
+  if (nmiRecoveryBusy) return;
+  nmiRecoveryBusy = true;
+  try {
+    const doors = moneyDoors("recovery");
+    const out = await runNmiRecovery({
+      host: process.env.NMI_HOST || "https://pinpointpayments.transactiongateway.com",
+      securityKey: process.env.NMI_PRIVATE_KEY || "",
+      days,
+      mode: POSTING_MODE,
+      observe: doors.shadowPayment,
+      post: doors.recordNmiPaidInvoice,
+      except: doors.recordPaymentException,
+    });
+    lastNmiRecovery = out;
+  } catch (e) {
+    const msg = String(e?.message || "failed");
+    lastNmiRecovery = {
+      at: new Date().toISOString(),
+      mode: POSTING_MODE,
+      errors: 1,
+      error: /^nmi_query_[a-z_0-9]+$/.test(msg) ? msg : "sweep_failed",
+    };
+    console.warn("nmi recovery sweep failed:", lastNmiRecovery.error);
+  } finally {
+    nmiRecoveryBusy = false;
+  }
+}
+if (
+  process.env.NMI_PRIVATE_KEY &&
+  (process.env.DATABASE_URL || process.env.DATABASE_PUBLIC_URL) &&
+  process.env.NMI_RECOVERY !== "off"
+) {
+  setTimeout(() => runNmiRecoverySweep(45), 60 * 1000).unref();
+  setInterval(() => runNmiRecoverySweep(3), 15 * 60 * 1000).unref();
+}
+
 let lastPaySync = null;
+let lastPaySyncSuccessAt = null;
 let paySyncBusy = false;
 
 async function runPaySync(trigger) {
   if (paySyncBusy) return lastPaySync || { skippedRun: "busy" };
   paySyncBusy = true;
   try {
+    // Plan 17.4: the home-PC quick tunnel behind MERCURY_API_BASE died
+    // 22 Sep ~08:24Z and Joseph ruled no tunnel on his PC. When the money
+    // seat is connected, the AR listing comes through its outbound hop.
+    const hop = moneyHop.health();
+    const viaSeat = hop.configured && hop.online;
     const out = await syncPaidInvoices({
       token: process.env.MERCURY_TOKEN_NESHER || process.env.MERCURY_TOKEN,
       pool: getPool(),
+      ...(viaSeat ? { listInvoices: () => listInvoicesViaSeat(moneyHop) } : {}),
     });
     lastPaySync = out;
+    if (!out.errors.length) lastPaySyncSuccessAt = out.at;
     if (out.recorded.length || out.errors.length) {
       console.log(
         `pay-sync (${trigger}): recorded=${JSON.stringify(out.recorded)} errors=${JSON.stringify(out.errors)}`
