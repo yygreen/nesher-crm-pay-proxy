@@ -16,15 +16,15 @@ import {
   brandFromKind,
   guestPayOrigin,
   guestCardMessage,
-  deleteVaultCustomer,
 } from "./nmi-card.js";
 import {
   OCR_PATH,
+  cardHoldCount,
   handleOcrRequest,
   isOcrPath,
   ocrEnabled,
   ocrSecret,
-  startCardRefSweeper,
+  startCardHoldSweeper,
 } from "./ocr-card.js";
 import { sharedEnginePool } from "./ocr-engine.js";
 import {
@@ -133,6 +133,13 @@ import {
 } from "./whatsapp-webhook.js";
 
 const PORT = Number(process.env.PORT || 8080);
+
+// One id per running process, minted at boot. The card reader holds a card in
+// THIS process's memory for five minutes, which is only correct while one
+// container answers; health reports this so that stays provable from outside:
+// poll /__nesher_pay/health and every answer must carry the same instance.
+// It is random, so it names nothing and leaks nothing.
+const INSTANCE_ID = crypto.randomBytes(6).toString("hex");
 const UPSTREAM =
   process.env.CRM_UPSTREAM ||
   "https://nesher-crm-production.up.railway.app";
@@ -1362,7 +1369,8 @@ const server = http.createServer(async (req, res) => {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-09-23-ocr-hop",
+      build: "2026-09-23-card-hold",
+      instance: INSTANCE_ID,
       snapEngage: {
         enabled: SNAPENGAGE_ENABLED,
         widgetId: SNAPENGAGE_WIDGET_ID,
@@ -1404,6 +1412,9 @@ const server = http.createServer(async (req, res) => {
         ready: ocrPool ? ocrPool.ready : false,
         error: ocrPool ? ocrPool.error : null,
         refundCapSet: refundCapCents() > 0,
+        // The one-time card references this process is holding right now.
+        // A count, never a reference and never a card.
+        holds: cardHoldCount(),
       },
     });
     return;
@@ -1714,9 +1725,7 @@ if (ocrEnabled()) {
     .warm()
     .then(() => console.log(`ocr engine ready workers=${ocrPool.size}`))
     .catch((e) => console.error("ocr engine warm failed:", e.message));
-  startCardRefSweeper({
-    deleteVault: (id) => deleteVaultCustomer({ customerVaultId: id }),
-  });
+  startCardHoldSweeper();
 } else {
   console.log("ocr route disabled: OCR_TICKET_SECRET not set");
 }

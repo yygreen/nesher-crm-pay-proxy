@@ -13,8 +13,9 @@
  *   PSM single block, then a sparse-text second pass at the found rotation ->
  *   candidates = 13..19 digit runs that pass Luhn and a known brand range ->
  *   vote across variants -> confidence high / low -> expiry + name from one
- *   text pass -> gateway tokenization (validate + customer vault, no funds) ->
- *   purge (every Buffer this process holds is overwritten with zeros).
+ *   text pass -> a server-side hold (this process, in memory, five minutes,
+ *   single use, bound to the rep) -> purge (every Buffer this process holds
+ *   is overwritten with zeros).
  *
  * What the response carries: brand, last four, expiry, name, confidence and a
  * one-time card reference that chargeCardRef / chargeWithToken can spend once.
@@ -26,20 +27,41 @@
  * PCI (13.8): this route is what puts the pay-proxy in SAQ D scope. Same host
  * that already holds NMI_PRIVATE_KEY, so the scope does not widen.
  *
+ * THE HOLD (13.3.6, rebuilt 23 Sep 2026). The spec asked for "the gateway's
+ * tokenization endpoint (Collect.js public key, server side)", which does not
+ * exist: Collect.js is a browser flow and the public key does not
+ * authenticate a server call. The first build used a gateway Customer Vault
+ * record instead. That is now removed, for two reasons and not one:
+ *   1. Joseph declined the Customer Vault value-added service on 2026-09-08
+ *      over its fee ($10 + $40/month + $0.40 a transaction), and the reader
+ *      itself is "7.2 free" - no paid add-on may be on its critical path.
+ *   2. It was never proved that this merchant can vault at all.
+ * So the reference this route hands back is OURS, and it costs nothing: the
+ * number stays in THIS PROCESS, in a Buffer, in a Map, for five minutes at
+ * most, spendable exactly once, by the one rep who uploaded the photo, and
+ * only together with a charge ticket that is signed over that same reference.
+ * Nothing is written to disk, to Postgres or to any backup, and the number
+ * never reaches the gateway until the rep actually charges the card.
+ *
  * Honest limits, stated once here and in the bundle:
  *  - JS strings are immutable: OCR text and the PAN string are dropped and
- *    become unreachable; only Buffers can be, and are, zeroed.
+ *    become unreachable; only Buffers can be, and are, zeroed. The hold keeps
+ *    the number as a Buffer precisely so it CAN be zeroed, on every path.
+ *  - At the moment of the charge the number must become a string to be put in
+ *    the JSON the gateway expects. That string is unreachable one tick later
+ *    and cannot be zeroed. This is the same limit every Node merchant server
+ *    has, and it is why the hold's life is five minutes and one use.
  *  - The tesseract worker thread receives a structured-clone copy of each
  *    variant and frees it after the job; that copy is not zeroed by us.
- *  - The gateway's public tokenization key (Collect.js) cannot tokenize from
- *    a server, so the "short-lived tokenized reference" (13.3.6) is a
- *    Customer Vault record created by POST /api/v5/payments/validate with
- *    add_to_vault (no funds move), deleted after the sale or after
- *    CARD_REF_TTL_MS by the sweeper.
+ *  - The store is in memory, so it belongs to one container. This service
+ *    runs one replica (Railway numReplicas unset), and health reports an
+ *    `instance` id so that stays provable. If it were ever scaled out, a
+ *    reference minted on one replica and presented to another is simply
+ *    unknown - 410, "take the photo again". It fails closed, never open.
  */
 
 import crypto from "node:crypto";
-import { NMI_HOST, chargeWithToken, deleteVaultCustomer } from "./nmi-card.js";
+import { chargeWithToken } from "./nmi-card.js";
 
 export const OCR_PATH = "/__nesher_pay/ocr";
 export const OCR_TICKET_SECRET_NAME = "OCR_TICKET_SECRET";
@@ -48,7 +70,8 @@ export const OCR_TICKET_TTL_MS = 5 * 60 * 1000;
 export const OCR_MAX_SIDE = 1600;
 /** Soft budget for the recognize passes (13.6 target is 3 s photo to tile). */
 export const OCR_DEADLINE_MS = 2600;
-export const CARD_REF_TTL_MS = 15 * 60 * 1000;
+/** The hold's whole life. Five minutes, the same hard cap as a ticket. */
+export const CARD_HOLD_TTL_MS = 5 * 60 * 1000;
 export const VARIANT_NAMES = ["stretch", "adaptive", "inverted", "unsharp"];
 /** 13.6: 180 and 270 are the first to drop, so they run last. */
 export const ROTATION_LADDER = [0, 90, 270, 180];
@@ -665,171 +688,103 @@ export async function recognizeCard(input, opts = {}) {
   });
 }
 
-// ── gateway token reference (13.3.6) ───────────────────────────────────────
+// ── the hold: our own one-time card reference (13.3.6) ─────────────────────
 
-/** ref -> { customerVaultId, brand, last4, expiry, expiresAt } */
-const cardRefs = new Map();
+/**
+ * ref -> { pan: Buffer, expMMYY, brand, last4, expiry, rep, expiresAt }
+ * In this process only. The number is a Buffer so it can be zeroed; nothing
+ * here is ever written to disk, to Postgres, to a log or to a response.
+ */
+const cardHolds = new Map();
 
-export function registerCardRef(entry, { now = Date.now(), ttlMs = CARD_REF_TTL_MS } = {}) {
-  const ref = "cr_" + crypto.randomBytes(18).toString("base64url");
-  cardRefs.set(ref, {
-    customerVaultId: String(entry.customerVaultId || ""),
-    brand: entry.brand || null,
-    last4: entry.last4 || null,
+/** Overwrite the number in place. Safe to call twice. */
+export function zeroHold(entry) {
+  if (entry && entry.pan && typeof entry.pan.fill === "function") entry.pan.fill(0);
+  return entry;
+}
+
+/**
+ * Put a read card behind an opaque one-time reference.
+ * 24 random bytes = 192 bits: the reference cannot be guessed, and on its own
+ * it is worthless - spending it also needs a charge ticket signed over it.
+ */
+export function registerCardHold(entry, { now = Date.now(), ttlMs = CARD_HOLD_TTL_MS } = {}) {
+  const number = String(entry.pan || "");
+  if (!/^\d{12,19}$/.test(number)) return { ok: false, error: "pan_invalid" };
+  const rep = String(entry.rep || "").trim();
+  if (!rep) return { ok: false, error: "rep_required" };
+  const expMMYY = expiryToMMYY(entry.expiry);
+  if (!expMMYY) return { ok: false, error: "expiry_unknown" };
+  const life = Math.min(Number(ttlMs) || CARD_HOLD_TTL_MS, CARD_HOLD_TTL_MS);
+  const expiresAt = now + life;
+  const ref = "cr_" + crypto.randomBytes(24).toString("base64url");
+  cardHolds.set(ref, {
+    pan: Buffer.from(number, "latin1"),
+    expMMYY,
+    brand: entry.brand || brandOf(number),
+    last4: number.slice(-4),
     expiry: entry.expiry || null,
-    expiresAt: now + ttlMs,
+    rep,
+    expiresAt,
   });
-  return { ref, expiresAt: now + ttlMs };
+  return { ok: true, ref, expiresAt };
 }
 
-/** Spend the reference. Second call returns null. */
-export function redeemCardRef(ref, { now = Date.now() } = {}) {
-  const e = cardRefs.get(String(ref || ""));
-  if (!e) return null;
-  cardRefs.delete(String(ref));
-  if (e.expiresAt <= now) return null;
-  return { ...e };
+/**
+ * Spend the hold. ONE presentation is the whole life of a reference: it is
+ * removed from the store before anything else is checked, so a wrong rep or a
+ * late arrival cannot be retried and cannot be used to probe the store. On
+ * every refusal the number is zeroed here, before returning.
+ */
+export function redeemCardHold(ref, { now = Date.now(), rep } = {}) {
+  const key = String(ref || "");
+  const e = cardHolds.get(key);
+  if (!e) return { ok: false, error: "unknown" };
+  cardHolds.delete(key);
+  if (e.expiresAt <= now) {
+    zeroHold(e);
+    return { ok: false, error: "expired" };
+  }
+  if (rep !== undefined && String(rep || "") !== e.rep) {
+    zeroHold(e);
+    return { ok: false, error: "rep_mismatch" };
+  }
+  return { ok: true, entry: e };
 }
 
-export function cardRefCount() {
-  return cardRefs.size;
+export function cardHoldCount() {
+  return cardHolds.size;
 }
 
-/** Drop expired references; the gateway record goes with each one (best effort). */
-export async function sweepCardRefs({ now = Date.now(), deleteVault } = {}) {
-  const gone = [];
-  for (const [ref, e] of cardRefs) {
+/** Zero and drop every hold whose five minutes are up. */
+export function sweepCardHolds({ now = Date.now() } = {}) {
+  let n = 0;
+  for (const [ref, e] of cardHolds) {
     if (e.expiresAt <= now) {
-      cardRefs.delete(ref);
-      gone.push(e.customerVaultId);
+      cardHolds.delete(ref);
+      zeroHold(e);
+      n += 1;
     }
   }
-  if (typeof deleteVault === "function") {
-    for (const id of gone) {
-      try {
-        await deleteVault(id);
-      } catch {
-        /* best effort; the vault record expires with nothing attached */
-      }
-    }
-  }
-  return gone.length;
+  return n;
 }
 
-export function startCardRefSweeper({ intervalMs = 60 * 1000, deleteVault } = {}) {
+export function startCardHoldSweeper({ intervalMs = 30 * 1000 } = {}) {
   const timer = setInterval(() => {
-    sweepCardRefs({ deleteVault }).catch(() => {});
+    try {
+      sweepCardHolds();
+    } catch {
+      /* the sweeper never takes the process down */
+    }
   }, intervalMs);
   if (typeof timer.unref === "function") timer.unref();
   return () => clearInterval(timer);
 }
 
 export function _resetCardRefsForTests() {
-  cardRefs.clear();
+  for (const e of cardHolds.values()) zeroHold(e);
+  cardHolds.clear();
   usedTickets.clear();
-}
-
-/**
- * Validate (no funds) + add to the Customer Vault under an id we choose, so
- * the number leaves this process and only a one-time reference stays.
- * v5 shapes from the published OpenAPI: payment_details.card_number /
- * card_exp (MMYY), customer_vault.add_to_vault + id, response.response "1",
- * response.customer_vault_id.
- */
-export async function tokenizeCard({ pan, expiry, name, fetchImpl, privateKey, now = Date.now() } = {}) {
-  const number = String(pan || "");
-  const mmyy = expiryToMMYY(expiry);
-  const key = String(privateKey ?? process.env.NMI_PRIVATE_KEY ?? "").trim();
-  if (!number) return { ok: false, error: "pan_required" };
-  if (!mmyy) return { ok: false, error: "expiry_unknown" };
-  if (!key) return { ok: false, error: "keys_missing" };
-  const vaultId = "ocr-" + crypto.randomBytes(10).toString("hex");
-  const parts = String(name || "").trim().split(/\s+/).filter(Boolean);
-  const body = {
-    payment_details: { card_number: number, card_exp: mmyy },
-    customer_vault: { add_to_vault: true, id: vaultId },
-    billing_address: {
-      first_name: (parts[0] || "Card").slice(0, 50),
-      last_name: (parts.slice(1).join(" ") || "Holder").slice(0, 50),
-    },
-  };
-  const doFetch = fetchImpl || fetch;
-  let res;
-  let text = "";
-  try {
-    res = await doFetch(`${NMI_HOST}/api/v5/payments/validate`, {
-      method: "POST",
-      headers: {
-        Authorization: key,
-        Accept: "application/json",
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(body),
-    });
-    text = await res.text();
-  } catch {
-    return { ok: false, error: "gateway_unreachable" };
-  }
-  let json = {};
-  try {
-    json = JSON.parse(text);
-  } catch {
-    json = {};
-  }
-  const approved = String(json.response ?? "") === "1";
-  if (!res.ok || !approved) {
-    return {
-      ok: false,
-      error: res.ok ? "validate_declined" : `validate_http_${res.status}`,
-      responseCode: json.response_code ? String(json.response_code) : null,
-    };
-  }
-  const gotId = String(json.customer_vault_id || vaultId);
-  const brand = brandOf(number);
-  const reg = registerCardRef(
-    { customerVaultId: gotId, brand, last4: number.slice(-4), expiry },
-    { now }
-  );
-  return { ok: true, ref: reg.ref, expiresAt: reg.expiresAt };
-}
-
-/**
- * Spend a card reference once: sale from the vault record, then delete it.
- * Not wired to any route in this ship (the charge tile is plan Phase 1.3).
- */
-export async function chargeCardRef(opts = {}) {
-  const entry = redeemCardRef(opts.ref, { now: opts.now });
-  if (!entry) return { ok: false, error: "card_ref_invalid", httpStatus: 410 };
-  let sale;
-  try {
-    sale = await chargeWithToken({
-      ...opts,
-      paymentToken: "",
-      customerVaultId: entry.customerVaultId,
-    });
-  } finally {
-    try {
-      await deleteVaultCustomer({
-        customerVaultId: entry.customerVaultId,
-        fetchImpl: opts.fetchImpl,
-        privateKey: opts.privateKey,
-      });
-    } catch {
-      /* best effort */
-    }
-  }
-  return {
-    ok: Boolean(sale && sale.ok),
-    error: sale && sale.error ? sale.error : null,
-    message: sale && sale.message ? sale.message : null,
-    transactionId: sale && sale.transactionId ? sale.transactionId : null,
-    brand: sale && sale.brand ? sale.brand : null,
-    processorId: sale && sale.processorId ? sale.processorId : null,
-    cardBrand: entry.brand,
-    last4: entry.last4,
-    expiry: entry.expiry,
-    amountUsd: sale && sale.amountUsd ? sale.amountUsd : null,
-  };
 }
 
 // ── request body ───────────────────────────────────────────────────────────
@@ -1068,14 +1023,17 @@ export async function handleOcrRequest(req, res, deps = {}) {
     return;
   }
 
-  const token2 = await tokenizeCard({
-    pan: result.pan,
-    expiry: result.expiry,
-    name: result.name,
-    fetchImpl: deps.fetchImpl,
-    privateKey: deps.privateKey,
-    now: clock(),
-  });
+  // The hold is ours and local: no gateway call, no add-on, no cost, and the
+  // number does not leave this process until the rep charges the card.
+  const held = registerCardHold(
+    {
+      pan: result.pan,
+      expiry: result.expiry,
+      brand: result.brand,
+      rep: ticket.repId,
+    },
+    { now: clock() }
+  );
   result.pan = null;
   delete result.pan;
 
@@ -1093,14 +1051,14 @@ export async function handleOcrRequest(req, res, deps = {}) {
     rotation: result.rotation,
     // One name for the reference at both ends of the flow: what this route
     // hands out is exactly what POST /__nesher_pay/charge takes as token_ref.
-    token_ref: token2.ok ? token2.ref : null,
-    token_ref_expires_at: token2.ok ? new Date(token2.expiresAt).toISOString() : null,
-    token_ref_error: token2.ok ? null : token2.error,
+    token_ref: held.ok ? held.ref : null,
+    token_ref_expires_at: held.ok ? new Date(held.expiresAt).toISOString() : null,
+    token_ref_error: held.ok ? null : held.error,
     ocrMs: result.ms,
     passes: result.passes,
   };
   done(200, body, {
     ...fields,
-    outcome: `ok:${result.confidence}${token2.ok ? "" : ":" + token2.error}`,
+    outcome: `ok:${result.confidence}${held.ok ? "" : ":" + held.error}`,
   });
 }

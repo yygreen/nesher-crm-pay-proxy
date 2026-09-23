@@ -13,9 +13,11 @@ import {
   handleVoidRequest,
   handleRefundRequest,
 } from "../card-charge.js";
-import { mintTicket, mintOcrTicket, registerCardRef, redeemCardRef, _resetCardRefsForTests } from "../ocr-card.js";
+import { mintTicket, mintOcrTicket, registerCardHold, redeemCardHold, CARD_HOLD_TTL_MS, _resetCardRefsForTests } from "../ocr-card.js";
 
 const SECRET = "test-ocr-secret-0123456789abcdef";
+const PAN = "4539578763621486"; // synthetic, Luhn-valid, Visa range
+const CVV = "731";
 
 function gatewayMock(script = {}) {
   const calls = [];
@@ -57,7 +59,14 @@ async function post(url, path, token, body) {
 }
 
 function newRef(over = {}) {
-  return registerCardRef({ customerVaultId: "ocr-vault-1", brand: "visa", last4: "1486", expiry: "10/29", ...over }).ref;
+  const h = registerCardHold({ pan: PAN, expiry: "10/29", brand: "visa", rep: "sruly", ...over });
+  assert.equal(h.ok, true, "the hold must mint for the test to mean anything");
+  return h.ref;
+}
+
+/** Everything the doors said, in one string, so "never logged" can be asserted. */
+function everythingSaid(door, ...responses) {
+  return [...door.logs, ...responses.map((r) => (r && r.text) || "")].join("\n");
 }
 
 describe("card-charge basics", () => {
@@ -129,13 +138,13 @@ describe("POST /__nesher_pay/charge", () => {
       assert.equal(p.status, 401);
       assert.equal(p.body.error, "ticket_used");
       assert.equal(calls.length, 0, "the gateway never heard from us");
-      assert.ok(redeemCardRef(ref), "the card ref was not spent by refused calls");
+      assert.equal(redeemCardHold(ref, { rep: "sruly" }).ok, true, "the hold was not spent by refused calls");
     } finally {
       await s.close();
     }
   });
 
-  it("JRM charge: vault sale on mav2083, AVS along, never payment_descriptor, vault record deleted after, response shape", async () => {
+  it("JRM charge: held card sold on mav2083 with the typed cvv, AVS along, never payment_descriptor, response shape", async () => {
     const { fetchImpl, calls } = gatewayMock();
     const s = await startDoor(handleChargeRequest, { secret: SECRET, fetchImpl, privateKey: "k-live-never" });
     try {
@@ -143,21 +152,24 @@ describe("POST /__nesher_pay/charge", () => {
       const t = mintTicket({ kind: "charge", repId: "sruly", bind: ref, secret: SECRET });
       const p = await post(s.url, CHARGE_PATH, t.token, {
         token_ref: ref, amount_cents: 123456, currency: "usd", brand: "jrm", rep: "sruly", customer_name: "Avrohom Cohen",
+        cvv: CVV,
         invoice_ref: "JRM-189-O50", note: "2 nights", address1: "12 Main St", city: "Monsey", state: "NY", zip: "10952", country: "US",
       });
       assert.equal(p.status, 200, p.text);
       assert.deepEqual(p.body, {
         ok: true, txn_id: "txn-100", brand: "jrm", last4: "1486", card_brand: "visa", amount_cents: 123456, currency: "USD",
-        processor_id: "mav2083", auth_code: "OK123", avs: "Y", cvv: "M", order_id: "JRM-189-O50",
+        processor_id: "mav2083", auth_code: "OK123", avs: "Y", cvv: "M", cvv_sent: true, order_id: "JRM-189-O50",
       });
-      assert.equal(calls.length, 2);
+      assert.equal(calls.length, 1, "one gateway call: the sale, and nothing else");
       const sale = calls[0];
       assert.match(sale.url, /\/api\/v5\/payments\/sale$/);
       assert.equal(sale.auth, "k-live-never");
       assert.equal(sale.body.amount, "1234.56");
       assert.equal(sale.body.processor_id, "mav2083");
-      assert.deepEqual(sale.body.customer_vault, { id: "ocr-vault-1" });
-      assert.equal(sale.body.payment_details, undefined);
+      // The held number and expiry, and the code the rep typed, all on this
+      // one call and nowhere else.
+      assert.deepEqual(sale.body.payment_details, { card_number: PAN, card_exp: "1029", card_cvv: CVV });
+      assert.equal(sale.body.customer_vault, undefined, "no paid add-on on the path");
       assert.equal(sale.body.payment_descriptor, undefined);
       assert.equal(sale.body.billing_address.address1, "12 Main St");
       assert.equal(sale.body.billing_address.zip, "10952");
@@ -165,15 +177,158 @@ describe("POST /__nesher_pay/charge", () => {
       assert.equal(sale.body.merchant_defined_fields.field_1, "jrm");
       assert.equal(sale.body.merchant_defined_fields.field_5, "sruly");
       assert.equal(sale.body.merchant_defined_fields.field_6, "2 nights");
-      assert.equal(calls[1].method, "DELETE");
-      assert.match(calls[1].url, /\/api\/v5\/customers\/ocr-vault-1$/);
-      assert.equal(redeemCardRef(ref), null, "ref spent");
+      assert.equal(redeemCardHold(ref, { rep: "sruly" }).error, "unknown", "hold spent");
       assert.equal(s.logs.length, 1);
       const line = JSON.parse(s.logs[0].replace(/^charge /, ""));
-      assert.deepEqual(line, { method: "POST", ticket: t.ticketId, outcome: "approved", ms: line.ms, brand: "jrm", amount_cents: 123456, txn: "txn-100" });
-      assert.equal(s.logs[0].includes("ocr-vault-1"), false);
-      assert.equal(s.logs[0].includes(ref), false);
-      assert.equal(s.logs[0].includes("Cohen"), false);
+      assert.deepEqual(line, { method: "POST", ticket: t.ticketId, outcome: "approved", ms: line.ms, brand: "jrm", amount_cents: 123456, txn: "txn-100", cvv_sent: true });
+      // Neither the number, nor the code, nor the reference, nor the guest.
+      const said = everythingSaid(s, p);
+      for (const secretish of [PAN, CVV, ref, "Cohen", "4539 5787"]) {
+        assert.equal(said.includes(secretish), false, `never said: ${secretish.slice(0, 4)}...`);
+      }
+      assert.doesNotMatch(said, /\d{13,19}/, "no card-length digit run anywhere");
+    } finally {
+      await s.close();
+    }
+  });
+
+  it("cvv is optional: without one the sale still goes, and the answer says so", async () => {
+    const { fetchImpl, calls } = gatewayMock();
+    const s = await startDoor(handleChargeRequest, { secret: SECRET, fetchImpl, privateKey: "k" });
+    try {
+      const ref = newRef();
+      const t = mintTicket({ kind: "charge", repId: "sruly", bind: ref, secret: SECRET });
+      const p = await post(s.url, CHARGE_PATH, t.token, { token_ref: ref, amount_cents: 2500, brand: "jrm", rep: "sruly", customer_name: "Guest" });
+      assert.equal(p.status, 200, p.text);
+      assert.equal(p.body.ok, true);
+      assert.equal(p.body.cvv_sent, false, "the tile and the ledger must be able to show this");
+      assert.deepEqual(calls[0].body.payment_details, { card_number: PAN, card_exp: "1029" });
+      assert.equal("card_cvv" in calls[0].body.payment_details, false);
+      assert.match(s.logs[0], /"cvv_sent":false/);
+    } finally {
+      await s.close();
+    }
+  });
+
+  it("a cvv that is not 3 or 4 digits is refused before the gateway, and the hold survives", async () => {
+    const { fetchImpl, calls } = gatewayMock();
+    const s = await startDoor(handleChargeRequest, { secret: SECRET, fetchImpl, privateKey: "k" });
+    try {
+      const ref = newRef();
+      // "12345" is the one that matters: a mistyped code must be refused, not
+      // quietly cut down to four digits and sent to the bank.
+      for (const junk of ["12", "12345", "123456789", "abc", "1 3", "12a"]) {
+        const t = mintTicket({ kind: "charge", repId: "sruly", bind: ref, secret: SECRET });
+        const p = await post(s.url, CHARGE_PATH, t.token, { token_ref: ref, amount_cents: 2500, brand: "jrm", rep: "sruly", customer_name: "Guest", cvv: junk });
+        assert.equal(p.status, 400, p.text);
+        assert.equal(p.body.error, "cvv_invalid");
+      }
+      assert.equal(calls.length, 0);
+      assert.equal(redeemCardHold(ref, { rep: "sruly" }).ok, true, "a bad cvv does not burn the card");
+    } finally {
+      await s.close();
+    }
+  });
+
+  it("the cvv never reaches a decline answer or a decline log either", async () => {
+    const { fetchImpl } = gatewayMock({ sale: { response: "2", response_code: "225", response_text: "CVV MISMATCH" } });
+    const s = await startDoor(handleChargeRequest, { secret: SECRET, fetchImpl, privateKey: "k" });
+    try {
+      const ref = newRef();
+      const t = mintTicket({ kind: "charge", repId: "sruly", bind: ref, secret: SECRET });
+      const p = await post(s.url, CHARGE_PATH, t.token, { token_ref: ref, amount_cents: 2500, brand: "jrm", rep: "sruly", customer_name: "Guest", cvv: CVV });
+      assert.equal(p.status, 402);
+      assert.equal(p.body.decline_reason_human, "The security code is wrong.");
+      assert.equal(p.body.cvv_sent, true);
+      const said = everythingSaid(s, p);
+      assert.equal(said.includes(CVV), false);
+      assert.equal(said.includes(PAN), false);
+    } finally {
+      await s.close();
+    }
+  });
+
+  it("the number is zeroed after the charge on every path: approved, declined, and the gateway throwing", async () => {
+    const seen = [];
+    for (const script of [
+      { name: "approved", sale: { response: "1", id: "txn-z", auth_code: "A" } },
+      { name: "declined", sale: { response: "2", response_code: "200" } },
+      { name: "threw", throws: true },
+    ]) {
+      const fetchImpl = async (url, init = {}) => {
+        if (script.throws) throw new Error("gateway on fire");
+        return { ok: true, status: 200, text: async () => JSON.stringify(script.sale) };
+      };
+      const trace = { buffers: [] };
+      const s = await startDoor(handleChargeRequest, { secret: SECRET, fetchImpl, privateKey: "k", trace });
+      try {
+        const ref = newRef();
+        const t = mintTicket({ kind: "charge", repId: "sruly", bind: ref, secret: SECRET });
+        const p = await post(s.url, CHARGE_PATH, t.token, { token_ref: ref, amount_cents: 2500, brand: "jrm", rep: "sruly", customer_name: "Guest", cvv: CVV });
+        assert.ok([200, 402].includes(p.status), `${script.name}: ${p.status} ${p.text}`);
+        assert.equal(trace.buffers.length, 1, `${script.name}: the door held exactly one number`);
+        assert.equal(
+          trace.buffers[0].every((b) => b === 0),
+          true,
+          `${script.name}: the number is zeroed once the answer is out`
+        );
+        assert.equal(redeemCardHold(ref, { rep: "sruly" }).error, "unknown", `${script.name}: gone from the store`);
+        const said = everythingSaid(s, p);
+        assert.equal(said.includes(PAN), false, `${script.name}: no number said`);
+        assert.equal(said.includes(CVV), false, `${script.name}: no code said`);
+        seen.push(script.name);
+      } finally {
+        await s.close();
+      }
+    }
+    assert.deepEqual(seen, ["approved", "declined", "threw"]);
+  });
+
+  it("a hold past its five minutes is refused, and a hold read by another rep is refused, without a gateway call", async () => {
+    const { fetchImpl, calls } = gatewayMock();
+    const s = await startDoor(handleChargeRequest, { secret: SECRET, fetchImpl, privateKey: "k" });
+    try {
+      // Expired: minted in the past so its whole life is already over.
+      const old = registerCardHold({ pan: PAN, expiry: "10/29", brand: "visa", rep: "sruly" }, { now: Date.now() - CARD_HOLD_TTL_MS - 1000 }).ref;
+      let t = mintTicket({ kind: "charge", repId: "sruly", bind: old, secret: SECRET });
+      let p = await post(s.url, CHARGE_PATH, t.token, { token_ref: old, amount_cents: 2500, brand: "jrm", rep: "sruly", customer_name: "Guest" });
+      assert.equal(p.status, 410);
+      assert.equal(p.body.error, "token_ref_spent_or_expired");
+      assert.match(s.logs.at(-1), /"outcome":"token_ref_gone:expired"/);
+
+      // Wrong rep: hershy has a perfectly good ticket of his own, bound to a
+      // reference that is not his to spend.
+      const mine = registerCardHold({ pan: PAN, expiry: "10/29", brand: "visa", rep: "sruly" }).ref;
+      t = mintTicket({ kind: "charge", repId: "hershy", bind: mine, secret: SECRET });
+      p = await post(s.url, CHARGE_PATH, t.token, { token_ref: mine, amount_cents: 2500, brand: "jrm", rep: "hershy", customer_name: "Guest" });
+      assert.equal(p.status, 403, p.text);
+      assert.equal(p.body.error, "token_ref_wrong_rep");
+      assert.match(s.logs.at(-1), /"outcome":"token_ref_wrong_rep"/);
+      // Burned: even the rep who took the photo cannot use it now.
+      t = mintTicket({ kind: "charge", repId: "sruly", bind: mine, secret: SECRET });
+      p = await post(s.url, CHARGE_PATH, t.token, { token_ref: mine, amount_cents: 2500, brand: "jrm", rep: "sruly", customer_name: "Guest" });
+      assert.equal(p.status, 410);
+
+      assert.equal(calls.length, 0, "no card ever reached the gateway on a refused hold");
+    } finally {
+      await s.close();
+    }
+  });
+
+  it("a charge ticket bound to a different token_ref cannot spend this one", async () => {
+    const { fetchImpl, calls } = gatewayMock();
+    const s = await startDoor(handleChargeRequest, { secret: SECRET, fetchImpl, privateKey: "k" });
+    try {
+      const mine = newRef();
+      const other = newRef();
+      // A real, signed, unexpired, unused charge ticket - for the OTHER card.
+      const t = mintTicket({ kind: "charge", repId: "sruly", bind: other, secret: SECRET });
+      const p = await post(s.url, CHARGE_PATH, t.token, { token_ref: mine, amount_cents: 2500, brand: "jrm", rep: "sruly", customer_name: "Guest" });
+      assert.equal(p.status, 401);
+      assert.equal(p.body.error, "ticket_bind_mismatch");
+      assert.equal(calls.length, 0);
+      assert.equal(redeemCardHold(mine, { rep: "sruly" }).ok, true, "and neither card was spent");
+      assert.equal(redeemCardHold(other, { rep: "sruly" }).ok, true);
     } finally {
       await s.close();
     }
@@ -183,7 +338,7 @@ describe("POST /__nesher_pay/charge", () => {
     const { fetchImpl, calls } = gatewayMock();
     const s = await startDoor(handleChargeRequest, { secret: SECRET, fetchImpl, privateKey: "k" });
     try {
-      const ref = newRef();
+      const ref = newRef({ rep: "goldie" });
       const t = mintTicket({ kind: "charge", repId: "goldie", bind: ref, secret: SECRET });
       const p = await post(s.url, CHARGE_PATH, t.token, { token_ref: ref, amount_cents: 100, brand: "nesher", rep: "goldie", customer_name: "Miriam Schwartz" });
       assert.equal(p.status, 200, p.text);
@@ -197,7 +352,7 @@ describe("POST /__nesher_pay/charge", () => {
     }
   });
 
-  it("declines map to plain words with the raw code beside; the vault record is still deleted; 503 when keys are missing", async () => {
+  it("declines map to plain words with the raw code beside; 503 when keys are missing", async () => {
     const { fetchImpl, calls } = gatewayMock({ sale: { response: "2", response_code: "202", response_text: "DECLINED: INSUFFICIENT FUNDS" } });
     const s = await startDoor(handleChargeRequest, { secret: SECRET, fetchImpl, privateKey: "k" });
     try {
@@ -211,7 +366,7 @@ describe("POST /__nesher_pay/charge", () => {
       assert.equal(p.body.decline_text, "DECLINED: INSUFFICIENT FUNDS");
       assert.equal(p.body.last4, "1486");
       assert.doesNotMatch(p.body.decline_reason_human, /\d/);
-      assert.equal(calls[1].method, "DELETE");
+      assert.equal(calls.length, 1, "one sale attempt, no clean-up call to a vault that does not exist");
       assert.match(s.logs[0], /"outcome":"declined:202"/);
     } finally {
       await s.close();
@@ -254,7 +409,7 @@ describe("POST /__nesher_pay/charge", () => {
       assert.equal(p.body.error, "currency_usd_only");
       p = await post(s.url, CHARGE_PATH, mk(ref), { ...base, token_ref: ref, amount_cents: 1000, customer_name: "" });
       assert.equal(p.body.error, "customer_name_required");
-      assert.ok(redeemCardRef(ref), "validation failures do not spend the ref");
+      assert.equal(redeemCardHold(ref, { rep: "sruly" }).ok, true, "validation failures do not spend the hold");
       p = await post(s.url, CHARGE_PATH, mk(ref), { ...base, token_ref: ref, amount_cents: 1000 });
       assert.equal(p.status, 410);
       assert.equal(p.body.error, "token_ref_spent_or_expired");

@@ -2,7 +2,7 @@
  * Server-to-server money doors for the desk chat's card tile (Mr Money plan
  * Phase 1.3; scope added mid-run by the coordinator on 23 Sep 2026):
  *
- *   POST /__nesher_pay/charge {token_ref, amount_cents, currency, brand, rep, customer_name, invoice_ref?, note?, address1?, city?, state?, zip?, country?}
+ *   POST /__nesher_pay/charge {token_ref, amount_cents, currency, brand, rep, customer_name, cvv?, invoice_ref?, note?, address1?, city?, state?, zip?, country?}
  *   POST /__nesher_pay/void   {txn_id}
  *   POST /__nesher_pay/refund {txn_id, amount_cents}
  *
@@ -17,15 +17,28 @@
  * ride along when present. Refunds are capped server side by REFUND_CAP_CENTS,
  * which defaults to 0 (refuses) when absent.
  *
+ * Spending a hold (23 Sep 2026): the token_ref is redeemed ONCE - removed
+ * from the store before anything else is checked - and the rep on the hold
+ * must be the rep on the ticket. The number lives just long enough to go into
+ * the gateway body and is zeroed in a finally on every path, including the
+ * decline path and the throw path.
+ *
+ * CVV (13.4, and Joseph's design item 2). The security code is NEVER read
+ * from the photo and is NEVER held. The rep types it at charge time; it
+ * arrives in this one request, goes straight into this one gateway call, and
+ * is gone. Optional, because some cards reach a rep without one - but then
+ * the sale is card-not-present with no CVV protection and worse interchange,
+ * so the answer carries `cvv_sent` either way and the tile and the ledger
+ * show it. The code itself is never stored, never logged, never echoed.
+ *
  * Disabled (404) together with the OCR route when OCR_TICKET_SECRET is unset.
  * Nothing here is reachable from a browser (no CORS); the desk chat's server
- * calls it. No PAN, no vault id, no card reference in any log line.
+ * calls it. No PAN and no card reference in any log line.
  */
 
 import {
   BRANDS,
   chargeWithToken,
-  deleteVaultCustomer,
   refundPayment,
   voidPayment,
 } from "./nmi-card.js";
@@ -35,10 +48,11 @@ import {
   ocrSecret,
   purge,
   readLimitedBody,
-  redeemCardRef,
+  redeemCardHold,
   sendTicketJson,
   ticketFromHeaders,
   verifyTicket,
+  zeroHold,
 } from "./ocr-card.js";
 
 export const CHARGE_PATH = "/__nesher_pay/charge";
@@ -51,6 +65,8 @@ export const REFUND_CAP_NAME = "REFUND_CAP_CENTS";
 
 const CARD_REF_RE = /^cr_[A-Za-z0-9_-]{16,64}$/;
 const TXN_ID_RE = /^[A-Za-z0-9_-]{4,64}$/;
+/** 3 digits, or 4 for Amex. Never stored, never logged, never echoed. */
+const CVV_RE = /^\d{3,4}$/;
 
 export function chargeFamilyPath(pathname) {
   const p = String(pathname || "").split("?")[0].replace(/\/+$/, "");
@@ -131,6 +147,8 @@ function accessLine(name, fields) {
   if (fields.brand) o.brand = fields.brand;
   if (fields.amount_cents != null) o.amount_cents = fields.amount_cents;
   if (fields.txn) o.txn = fields.txn;
+  // A yes/no, never the code. Nothing else about the card is ever logged.
+  if (fields.cvv_sent != null) o.cvv_sent = Boolean(fields.cvv_sent);
   return `${name} ${JSON.stringify(o)}`;
 }
 
@@ -224,18 +242,37 @@ export async function handleChargeRequest(req, res, deps = {}) {
   const customerName = str(body.customer_name, 80);
   const invoiceRef = str(body.invoice_ref, 50);
   const note = str(body.note, 255);
+  // The security code, typed by the rep, optional. It is NOT in the hold and
+  // never will be (13.4: it is never read from a photo). It is taken off the
+  // body here, put in the one gateway call, and dropped. The raw request bytes
+  // that carried it are already zeroed by openDoor.
+  // NOT sliced to 4: slicing would turn a mistyped "12345" into a valid-looking
+  // "1234" and send the wrong code to the bank. Take it whole, then judge it.
+  const cvv = str(body.cvv, 16);
+  body.cvv = null;
+  delete body.cvv;
 
   const bad = (error) => finish(400, { ok: false, error }, { outcome: `bad_request:${error}` });
   if (!CARD_REF_RE.test(tokenRef)) return bad("token_ref_invalid");
+  if (cvv && !CVV_RE.test(cvv)) return bad("cvv_invalid");
   if (!isInt(amountCents) || amountCents < 100 || amountCents > CHARGE_MAX_CENTS) return bad("amount_cents_invalid");
   if (currency !== "USD") return bad("currency_usd_only");
   if (brandId !== "jrm" && brandId !== "nesher") return bad("brand_invalid");
   if (!customerName) return bad("customer_name_required");
 
-  const entry = redeemCardRef(tokenRef, { now: clock() });
-  if (!entry) {
-    return finish(410, { ok: false, error: "token_ref_spent_or_expired", decline_reason_human: "That card reference has expired. Take the photo again." }, { outcome: "token_ref_gone", brand: brandId, amount_cents: amountCents });
+  // One presentation is the whole life of a reference. The rep on the ticket
+  // must be the rep who took the photo.
+  const held = redeemCardHold(tokenRef, { now: clock(), rep: ticket.repId });
+  if (!held.ok) {
+    if (held.error === "rep_mismatch") {
+      return finish(403, { ok: false, error: "token_ref_wrong_rep", decline_reason_human: "That card was read by somebody else. Take the photo again." }, { outcome: "token_ref_wrong_rep", brand: brandId, amount_cents: amountCents });
+    }
+    return finish(410, { ok: false, error: "token_ref_spent_or_expired", decline_reason_human: "That card reference has expired. Take the photo again." }, { outcome: `token_ref_gone:${held.error}`, brand: brandId, amount_cents: amountCents });
   }
+  const entry = held.entry;
+  // The same trace seam handleOcrRequest uses: the suite collects every Buffer
+  // this path touches and asserts each one is all-zero when the answer is out.
+  if (deps.trace && Array.isArray(deps.trace.buffers)) deps.trace.buffers.push(entry.pan);
 
   let sale;
   try {
@@ -252,7 +289,7 @@ export async function handleChargeRequest(req, res, deps = {}) {
       zip: str(body.zip, 20),
       country: str(body.country, 2),
       email: str(body.email, 120),
-      customerVaultId: entry.customerVaultId,
+      rawCard: { number: entry.pan.toString("latin1"), expMMYY: entry.expMMYY, cvv },
       paymentToken: "",
       fetchImpl: deps.fetchImpl,
       privateKey: deps.privateKey,
@@ -260,11 +297,8 @@ export async function handleChargeRequest(req, res, deps = {}) {
   } catch {
     sale = { ok: false, error: "processor_error", responseCode: null, responseText: "" };
   } finally {
-    try {
-      await deleteVaultCustomer({ customerVaultId: entry.customerVaultId, fetchImpl: deps.fetchImpl, privateKey: deps.privateKey });
-    } catch {
-      /* best effort; the sweeper and the gateway's own expiry cover it */
-    }
+    // Approved, declined or thrown: the number is gone from this process here.
+    zeroHold(entry);
   }
 
   const brand = brandId === "jrm" ? BRANDS.jrm : BRANDS.nesher;
@@ -282,8 +316,9 @@ export async function handleChargeRequest(req, res, deps = {}) {
         brand: brand.id,
         last4: entry.last4,
         amount_cents: amountCents,
+        cvv_sent: Boolean(cvv),
       },
-      { outcome: `declined:${code || (sale && sale.error) || "unknown"}`, brand: brand.id, amount_cents: amountCents }
+      { outcome: `declined:${code || (sale && sale.error) || "unknown"}`, brand: brand.id, amount_cents: amountCents, cvv_sent: Boolean(cvv) }
     );
   }
   return finish(
@@ -299,10 +334,14 @@ export async function handleChargeRequest(req, res, deps = {}) {
       processor_id: sale.processorId,
       auth_code: sale.authCode || null,
       avs: sale.avsResponse || null,
+      // The gateway's CVV match letter (M / N / P), never the code itself.
       cvv: sale.cvvResponse || null,
+      // Did a security code go with this sale? The tile and the ledger show
+      // this: a sale without one is worse interchange and no CVV protection.
+      cvv_sent: Boolean(cvv),
       order_id: sale.orderId,
     },
-    { outcome: "approved", brand: brand.id, amount_cents: amountCents, txn: sale.transactionId }
+    { outcome: "approved", brand: brand.id, amount_cents: amountCents, txn: sale.transactionId, cvv_sent: Boolean(cvv) }
   );
 }
 

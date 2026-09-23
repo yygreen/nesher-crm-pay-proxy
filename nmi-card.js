@@ -949,9 +949,18 @@ export async function chargeWithToken(opts = {}) {
   const descriptor = descriptorFor(brand);
   const processorId = processorIdFor(brand);
   const token = String(opts.paymentToken || "").trim();
-  // Card reader path (ocr-card.js): the number lives in the gateway's Customer
-  // Vault under an id we minted; the sale references it and never a PAN.
-  const customerVaultId = String(opts.customerVaultId || "").trim();
+  // Card reader path (ocr-card.js + card-charge.js): the number came off a
+  // photo and has been held in memory for at most five minutes. It is passed
+  // in here once, put straight into the v5 body, and dropped. It is never
+  // logged, never returned, never stored. Docs: POST /api/v5/payments/sale
+  // payment_details {card_number, card_exp: MMYY}.
+  // The security code never comes off the photo (plan 13.4) and is never
+  // held: the rep types it at charge time and it rides this one call only.
+  const rawCard = opts.rawCard && typeof opts.rawCard === "object" ? opts.rawCard : null;
+  const rawNumber = rawCard ? String(rawCard.number || "") : "";
+  const rawExp = rawCard ? String(rawCard.expMMYY || "") : "";
+  const rawCvv = rawCard && /^\d{3,4}$/.test(String(rawCard.cvv || "")) ? String(rawCard.cvv) : "";
+  const rawOk = /^\d{12,19}$/.test(rawNumber) && /^\d{4}$/.test(rawExp);
   const orderId = invoiceNumber.slice(0, 50);
   const base = {
     brand,
@@ -959,6 +968,9 @@ export async function chargeWithToken(opts = {}) {
     descriptor,
     processorId,
     amountUsd: amount ? Number(amount) : 0,
+    // true / false on the raw-card path; null on the token path, where the
+    // browser token already carries whatever the guest typed.
+    cvvSent: token ? null : Boolean(rawCvv),
   };
   if (!amount) {
     const message = guestCardMessage({ error: "amountUsd required" });
@@ -968,7 +980,7 @@ export async function chargeWithToken(opts = {}) {
     const message = guestCardMessage({ error: "invoiceNumber required" });
     return { ok: false, error: "invoiceNumber required", message, ...base };
   }
-  if (!token && !customerVaultId) {
+  if (!token && !rawOk) {
     const message = guestCardMessage({ error: "payment_token required" });
     return { ok: false, error: "payment_token required", message, ...base };
   }
@@ -1012,9 +1024,15 @@ export async function chargeWithToken(opts = {}) {
   const body = {
     amount,
     currency: "USD",
-    ...(customerVaultId
-      ? { customer_vault: { id: customerVaultId } }
-      : { payment_details: { payment_token: token } }),
+    ...(token
+      ? { payment_details: { payment_token: token } }
+      : {
+          payment_details: {
+            card_number: rawNumber,
+            card_exp: rawExp,
+            ...(rawCvv ? { card_cvv: rawCvv } : {}),
+          },
+        }),
     ...(billing ? { billing_address: billing } : {}),
     order_details: {
       id: orderId,
@@ -1108,18 +1126,9 @@ async function nmiJson(path, { method = "POST", body, fetchImpl, privateKey } = 
   return { res, json, status: res.status, responseCode, responseText };
 }
 
-/** DELETE /api/v5/customers/{id}: drop a Customer Vault record the card reader made. */
-export async function deleteVaultCustomer({ customerVaultId, fetchImpl, privateKey } = {}) {
-  const id = String(customerVaultId || "").trim();
-  if (!id) return { ok: false, error: "customer_vault_id required" };
-  const r = await nmiJson(`/api/v5/customers/${encodeURIComponent(id)}`, {
-    method: "DELETE",
-    fetchImpl,
-    privateKey,
-  });
-  if (r.error) return r;
-  return { ok: r.status >= 200 && r.status < 300, status: r.status, responseCode: r.responseCode, responseText: r.responseText };
-}
+// No Customer Vault door here on purpose: Joseph declined that value-added
+// service on 2026-09-08 over its fee, so nothing in this file may depend on
+// it. The card reader holds its own reference in memory (ocr-card.js).
 
 /** POST /api/v5/payments/{id}/void with the documented empty body. Unsettled sales only. */
 export async function voidPayment({ transactionId, fetchImpl, privateKey } = {}) {

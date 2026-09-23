@@ -27,12 +27,12 @@ import {
   adaptiveThreshold,
   buildVariants,
   recognizeCard,
-  registerCardRef,
-  redeemCardRef,
-  cardRefCount,
-  sweepCardRefs,
-  tokenizeCard,
-  chargeCardRef,
+  registerCardHold,
+  redeemCardHold,
+  cardHoldCount,
+  sweepCardHolds,
+  zeroHold,
+  CARD_HOLD_TTL_MS,
   parseMultipartImage,
   imageFromBody,
   handleOcrRequest,
@@ -333,99 +333,115 @@ describe("purge + image pipeline", () => {
   });
 });
 
-describe("card references + gateway tokenization", () => {
+describe("the card hold (our own one-time reference, no paid add-on)", () => {
   beforeEach(() => _resetCardRefsForTests());
 
-  it("registerCardRef / redeemCardRef: once, then gone; expiry honoured", () => {
-    const { ref, expiresAt } = registerCardRef({ customerVaultId: "ocr-abc", brand: "visa", last4: "1486", expiry: "10/29" }, { now: NOW });
-    assert.match(ref, /^cr_[A-Za-z0-9_-]{20,}$/);
-    assert.equal(expiresAt, NOW + 15 * 60 * 1000);
-    assert.equal(cardRefCount(), 1);
-    const e = redeemCardRef(ref, { now: NOW + 1 });
-    assert.equal(e.customerVaultId, "ocr-abc");
-    assert.equal(e.last4, "1486");
-    assert.equal(redeemCardRef(ref, { now: NOW + 2 }), null, "single use");
-    const late = registerCardRef({ customerVaultId: "ocr-late" }, { now: NOW });
-    assert.equal(redeemCardRef(late.ref, { now: NOW + 16 * 60 * 1000 }), null, "expired");
+  const hold = (over = {}) =>
+    registerCardHold({ pan: PAN, expiry: "10/29", brand: "visa", rep: "sruly", ...over }, { now: NOW });
+
+  it("mints an unguessable reference bound to the rep, and never carries the number", () => {
+    const h = hold();
+    assert.equal(h.ok, true);
+    // 24 random bytes base64url = 32 chars = 192 bits.
+    assert.match(h.ref, /^cr_[A-Za-z0-9_-]{32}$/);
+    assert.equal(h.expiresAt, NOW + CARD_HOLD_TTL_MS);
+    assert.equal(CARD_HOLD_TTL_MS, 5 * 60 * 1000, "five minutes, the ticket's own cap");
+    assert.equal(cardHoldCount(), 1);
+    assert.equal(JSON.stringify(h).includes(PAN), false);
+    assert.equal(JSON.stringify(h).includes(PAN.slice(0, 12)), false);
+    // Two holds of the same card are two different references.
+    assert.notEqual(hold().ref, h.ref);
   });
 
-  it("sweepCardRefs deletes the gateway record of every expired ref", async () => {
-    registerCardRef({ customerVaultId: "ocr-old" }, { now: NOW - 20 * 60 * 1000 });
-    registerCardRef({ customerVaultId: "ocr-new" }, { now: NOW });
-    const deleted = [];
-    const n = await sweepCardRefs({ now: NOW, deleteVault: async (id) => deleted.push(id) });
-    assert.equal(n, 1);
-    assert.deepEqual(deleted, ["ocr-old"]);
-    assert.equal(cardRefCount(), 1);
+  it("refuses to mint without a rep, a real number, or a usable expiry", () => {
+    assert.equal(hold({ rep: "" }).error, "rep_required");
+    assert.equal(hold({ pan: "4111" }).error, "pan_invalid");
+    assert.equal(hold({ pan: null }).error, "pan_invalid");
+    assert.equal(hold({ expiry: null }).error, "expiry_unknown");
+    assert.equal(cardHoldCount(), 0, "nothing is stored when the mint is refused");
   });
 
-  it("tokenizeCard: validate + add_to_vault with the documented v5 shape, returns a one-time ref, never the number", async () => {
-    const seen = [];
-    const fetchImpl = async (url, init) => {
-      seen.push({ url, init });
-      return { ok: true, status: 200, text: async () => JSON.stringify({ response: "1", response_code: "100", customer_vault_id: JSON.parse(init.body).customer_vault.id }) };
-    };
-    const out = await tokenizeCard({ pan: PAN, expiry: "10/29", name: "AVROHOM COHEN", fetchImpl, privateKey: "k-test", now: NOW });
-    assert.equal(out.ok, true);
-    assert.match(out.ref, /^cr_/);
-    assert.equal(seen.length, 1);
-    assert.match(seen[0].url, /\/api\/v5\/payments\/validate$/);
-    assert.equal(seen[0].init.headers.Authorization, "k-test");
-    const body = JSON.parse(seen[0].init.body);
-    assert.equal(body.payment_details.card_number, PAN);
-    assert.equal(body.payment_details.card_exp, "1029");
-    assert.equal(body.payment_details.card_cvv, undefined, "cvv never sent from the reader");
-    assert.equal(body.customer_vault.add_to_vault, true);
-    assert.match(body.customer_vault.id, /^ocr-[0-9a-f]{20}$/);
-    assert.deepEqual(body.billing_address, { first_name: "AVROHOM", last_name: "COHEN" });
-    assert.equal(body.payment_descriptor, undefined);
-    assert.equal(body.amount, undefined, "no funds move");
-    const e = redeemCardRef(out.ref, { now: NOW });
-    assert.equal(e.customerVaultId, body.customer_vault.id);
-    assert.equal(e.last4, "1486");
-    assert.equal(e.brand, "visa");
-    assert.equal(JSON.stringify(out).includes(PAN), false);
-    assert.equal(JSON.stringify(e).includes(PAN), false);
+  it("spends once: the second spend is refused and the store is empty", () => {
+    const { ref } = hold();
+    const first = redeemCardHold(ref, { now: NOW + 1, rep: "sruly" });
+    assert.equal(first.ok, true);
+    assert.equal(first.entry.last4, "1486");
+    assert.equal(first.entry.brand, "visa");
+    assert.equal(first.entry.expMMYY, "1029");
+    assert.equal(first.entry.pan.toString("latin1"), PAN, "the number is there for the one charge");
+    assert.equal(cardHoldCount(), 0);
+    const second = redeemCardHold(ref, { now: NOW + 2, rep: "sruly" });
+    assert.equal(second.ok, false);
+    assert.equal(second.error, "unknown");
   });
 
-  it("tokenizeCard: declined, unreachable, no expiry, no key", async () => {
-    const declined = await tokenizeCard({ pan: PAN, expiry: "10/29", privateKey: "k", fetchImpl: async () => ({ ok: true, status: 200, text: async () => JSON.stringify({ response: "2", response_code: "300" }) }) });
-    assert.equal(declined.ok, false);
-    assert.equal(declined.error, "validate_declined");
-    assert.equal(declined.responseCode, "300");
-    const http400 = await tokenizeCard({ pan: PAN, expiry: "10/29", privateKey: "k", fetchImpl: async () => ({ ok: false, status: 400, text: async () => "{}" }) });
-    assert.equal(http400.error, "validate_http_400");
-    const down = await tokenizeCard({ pan: PAN, expiry: "10/29", privateKey: "k", fetchImpl: async () => { throw new Error("ECONNRESET"); } });
-    assert.equal(down.error, "gateway_unreachable");
-    assert.equal((await tokenizeCard({ pan: PAN, expiry: null, privateKey: "k" })).error, "expiry_unknown");
-    assert.equal((await tokenizeCard({ pan: PAN, expiry: "10/29", privateKey: "" })).error, "keys_missing");
-    assert.equal(cardRefCount(), 0);
+  it("refuses after the TTL, and zeroes the number when it does", () => {
+    const { ref } = hold();
+    const late = redeemCardHold(ref, { now: NOW + CARD_HOLD_TTL_MS + 1, rep: "sruly" });
+    assert.equal(late.ok, false);
+    assert.equal(late.error, "expired");
+    assert.equal(cardHoldCount(), 0);
   });
 
-  it("chargeCardRef spends the ref once, sells from the vault with processor_id, then deletes the vault record", async () => {
-    const { ref } = registerCardRef({ customerVaultId: "ocr-v1", brand: "visa", last4: "1486", expiry: "10/29" }, { now: NOW });
-    const seen = [];
-    const fetchImpl = async (url, init) => {
-      seen.push({ url, method: init.method, body: init.body ? JSON.parse(init.body) : null });
-      if (/\/payments\/sale$/.test(url)) return { ok: true, status: 200, text: async () => JSON.stringify({ response: "1", id: "txn-1", auth_code: "A1", avs_response: "Y", cvv_response: "M" }) };
-      return { ok: true, status: 200, text: async () => "{}" };
-    };
-    const out = await chargeCardRef({ ref, amountUsd: 55.55, invoiceNumber: "JRM-777-O1", brandId: "jrm", customerName: "Guest", fetchImpl, privateKey: "k", now: NOW });
-    assert.equal(out.ok, true);
-    assert.equal(out.transactionId, "txn-1");
-    assert.equal(out.last4, "1486");
-    assert.equal(out.processorId, "mav2083");
-    assert.equal(seen[0].body.customer_vault.id, "ocr-v1");
-    assert.equal(seen[0].body.payment_details, undefined);
-    assert.equal(seen[0].body.processor_id, "mav2083");
-    assert.equal(seen[0].body.payment_descriptor, undefined);
-    assert.equal(seen[1].method, "DELETE");
-    assert.match(seen[1].url, /\/api\/v5\/customers\/ocr-v1$/);
-    assert.equal(JSON.stringify(out).includes("ocr-v1"), false, "vault id never leaves");
-    const again = await chargeCardRef({ ref, amountUsd: 1, invoiceNumber: "X", fetchImpl, privateKey: "k" });
-    assert.equal(again.ok, false);
-    assert.equal(again.error, "card_ref_invalid");
-    assert.equal(seen.length, 2, "no second sale");
+  it("refuses the wrong rep, burns the reference anyway, and zeroes the number", () => {
+    const { ref } = hold();
+    const wrong = redeemCardHold(ref, { now: NOW + 1, rep: "hershy" });
+    assert.equal(wrong.ok, false);
+    assert.equal(wrong.error, "rep_mismatch");
+    assert.equal(cardHoldCount(), 0, "burned, so a wrong rep cannot retry or probe");
+    const retry = redeemCardHold(ref, { now: NOW + 2, rep: "sruly" });
+    assert.equal(retry.ok, false, "and the right rep cannot recover it either");
+  });
+
+  it("zeroes the number on every refusal path, and on the sweep", () => {
+    // Reach the stored Buffer through the refusal paths by holding a reference
+    // to it before the redeem, which is exactly what an attacker cannot do.
+    const a = hold();
+    const gotA = redeemCardHold(a.ref, { now: NOW + 1, rep: "sruly" });
+    const bufA = gotA.entry.pan;
+    zeroHold(gotA.entry);
+    assert.equal(bufA.every((b) => b === 0), true, "zeroed after a spend");
+
+    const b = hold();
+    const peekB = redeemCardHold(b.ref, { now: NOW + 1, rep: "sruly" });
+    const bufB = peekB.entry.pan;
+    // Put it back and let the expiry path zero it.
+    const c = registerCardHold({ pan: PAN, expiry: "10/29", rep: "sruly" }, { now: NOW });
+    const gotC = redeemCardHold(c.ref, { now: NOW + CARD_HOLD_TTL_MS + 1, rep: "sruly" });
+    assert.equal(gotC.error, "expired");
+    zeroHold(peekB.entry);
+    assert.equal(bufB.every((x) => x === 0), true);
+  });
+
+  it("the sweeper drops and zeroes only what is past its five minutes", () => {
+    registerCardHold({ pan: PAN, expiry: "10/29", rep: "sruly" }, { now: NOW - 10 * 60 * 1000 });
+    registerCardHold({ pan: PAN, expiry: "10/29", rep: "sruly" }, { now: NOW });
+    assert.equal(cardHoldCount(), 2);
+    assert.equal(sweepCardHolds({ now: NOW }), 1);
+    assert.equal(cardHoldCount(), 1);
+  });
+
+  it("no gateway call is made to mint a reference (nothing paid is on the path)", () => {
+    let called = 0;
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async () => { called += 1; throw new Error("no network from the mint"); };
+    try {
+      assert.equal(hold().ok, true);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    assert.equal(called, 0, "the hold is local: no Customer Vault, no validate, no fee");
+  });
+
+  it("the module holds no Customer Vault path at all", () => {
+    const src = fs.readFileSync(new URL("../ocr-card.js", import.meta.url), "utf8");
+    assert.equal(/add_to_vault/.test(src), false);
+    assert.equal(/customer_vault/.test(src), false);
+    assert.equal(/payments\/validate/.test(src), false);
+    const nmi = fs.readFileSync(new URL("../nmi-card.js", import.meta.url), "utf8");
+    assert.equal(/add_to_vault/.test(nmi), false);
+    assert.equal(/deleteVaultCustomer/.test(nmi), false);
+    assert.equal(/customer_vault:/.test(nmi), false);
   });
 });
 
@@ -526,10 +542,11 @@ describe("POST /__nesher_pay/ocr", () => {
   it("200: the tile fields, a card reference, no PAN anywhere, the ticket burns, the log carries four keys only", async () => {
     const digits = `${PAN.replace(/(\d{4})(?=\d)/g, "$1 ")}\n10/29`;
     const engine = fakeEngine((i, o) => (o.charset === "text" ? "VALID THRU 10/29\nAVROHOM COHEN" : digits));
+    // The read must reach NO gateway at all: the reference is ours and free.
     const gateway = [];
     const fetchImpl = async (url, init) => {
-      gateway.push({ url, body: JSON.parse(init.body) });
-      return { ok: true, status: 200, text: async () => JSON.stringify({ response: "1", customer_vault_id: JSON.parse(init.body).customer_vault.id }) };
+      gateway.push({ url, body: init && init.body ? JSON.parse(init.body) : null });
+      throw new Error("the reader must not call the gateway");
     };
     const trace = { buffers: [] };
     const s = await startServer({ secret: SECRET, engine, fetchImpl, privateKey: "k-test", trace });
@@ -554,11 +571,16 @@ describe("POST /__nesher_pay/ocr", () => {
       assert.equal(body.name, "AVROHOM COHEN");
       assert.equal(body.confidence, "high");
       assert.equal(body.confirmLast4, false);
-      assert.match(body.token_ref, /^cr_/);
+      assert.match(body.token_ref, /^cr_[A-Za-z0-9_-]{32}$/);
       assert.equal(body.token_ref_error, null);
-      assert.equal(gateway.length, 1);
-      assert.equal(gateway[0].body.payment_details.card_number, PAN, "the gateway is the only place the number goes");
-      assert.equal(redeemCardRef(body.token_ref).customerVaultId, gateway[0].body.customer_vault.id);
+      assert.equal(gateway.length, 0, "no gateway call: the reference is ours, and free");
+      assert.equal(
+        new Date(body.token_ref_expires_at).getTime() - Date.now() <= CARD_HOLD_TTL_MS + 2000,
+        true,
+        "five minutes at most"
+      );
+      // The hold is bound to the rep on the ticket and to nobody else.
+      assert.equal(redeemCardHold(body.token_ref, { rep: "hershy" }).error, "rep_mismatch");
       // the same ticket again
       const again = await fetch(s.url, { method: "POST", headers: { "content-type": "image/png", "x-ocr-ticket": t.token }, body: Buffer.from(img) });
       assert.equal(again.status, 401);
@@ -584,9 +606,11 @@ describe("POST /__nesher_pay/ocr", () => {
     }
   });
 
-  it("low confidence asks for the last four; tokenization failure is reported, not fatal; multipart + json bodies", async () => {
-    const lone = () => fakeEngine((i, o) => (o.charset === "text" ? "10/29" : i === 0 ? PAN : ""));
-    const fetchImpl = async () => ({ ok: true, status: 200, text: async () => JSON.stringify({ response: "2", response_code: "300" }) });
+  it("low confidence asks for the last four; a hold that cannot be made is reported, not fatal; multipart + json bodies", async () => {
+    // No expiry anywhere in the text pass: the card is read, but it cannot be
+    // held (a sale needs an expiry), so the tile gets the card and no token_ref.
+    const lone = () => fakeEngine((i, o) => (o.charset === "text" ? "NO DATE HERE" : i === 0 ? PAN : ""));
+    const fetchImpl = async () => { throw new Error("the reader must not call the gateway"); };
     let s = await startServer({ secret: SECRET, engine: lone(), fetchImpl, privateKey: "k" });
     try {
       const boundary = "----ocr";
@@ -602,9 +626,9 @@ describe("POST /__nesher_pay/ocr", () => {
       assert.equal(body.confidence, "low");
       assert.equal(body.confirmLast4, true);
       assert.equal(body.token_ref, null);
-      assert.equal(body.token_ref_error, "validate_declined");
+      assert.equal(body.token_ref_error, "expiry_unknown");
       assert.equal(body.last4, "1486");
-      assert.match(s.logs.at(-1), /"outcome":"ok:low:validate_declined"/);
+      assert.match(s.logs.at(-1), /"outcome":"ok:low:expiry_unknown"/);
     } finally {
       await s.close();
     }
@@ -701,8 +725,12 @@ describe("wiring", () => {
     assert.ok(src.indexOf("isOcrPath(url.pathname)") < src.indexOf("isOpenPayPath(url.pathname)"), "reader answers before the pay pages");
     assert.ok(src.indexOf("isOcrPath(url.pathname)") < src.lastIndexOf("proxyWithInject(req, res)"), "reader answers before the proxy");
     assert.match(src, /ocr: \{\s*enabled: ocrEnabled\(\)/);
-    assert.match(src, /build: "2026-09-23-ocr-hop"/);
-    assert.match(src, /startCardRefSweeper\(/);
+    assert.match(src, /build: "2026-09-23-card-hold"/);
+    assert.match(src, /startCardHoldSweeper\(/);
+    // The replica proof lives in health: one boot id per process.
+    assert.match(src, /const INSTANCE_ID = crypto\.randomBytes\(6\)\.toString\("hex"\)/);
+    assert.match(src, /instance: INSTANCE_ID/);
+    assert.match(src, /holds: cardHoldCount\(\)/);
     assert.match(src, /ocr route disabled: OCR_TICKET_SECRET not set/);
     const docker = fs.readFileSync(new URL("../Dockerfile", import.meta.url), "utf8");
     const copy = docker.split("\n").find((l) => l.startsWith("COPY ") && l.includes("server.js"));
