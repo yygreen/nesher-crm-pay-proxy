@@ -275,12 +275,16 @@ export function renderInvoiceHtml(data) {
     invoiceNumber: data.invoiceNumber,
     kind: data.kind,
   });
-  const paid = Boolean(data.paidAt);
+  // Gabbai 23 Sep F2: a claim kept after an unconfirmed gateway answer is
+  // neither paid nor payable until a transaction id confirms it.
+  const confirming = Boolean(data.confirming) && !data.transactionId;
+  const paid = Boolean(data.paidAt) && !confirming;
+  const locked = paid || confirming;
   const hostedCardUrl =
-    !paid && isAllowedCardUrl(data.cardUrl) ? esc(data.cardUrl) : "";
+    !locked && isAllowedCardUrl(data.cardUrl) ? esc(data.cardUrl) : "";
   const collectKey = String(data.collectPublicKey || "").trim();
   const collectOn = Boolean(
-    !paid &&
+    !locked &&
       !hostedCardUrl &&
       collectKey &&
       data.capture === "collectjs"
@@ -292,10 +296,14 @@ export function renderInvoiceHtml(data) {
     : collectOn
       ? renderCollectJsForm(collectKey)
       : "";
-  const bankBtn = paid
+  const bankBtn = locked
     ? ""
     : `<a class="btn ${hasCard ? "btn-secondary" : "btn-primary"}" href="${mercuryUrl}">Pay with bank</a>`;
-  const hint = paid ? `<p class="hint">Payment received. Thank you.</p>` : "";
+  const hint = confirming
+    ? `<p class="hint">We are confirming this payment. Please contact us before paying again.</p>`
+    : paid
+      ? `<p class="hint">Payment received. Thank you.</p>`
+      : "";
   const actions = `
       ${cardBtn}
       ${bankBtn}

@@ -302,6 +302,23 @@ export async function handleChargeRequest(req, res, deps = {}) {
   }
 
   const brand = brandId === "jrm" ? BRANDS.jrm : BRANDS.nesher;
+  if (sale && sale.outcomeUnknown) {
+    // Gabbai 23 Sep F5: the gateway may have taken the money. A rep told
+    // "declined" would retake the photo and charge twice.
+    return finish(
+      503,
+      {
+        ok: false,
+        error: "outcome_unknown",
+        message: "We could not confirm this charge. Do not charge again - check with the office.",
+        brand: brandId === "jrm" ? BRANDS.jrm.id : BRANDS.nesher.id,
+        last4: entry.last4,
+        amount_cents: amountCents,
+        cvv_sent: Boolean(cvv),
+      },
+      { outcome: "outcome_unknown", brand: brandId === "jrm" ? "jrm" : "nesher", amount_cents: amountCents, cvv_sent: Boolean(cvv) }
+    );
+  }
   if (!sale || !sale.ok) {
     const code = sale && sale.responseCode ? String(sale.responseCode) : null;
     const status = sale && sale.error === "keys_missing" ? 503 : 402;

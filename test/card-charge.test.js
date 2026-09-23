@@ -265,7 +265,8 @@ describe("POST /__nesher_pay/charge", () => {
         const ref = newRef();
         const t = mintTicket({ kind: "charge", repId: "sruly", bind: ref, secret: SECRET });
         const p = await post(s.url, CHARGE_PATH, t.token, { token_ref: ref, amount_cents: 2500, brand: "jrm", rep: "sruly", customer_name: "Guest", cvv: CVV });
-        assert.ok([200, 402].includes(p.status), `${script.name}: ${p.status} ${p.text}`);
+        // Gabbai 23 Sep F5: a gateway that throws is an UNKNOWN outcome (503), never "declined".
+        assert.equal(p.status, { approved: 200, declined: 402, threw: 503 }[script.name], `${script.name}: ${p.status} ${p.text}`);
         assert.equal(trace.buffers.length, 1, `${script.name}: the door held exactly one number`);
         assert.equal(
           trace.buffers[0].every((b) => b === 0),
@@ -491,6 +492,31 @@ describe("POST /__nesher_pay/void and /refund", () => {
       assert.equal(p.body.error, "amount_cents_invalid");
     } finally {
       await s2.close();
+    }
+  });
+});
+
+describe("unknown gateway outcome at the desk charge door (Gabbai 23 Sep F5)", () => {
+  beforeEach(() => _resetCardRefsForTests());
+  it("503 outcome_unknown with do-not-charge-again words, not a 402 decline, on throw / 5xx / unreadable", async () => {
+    for (const make of [
+      () => async () => { throw new Error("socket hang up"); },
+      () => async () => ({ ok: false, status: 502, text: async () => "<html>bad gateway</html>" }),
+      () => async () => ({ ok: true, status: 200, text: async () => "not json" }),
+    ]) {
+      const s = await startDoor(handleChargeRequest, { secret: SECRET, fetchImpl: make(), privateKey: "k" });
+      try {
+        const ref = newRef();
+        const t = mintTicket({ kind: "charge", repId: "sruly", bind: ref, secret: SECRET });
+        const p = await post(s.url, CHARGE_PATH, t.token, { token_ref: ref, amount_cents: 2500, brand: "nesher", rep: "sruly", customer_name: "Guest", cvv: CVV });
+        assert.equal(p.status, 503, p.text);
+        assert.equal(p.body.error, "outcome_unknown");
+        assert.match(p.body.message, /Do not charge again/);
+        assert.match(s.logs.join("\n"), /"outcome":"outcome_unknown"/);
+        assert.equal(everythingSaid(s, p).includes(PAN), false);
+      } finally {
+        await s.close();
+      }
     }
   });
 });

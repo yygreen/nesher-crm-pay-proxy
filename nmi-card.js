@@ -1338,6 +1338,14 @@ export async function chargePayCode(opts = {}) {
     privateKey: opts.privateKey,
   });
   if (!sale.ok) {
+    if (sale.outcomeUnknown && typeof opts.markInvoiceConfirming === "function") {
+      // Keep the claim (never a second sale) but never show it as received.
+      try {
+        await opts.markInvoiceConfirming(code, claimed.paidAt || claimedAt);
+      } catch {
+        console.warn("markInvoiceConfirming failed");
+      }
+    }
     if (!sale.outcomeUnknown && typeof opts.releaseInvoicePaidClaim === "function") {
       try {
         await opts.releaseInvoicePaidClaim(code, claimed.paidAt || claimedAt);

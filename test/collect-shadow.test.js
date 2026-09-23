@@ -289,7 +289,7 @@ describe("17.4 going forward: method, rep, last four", () => {
     assert.equal(repUserId("Hershy"), 3);
     assert.equal(repUserId("sruly"), 7);
     assert.equal(repUserId("Goldie"), 2);
-    assert.equal(repUserId("Joseph"), 10);
+    assert.equal(repUserId("Joseph"), null, "no CRM row by id 10: the second source fails");
     assert.equal(repUserId("Richter"), null);
     assert.equal(repUserId(""), null);
   });

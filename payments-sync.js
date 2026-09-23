@@ -38,12 +38,15 @@ function nmiMarker(transactionId) {
 }
 
 /**
- * CRM user id for the rep who took a card payment, or null. The office roster
- * (open-pay OPEN_PAY_STAFF) mapped onto auth_user, verified by read on
- * 23 Sep 2026: goldy=2, Hershy=3, sgrunfeld=7, joseph=10. Richter has no CRM
- * user, so he stays null (the note still names him). Never guessed.
+ * CRM user id for the rep the office DECLARED in the "Taken by" dropdown (not a
+ * signed-in identity: /pay/office has no staff session), or null. Two sources,
+ * both read 23 Sep 2026 (Gabbai A3): auth_user id + username + first name, AND
+ * rows that person already created in the CRM - goldy=2 (30 payments, 333
+ * hotel notes), Hershy=3 (57 payments), sgrunfeld=7 (866 hotel notes).
+ * joseph=10 has created no CRM row, so the second source fails and he maps to
+ * null; Richter has no CRM user. The note text still names whoever was declared.
  */
-export const REP_USER_IDS = Object.freeze({ goldie: 2, goldy: 2, hershy: 3, sruly: 7, joseph: 10 });
+export const REP_USER_IDS = Object.freeze({ goldie: 2, goldy: 2, hershy: 3, sruly: 7 });
 export function repUserId(name) {
   const k = String(name || "").trim().toLowerCase();
   return Object.prototype.hasOwnProperty.call(REP_USER_IDS, k) ? REP_USER_IDS[k] : null;

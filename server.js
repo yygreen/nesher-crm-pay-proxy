@@ -69,6 +69,8 @@ import {
   releaseInvoicePaidClaim,
   findInvoicesByOrderId,
   claimNmiNote,
+  markInvoiceConfirming,
+  listConfirmingLinks,
 } from "./invoice-store.js";
 import { injectPayButtons, injectPaidBadges } from "./inject.js";
 import { stripStripeUi } from "./strip-stripe.js";
@@ -1270,6 +1272,7 @@ const server = http.createServer(async (req, res) => {
             loadInvoice,
             claimInvoicePaid,
             releaseInvoicePaidClaim,
+            markInvoiceConfirming,
             markInvoicePaid,
             claimNmiNote,
             appendHotelNote,
@@ -1357,6 +1360,7 @@ const server = http.createServer(async (req, res) => {
       loadInvoice,
       claimInvoicePaid,
       releaseInvoicePaidClaim,
+      markInvoiceConfirming,
       markInvoicePaid,
       claimNmiNote,
       appendHotelNote,
@@ -1437,6 +1441,7 @@ const server = http.createServer(async (req, res) => {
         at: new Date().toISOString(),
         shadow: shadowStats,
         recovery: lastNmiRecovery,
+        confirmingLinks: await listConfirmingLinks().catch(() => null),
         ...report,
       });
     } catch {
@@ -1482,6 +1487,7 @@ const server = http.createServer(async (req, res) => {
         : null,
       paymentPosting: lastPaymentPosting,
       postingMode: POSTING_MODE,
+      payLinks: payLinkStats,
       postingShadow: POSTING_MODE === "shadow" ? shadowStats : null,
       nmiRecovery: lastNmiRecovery,
       hasMercury: Boolean(
@@ -1853,6 +1859,22 @@ if (POSTING_MODE === "live" && (process.env.DATABASE_URL || process.env.DATABASE
 // each processor-confirmed transaction handed to the doors of this mode.
 // First sweep reaches back 45 days, then every 15 minutes over 3 days.
 let lastNmiRecovery = null;
+// Gabbai 23 Sep F4: pay links held as "confirming" (an unconfirmed gateway
+// answer) - counted once a minute, never a per-health-request query.
+const payLinkStats = { confirming: null, at: null };
+async function refreshPayLinkStats() {
+  try {
+    const rows = await listConfirmingLinks(undefined, 200);
+    payLinkStats.confirming = rows.length;
+    payLinkStats.at = new Date().toISOString();
+  } catch {
+    payLinkStats.at = new Date().toISOString();
+  }
+}
+if (process.env.DATABASE_URL || process.env.DATABASE_PUBLIC_URL) {
+  setTimeout(refreshPayLinkStats, 15 * 1000).unref();
+  setInterval(refreshPayLinkStats, 60 * 1000).unref();
+}
 let nmiRecoveryBusy = false;
 async function runNmiRecoverySweep(days) {
   if (nmiRecoveryBusy) return;
@@ -1899,9 +1921,11 @@ async function runPaySync(trigger) {
   if (paySyncBusy) return lastPaySync || { skippedRun: "busy" };
   paySyncBusy = true;
   try {
-    // Plan 17.4: the home-PC quick tunnel behind MERCURY_API_BASE died
-    // 22 Sep ~08:24Z and Joseph ruled no tunnel on his PC. When the money
-    // seat is connected, the AR listing comes through its outbound hop.
+    // Plan 17.4: the home-PC quick tunnel behind MERCURY_API_BASE died with
+    // the PC's network on 22 Sep (530 from 07:12:20Z, fetch failed from
+    // 08:44:20Z) and Joseph ruled no tunnel on his PC. When the money seat
+    // is connected, the AR listing comes through its outbound hop. STOPGAP:
+    // the direct path (static IPs on the Mercury token) is the target.
     const hop = moneyHop.health();
     const viaSeat = hop.configured && hop.online;
     const out = await syncPaidInvoices({

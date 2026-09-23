@@ -35,7 +35,7 @@ import {
   GUEST_MISSING_AMOUNT,
   GUEST_MISSING_CARD,
 } from "./nmi-card.js";
-import { parseInvoiceNumber, recordNmiPaidInvoice } from "./payments-sync.js";
+import { parseInvoiceNumber, recordNmiPaidInvoiceLegacy } from "./payments-sync.js";
 import { loadInvoice } from "./invoice-store.js";
 import { observeSafely } from "./payment-posts.js";
 import {
@@ -760,7 +760,9 @@ async function chargeOfficeCrmRef(opts, classified) {
       decision: { action: "post" },
     });
     // live: the ledger poster; shadow: the legacy writer (real CRM write).
-    const record = opts.recordNmiPaidInvoice || opts.recordOfficeCrmPayment || recordNmiPaidInvoice;
+    // A caller that forgets the doors falls back to the LEGACY writer (Gabbai
+    // 23 Sep A6): nothing can post through the live poster by default.
+    const record = opts.recordNmiPaidInvoice || opts.recordOfficeCrmPayment || recordNmiPaidInvoiceLegacy;
     if (typeof record === "function") {
       try {
         const posted = await record({
@@ -811,6 +813,7 @@ export async function chargeOfficePay(opts = {}) {
       loadInvoice: opts.loadInvoice,
       claimInvoicePaid: opts.claimInvoicePaid,
       releaseInvoicePaidClaim: opts.releaseInvoicePaidClaim,
+      markInvoiceConfirming: opts.markInvoiceConfirming,
       markInvoicePaid: opts.markInvoicePaid,
       claimNmiNote: opts.claimNmiNote,
       appendReservationNote: opts.appendReservationNote,

@@ -138,6 +138,7 @@ export async function loadInvoice(idOrToken) {
           capture: p.capture || "",
           paidAt: p.paidAt || null,
           transactionId: p.transactionId || null,
+          confirming: p.confirming === true && !p.transactionId,
           kind: p.kind || "",
           recordId: Number.isFinite(Number(p.recordId)) && Number(p.recordId) > 0
             ? Number(p.recordId)
@@ -225,6 +226,54 @@ export async function releaseInvoicePaidClaim(idOrToken, claimedAt, poolImpl) {
   }
 }
 
+/**
+ * Gabbai 23 Sep F1: the gateway answer was lost or unreadable, so the claim is
+ * KEPT (never a second sale) and the link is marked CONFIRMING - neither paid
+ * nor payable - until a transaction id arrives (webhook / recovery). CAS on
+ * the same claim and on no transaction id yet.
+ */
+export async function markInvoiceConfirming(idOrToken, claimedAt, poolImpl) {
+  const key = String(idOrToken || "").trim();
+  if (!isShortPayCode(key) || !claimedAt) return { ok: false, error: "bad claim" };
+  try {
+    const pool = storePool(poolImpl);
+    await ensureTable(pool);
+    const r = await pool.query(
+      `UPDATE nesher_pay_invoices
+          SET payload = COALESCE(payload, '{}'::jsonb) || $3::jsonb
+        WHERE id = $1
+          AND payload->>'paidAt' = $2
+          AND COALESCE(payload->>'transactionId', '') = ''
+        RETURNING id`,
+      [key.toLowerCase(), String(claimedAt), JSON.stringify({ confirming: true, confirmingSince: new Date().toISOString() })]
+    );
+    return { ok: Boolean(r.rows.length) };
+  } catch (e) {
+    console.warn("markInvoiceConfirming failed");
+    return { ok: false, error: "store_error" };
+  }
+}
+
+/** Gabbai 23 Sep F4: links held as confirming, for health (count) and the report (list). */
+export async function listConfirmingLinks(poolImpl, limit = 50) {
+  const pool = storePool(poolImpl);
+  await ensureTable(pool);
+  const r = await pool.query(
+    `SELECT id, payload->>'invoiceNumber' AS invoice_number, payload->>'amountUsd' AS amount_usd,
+            payload->>'confirmingSince' AS since
+       FROM nesher_pay_invoices
+      WHERE payload->>'confirming' = 'true' AND COALESCE(payload->>'transactionId', '') = ''
+      ORDER BY payload->>'confirmingSince' LIMIT $1`,
+    [Math.min(200, Math.max(1, Number(limit) || 50))]
+  );
+  return r.rows.map((x) => ({
+    link: "..." + String(x.id).slice(-3),
+    invoice: x.invoice_number || null,
+    amount_usd: x.amount_usd != null ? Number(x.amount_usd) : null,
+    since: x.since || null,
+  }));
+}
+
 /** Stamp transactionId (and paidAt) on a short code after a successful sale. */
 export async function markInvoicePaid(idOrToken, extra = {}, poolImpl) {
   const key = String(idOrToken || "").trim();
@@ -236,7 +285,7 @@ export async function markInvoicePaid(idOrToken, extra = {}, poolImpl) {
     await ensureTable(pool);
     const r = await pool.query(
       `UPDATE nesher_pay_invoices
-         SET payload = COALESCE(payload, '{}'::jsonb) || $2::jsonb
+         SET payload = (COALESCE(payload, '{}'::jsonb) - 'confirming' - 'confirmingSince') || $2::jsonb
        WHERE id = $1
          AND (COALESCE(payload->>'transactionId', '') = '' OR payload->>'transactionId' = $3)
        RETURNING payload`,

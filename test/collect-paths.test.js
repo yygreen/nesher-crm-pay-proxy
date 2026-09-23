@@ -289,6 +289,7 @@ describe("server wiring (boot without credentials)", () => {
         const j = await h.json();
         assert.equal(j.build, "2026-09-23-collect-shadow");
         assert.equal(j.postingMode, mode === "live" ? "live" : "shadow");
+        assert.deepEqual(j.payLinks, { confirming: null, at: null }, "no DB: the confirming count is unknown, never a fake 0");
         if (mode) assert.equal(j.postingShadow, null);
         else assert.deepEqual(j.postingShadow, { observed: 0, planned: 0, errors: 0, lastAt: null, lastError: null });
         assert.equal((await get("/__nesher_pay/posting-shadow")).status, 401);
