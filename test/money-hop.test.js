@@ -279,11 +279,11 @@ describe("wiring", () => {
     assert.match(docker, /\bmoney-hop\.js\b/);
     const src = fs.readFileSync(new URL("../server.js", import.meta.url), "utf8");
     assert.match(src, /import \{ createMoneyHop \} from "\.\/money-hop\.js"/);
-    assert.match(src, /createMoneyHop\(\{ key: process\.env\.MONEY_HOP_KEY \|\| "" \}\)/);
+    assert.match(src, /createMoneyHop\(\{\s+key: process\.env\.MONEY_HOP_KEY \|\| "",\s+direct: \(sub\) => mercuryGateway\.hopDirect\(sub\),\s+\}\)/);
     assert.match(src, /url\.pathname\.startsWith\("\/__money_hop\/"\)/);
     assert.match(src, /await moneyHop\.handle\(req, res\)/);
     assert.match(src, /moneyHop: moneyHop\.health\(\)/);
-    assert.match(src, /build: "2026-09-23-collect-shadow"/);
+    assert.match(src, /build: "2026-09-23-off-the-pc"/);
     // the hop is mounted before the Mercury relay and everything behind it
     assert.ok(src.indexOf('url.pathname.startsWith("/__money_hop/")') < src.indexOf("/^\\/__mercury_relay\\/(.+)$/"));
     // no Mercury token or send path anywhere in the module
@@ -318,6 +318,39 @@ describe("read() - the service's own signed read through the seat (plan 17.4)", 
       }
       assert.equal((await t.hop.read("/invoices")).status, 503);
       assert.equal(JSON.parse((await t.hop.read("/invoices")).body).error, "seat_offline");
+    } finally { await t.close(); }
+  });
+});
+
+describe("money-hop direct hook (off the PC, 23 Sep)", () => {
+  it("a verified data GET is answered by opts.direct with X-Money-Hop: direct, even with the seat offline", async () => {
+    const asked = [];
+    const t = await rig({ direct: async (sub) => { asked.push(sub); return sub.startsWith("/balances") ? { status: 200, body: '{"seat":"direct"}' } : null; } });
+    try {
+      const r = await call(t, "GET", "/balances");
+      assert.equal(r.status, 200);
+      assert.equal(r.text, '{"seat":"direct"}');
+      assert.equal(r.headers["x-money-hop"], "direct");
+      assert.equal(t.hop.health().counters.direct, 1);
+      // null from the hook = the seat path exactly as before (offline here)
+      const s = await call(t, "GET", "/health");
+      assert.equal(s.status, 503);
+      assert.equal(s.json.error, "seat_offline");
+      // the gate still runs first: unsigned never reaches the hook, a POST is refused before it
+      const u = await call(t, "GET", "/balances", { headers: {} });
+      assert.equal(u.status, 401);
+      const p = await call(t, "POST", "/send", { body: "{}" });
+      assert.equal(p.status, 405);
+      assert.deepEqual(asked, ["/balances", "/health"]);
+    } finally { await t.close(); }
+  });
+
+  it("a throwing hook falls back to the seat path, never a 500", async () => {
+    const t = await rig({ direct: async () => { throw new Error("boom"); } });
+    try {
+      const r = await call(t, "GET", "/balances");
+      assert.equal(r.status, 503);
+      assert.equal(r.json.error, "seat_offline");
     } finally { await t.close(); }
   });
 });

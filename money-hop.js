@@ -23,7 +23,7 @@ import crypto from "node:crypto";
 export const MONEY_HOP_PREFIX = "/__money_hop";
 export const MONEY_HOP_KEY_ID = "hop";
 export const MONEY_HOP_FORWARDABLE = ["/health", "/balances", "/transactions", "/caps", "/state", "/invoices"];
-export const MONEY_HOP_BUILD = "2026-09-23-money-hop-invoices";
+export const MONEY_HOP_BUILD = "2026-09-23-money-hop-direct";
 export const MONEY_HOP_MAX_SKEW_MS = 5 * 60 * 1000;
 export const MONEY_HOP_NONCE_TTL_MS = 10 * 60 * 1000;
 const HEADER_NAMES = ["x-seat-key", "x-seat-ts", "x-seat-nonce", "x-seat-sig"];
@@ -119,12 +119,15 @@ export function createMoneyHop(opts = {}) {
   const setTimer = opts.setTimeout || setTimeout;
   const clearTimer = opts.clearTimeout || clearTimeout;
   const verifier = createHopVerifier(key, { now });
+  // Off the PC (Joseph 23 Sep): a verified data GET is answered by the pay-proxy itself, direct to
+  // Mercury, when opts.direct returns an answer; null = the seat, exactly as before.
+  const direct = typeof opts.direct === "function" ? opts.direct : null;
 
   const queue = [];      // jobs no poller has taken yet
   const waiters = [];    // open polls: { deliver, timer, req }
   const pending = new Map(); // job id -> { resolve, timer }
   let lastPollAt = 0;
-  const counters = { polls: 0, results: 0, forwarded: 0, refused: 0, offline: 0, timeouts: 0, unknown_results: 0 };
+  const counters = { polls: 0, results: 0, forwarded: 0, direct: 0, refused: 0, offline: 0, timeouts: 0, unknown_results: 0 };
 
   function configured() {
     return key.length >= 32;
@@ -258,6 +261,24 @@ export function createMoneyHop(opts = {}) {
       counters.refused++;
       send(res, 405, { error: "not_forwardable", forwardable: MONEY_HOP_FORWARDABLE });
       return true;
+    }
+    if (direct) {
+      let d = null;
+      try {
+        d = await direct(sub);
+      } catch {
+        d = null;
+      }
+      if (d && Number.isInteger(d.status)) {
+        counters.direct++;
+        res.writeHead(d.status, {
+          "Content-Type": "application/json; charset=utf-8",
+          "Cache-Control": "no-store",
+          "X-Money-Hop": "direct",
+        });
+        res.end(typeof d.body === "string" ? d.body : JSON.stringify(d.body ?? null));
+        return true;
+      }
     }
     if (!online()) {
       counters.offline++;

@@ -88,6 +88,8 @@ import { injectStatusExtra, handleStatusPost, STATUS_POST_RE } from "./status-ex
 import { injectNeedsAxis } from "./needs-axis.js";
 import { handleBoardPage, handleBoardDone } from "./board.js";
 import { createMoneyHop } from "./money-hop.js";
+import { createMercuryGateway } from "./mercury-gateway.js";
+import { createMoneyWatch } from "./money-watch.js";
 import {
   getPool,
   loadHotelPayContext,
@@ -476,9 +478,11 @@ async function handlePayApi(req, res, kind, id, query) {
       return;
     }
 
-    const result = await createOrReusePaymentRequest(
-      mercuryOptsFromDraft(token, draftBundle)
-    );
+    // Off the PC: direct to Mercury first, MERCURY_API_BASE only on 401 ipNotWhitelisted.
+    const result = await createOrReusePaymentRequest({
+      ...mercuryOptsFromDraft(token, draftBundle),
+      fetchImpl: mercuryGateway.arFetch("payLink"),
+    });
 
     const d = draftBundle.draft;
     let cardMint = {
@@ -1062,7 +1066,20 @@ function proxyWithInject(req, res) {
 
 // Mr Money hop (money-hop.js): the money seat on Joseph's PC polls this service; a caller's
 // signed GET /__money_hop/<seat path> becomes one job for the seat. MONEY_HOP_KEY unset = 503.
-const moneyHop = createMoneyHop({ key: process.env.MONEY_HOP_KEY || "" });
+// Off the PC (Joseph 23 Sep: "nothing needs to work through this machine"): a verified data GET
+// on the hop is answered direct to Mercury when the allowlist lets it, else by the seat as before.
+const moneyHop = createMoneyHop({
+  key: process.env.MONEY_HOP_KEY || "",
+  direct: (sub) => mercuryGateway.hopDirect(sub),
+});
+// The one door to Mercury (mercury-gateway.js): direct first, the seat / the tunnel as fallback,
+// the seat's read-only rules as code. Health reports per token which path served each use.
+const mercuryGateway = createMercuryGateway({ getHop: () => moneyHop });
+// The three Nesher-Payment-Watch jobs, on the server, in SHADOW beside the PC task.
+const moneyWatch = createMoneyWatch({
+  gateway: mercuryGateway,
+  getPool: () => (process.env.DATABASE_URL || process.env.DATABASE_PUBLIC_URL ? getPool() : null),
+});
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
@@ -1112,24 +1129,17 @@ const server = http.createServer(async (req, res) => {
         req.on("end", () => resolve(Buffer.concat(chunks)));
         req.on("error", reject);
       }) : null;
-      // Same egress path the pay modal itself uses: MERCURY_API_BASE (the
-      // whitelisted-IP relay tunnel) when set, the API directly otherwise.
-      const mercuryBase = (process.env.MERCURY_API_BASE || "https://api.mercury.com").replace(/\/$/, "");
-      const upstreamRes = await fetch(`${mercuryBase}/api/v1/${relPath}`, {
-        method: req.method,
-        headers: {
-          Authorization: `Bearer ${token}`,
-          Accept: "application/json",
-          "Content-Type": "application/json",
-        },
+      // Same door the pay modal uses (mercury-gateway.js): direct to Mercury
+      // first, MERCURY_API_BASE only when Mercury answers 401 ipNotWhitelisted.
+      const r = await mercuryGateway.arRequest("relay", req.method, `/${relPath}`, {
         body: bodyRaw && bodyRaw.length ? bodyRaw : undefined,
       });
-      const text = await upstreamRes.text();
-      res.writeHead(upstreamRes.status, {
-        "Content-Type": upstreamRes.headers.get("content-type") || "application/json",
+      res.writeHead(r.status, {
+        "Content-Type": r.contentType || "application/json",
         "Cache-Control": "no-store",
+        "X-Mercury-Path": r.servedBy,
       });
-      res.end(text);
+      res.end(r.text);
     } catch (e) {
       sendJson(res, 502, { error: "relay upstream failed", detail: String(e.message || e).slice(0, 200) });
     }
@@ -1423,6 +1433,26 @@ const server = http.createServer(async (req, res) => {
   }
 
   // Shadow comparison report (read-only, key-gated, never a CRM write).
+  // The server's copy of the three PC payment-watch jobs (SHADOW) + the Mercury door's per-token
+  // verdict. Same key gate as the posting report. ?run=1 runs one pass now (still shadow).
+  if (url.pathname === "/__nesher_pay/money-watch") {
+    if (req.method !== "GET") { sendJson(res, 405, { error: "GET only" }); return; }
+    const want = String(process.env.MONEY_POSTING_REPORT_KEY || "");
+    const given = String(req.headers["x-report-key"] || "");
+    if (want.length < 32) { sendJson(res, 503, { ok: false, error: "report_key_not_configured" }); return; }
+    if (given.length !== want.length || !crypto.timingSafeEqual(Buffer.from(given), Buffer.from(want))) {
+      sendJson(res, 401, { ok: false, error: "report_key" });
+      return;
+    }
+    try {
+      if (url.searchParams.get("run") === "1") await moneyWatch.runOnce("report");
+      sendJson(res, 200, { ...moneyWatch.report(), mercury: mercuryGateway.health() });
+    } catch (e) {
+      sendJson(res, 500, { ok: false, error: String(e.message || e).slice(0, 160) });
+    }
+    return;
+  }
+
   if (url.pathname === "/__nesher_pay/posting-shadow") {
     if (req.method !== "GET") { sendJson(res, 405, { error: "GET only" }); return; }
     const want = String(process.env.MONEY_POSTING_REPORT_KEY || "");
@@ -1466,7 +1496,7 @@ const server = http.createServer(async (req, res) => {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-09-23-collect-shadow",
+      build: "2026-09-23-off-the-pc",
       instance: INSTANCE_ID,
       snapEngage: {
         enabled: SNAPENGAGE_ENABLED,
@@ -1498,6 +1528,8 @@ const server = http.createServer(async (req, res) => {
       hasWhatsApp: wa.configured,
       hasMercuryRelay: (process.env.MERCURY_RELAY_KEY || "").length >= 24,
       moneyHop: moneyHop.health(),
+      mercury: mercuryGateway.health(),
+      moneyWatch: moneyWatch.summary(),
       whatsappWebhook: {
         path: "/__nesher_wa/webhook/",
         verifyTokenConfigured: Boolean(webhookVerifyToken()),
@@ -1926,13 +1958,16 @@ async function runPaySync(trigger) {
     // 08:44:20Z) and Joseph ruled no tunnel on his PC. When the money seat
     // is connected, the AR listing comes through its outbound hop. STOPGAP:
     // the direct path (static IPs on the Mercury token) is the target.
-    const hop = moneyHop.health();
-    const viaSeat = hop.configured && hop.online;
+    // 23 Sep off-the-PC: the listing now comes through mercury-gateway.js -
+    // direct to Mercury first, the seat's hop, then MERCURY_API_BASE - and
+    // `source` names the path that actually served this cycle.
     const out = await syncPaidInvoices({
       token: process.env.MERCURY_TOKEN_NESHER || process.env.MERCURY_TOKEN,
       pool: getPool(),
-      ...(viaSeat ? { listInvoices: () => listInvoicesViaSeat(moneyHop) } : {}),
+      listInvoices: () => mercuryGateway.listArInvoices("paySync"),
     });
+    const servedBy = mercuryGateway.lastServed("paySync");
+    out.source = servedBy === "direct" ? "mercury-direct" : servedBy === "seat" ? "money-seat" : servedBy === "tunnel" ? "tunnel" : (servedBy || "none");
     lastPaySync = out;
     if (!out.errors.length) lastPaySyncSuccessAt = out.at;
     if (out.recorded.length || out.errors.length) {
@@ -1965,3 +2000,11 @@ if (
 } else {
   console.warn("pay-sync disabled: MERCURY_TOKEN or DATABASE_URL missing");
 }
+
+// Off the PC: keep each Mercury token's direct verdict current (a probe only when the token has not
+// been tried for 5 minutes), and run the payment-watch jobs in SHADOW every 10 minutes.
+if (process.env.MERCURY_PROBE !== "off") {
+  setTimeout(() => mercuryGateway.probeStale().catch(() => {}), 20 * 1000).unref();
+  setInterval(() => mercuryGateway.probeStale().catch(() => {}), 5 * 60 * 1000).unref();
+}
+if (moneyWatch.start()) console.log("money-watch: shadow, every 10 min");
