@@ -949,6 +949,9 @@ export async function chargeWithToken(opts = {}) {
   const descriptor = descriptorFor(brand);
   const processorId = processorIdFor(brand);
   const token = String(opts.paymentToken || "").trim();
+  // Card reader path (ocr-card.js): the number lives in the gateway's Customer
+  // Vault under an id we minted; the sale references it and never a PAN.
+  const customerVaultId = String(opts.customerVaultId || "").trim();
   const orderId = invoiceNumber.slice(0, 50);
   const base = {
     brand,
@@ -965,7 +968,7 @@ export async function chargeWithToken(opts = {}) {
     const message = guestCardMessage({ error: "invoiceNumber required" });
     return { ok: false, error: "invoiceNumber required", message, ...base };
   }
-  if (!token) {
+  if (!token && !customerVaultId) {
     const message = guestCardMessage({ error: "payment_token required" });
     return { ok: false, error: "payment_token required", message, ...base };
   }
@@ -1009,7 +1012,9 @@ export async function chargeWithToken(opts = {}) {
   const body = {
     amount,
     currency: "USD",
-    payment_details: { payment_token: token },
+    ...(customerVaultId
+      ? { customer_vault: { id: customerVaultId } }
+      : { payment_details: { payment_token: token } }),
     ...(billing ? { billing_address: billing } : {}),
     order_details: {
       id: orderId,
@@ -1057,12 +1062,109 @@ export async function chargeWithToken(opts = {}) {
       message,
       blockedReason: message,
       ...base,
+      httpStatus: res.status,
+      responseCode: json.response_code != null ? String(json.response_code) : null,
+      responseText: String(json.response_text || json.responsetext || "").slice(0, 200) || null,
     };
   }
   return {
     ok: true,
     ...base,
     transactionId: json.id || json.transactionid || json.transaction_id || null,
+    authCode: json.auth_code ? String(json.auth_code) : null,
+    avsResponse: json.avs_response ? String(json.avs_response) : null,
+    cvvResponse: json.cvv_response ? String(json.cvv_response) : null,
+  };
+}
+
+async function nmiJson(path, { method = "POST", body, fetchImpl, privateKey } = {}) {
+  const key = String(privateKey || nmiPrivateKey()).trim();
+  if (!key) return { ok: false, error: "keys_missing", status: 0 };
+  const doFetch = fetchImpl || fetch;
+  let res;
+  let text = "";
+  try {
+    res = await doFetch(`${NMI_HOST}${path}`, {
+      method,
+      headers: {
+        Authorization: key,
+        Accept: "application/json",
+        ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
+      },
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+    text = await res.text();
+  } catch {
+    return { ok: false, error: "gateway_unreachable", status: 0 };
+  }
+  let json = {};
+  try {
+    json = JSON.parse(text);
+  } catch {
+    json = {};
+  }
+  const responseCode = json.response_code != null ? String(json.response_code) : null;
+  const responseText = String(json.response_text || json.responsetext || json.message || "").slice(0, 200) || null;
+  return { res, json, status: res.status, responseCode, responseText };
+}
+
+/** DELETE /api/v5/customers/{id}: drop a Customer Vault record the card reader made. */
+export async function deleteVaultCustomer({ customerVaultId, fetchImpl, privateKey } = {}) {
+  const id = String(customerVaultId || "").trim();
+  if (!id) return { ok: false, error: "customer_vault_id required" };
+  const r = await nmiJson(`/api/v5/customers/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+    fetchImpl,
+    privateKey,
+  });
+  if (r.error) return r;
+  return { ok: r.status >= 200 && r.status < 300, status: r.status, responseCode: r.responseCode, responseText: r.responseText };
+}
+
+/** POST /api/v5/payments/{id}/void with the documented empty body. Unsettled sales only. */
+export async function voidPayment({ transactionId, fetchImpl, privateKey } = {}) {
+  const id = String(transactionId || "").trim();
+  if (!id) return { ok: false, error: "transactionId required" };
+  const r = await nmiJson(`/api/v5/payments/${encodeURIComponent(id)}/void`, {
+    method: "POST",
+    body: {},
+    fetchImpl,
+    privateKey,
+  });
+  if (r.error) return r;
+  const approved = String(r.json.response ?? "") === "1";
+  return {
+    ok: r.status >= 200 && r.status < 300 && approved,
+    error: r.status >= 200 && r.status < 300 && approved ? null : "void_failed",
+    status: r.status,
+    responseCode: r.responseCode,
+    responseText: r.responseText,
+    transactionId: r.json.id ? String(r.json.id) : null,
+  };
+}
+
+/** POST /api/v5/payments/{id}/refund {amount}. Settled sales; amount <= settled amount. */
+export async function refundPayment({ transactionId, amountUsd, fetchImpl, privateKey } = {}) {
+  const id = String(transactionId || "").trim();
+  const amount = money2(amountUsd);
+  if (!id) return { ok: false, error: "transactionId required" };
+  if (!amount) return { ok: false, error: "amountUsd required" };
+  const r = await nmiJson(`/api/v5/payments/${encodeURIComponent(id)}/refund`, {
+    method: "POST",
+    body: { amount: Number(amount) },
+    fetchImpl,
+    privateKey,
+  });
+  if (r.error) return r;
+  const approved = String(r.json.response ?? "") === "1";
+  return {
+    ok: r.status >= 200 && r.status < 300 && approved,
+    error: r.status >= 200 && r.status < 300 && approved ? null : "refund_failed",
+    status: r.status,
+    responseCode: r.responseCode,
+    responseText: r.responseText,
+    transactionId: r.json.id ? String(r.json.id) : null,
+    amountUsd: Number(amount),
   };
 }
 

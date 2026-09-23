@@ -16,7 +16,24 @@ import {
   brandFromKind,
   guestPayOrigin,
   guestCardMessage,
+  deleteVaultCustomer,
 } from "./nmi-card.js";
+import {
+  OCR_PATH,
+  handleOcrRequest,
+  isOcrPath,
+  ocrEnabled,
+  ocrSecret,
+  startCardRefSweeper,
+} from "./ocr-card.js";
+import { sharedEnginePool } from "./ocr-engine.js";
+import {
+  chargeFamilyPath,
+  handleChargeRequest,
+  handleRefundRequest,
+  handleVoidRequest,
+  refundCapCents,
+} from "./card-charge.js";
 import {
   nmiWebhookSecret,
   verifyNmiWebhookSignature,
@@ -1046,6 +1063,28 @@ const server = http.createServer(async (req, res) => {
   }
 
   // Public open-amount /pay/open (Nesher or JRM guest) and /pay/office (Nesher staff).
+  // ── The free card reader + the chat's money doors (Mr Money plan s.13) ──
+  // Ticket-gated, JSON, answered here whether enabled or not: a card photo is
+  // never proxied onward to the CRM. 404 when OCR_TICKET_SECRET is unset.
+  if (isOcrPath(url.pathname)) {
+    await handleOcrRequest(req, res, {
+      secret: ocrSecret(),
+      engine: ocrEnabled() ? ocrEngine() : null,
+    });
+    return;
+  }
+  const moneyDoor = chargeFamilyPath(url.pathname);
+  if (moneyDoor) {
+    const handler =
+      moneyDoor === "charge"
+        ? handleChargeRequest
+        : moneyDoor === "void"
+          ? handleVoidRequest
+          : handleRefundRequest;
+    await handler(req, res, { secret: ocrSecret() });
+    return;
+  }
+
   if (isOpenPayPath(url.pathname) || isOfficePayPath(url.pathname)) {
     const officePath = isOfficePayPath(url.pathname);
     const openBrand = officePath ? null : resolveOpenPayBrand(req.headers);
@@ -1310,7 +1349,7 @@ const server = http.createServer(async (req, res) => {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-09-22-jrm-hop",
+      build: "2026-09-23-ocr-endpoint",
       snapEngage: {
         enabled: SNAPENGAGE_ENABLED,
         widgetId: SNAPENGAGE_WIDGET_ID,
@@ -1340,6 +1379,17 @@ const server = http.createServer(async (req, res) => {
       nmiWebhook: {
         path: "/__nesher_pay/nmi-webhook",
         secretConfigured: Boolean(nmiWebhookSecret()),
+      },
+      ocr: {
+        enabled: ocrEnabled(),
+        path: OCR_PATH,
+        engine: "tesseract.js",
+        langData: "local",
+        workers: ocrPool ? ocrPool.size : 0,
+        workersTarget: ocrPool ? ocrPool.target : 0,
+        ready: ocrPool ? ocrPool.ready : false,
+        error: ocrPool ? ocrPool.error : null,
+        refundCapSet: refundCapCents() > 0,
       },
     });
     return;
@@ -1638,6 +1688,24 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`nesher-crm-pay-proxy listening on ${PORT} → ${UPSTREAM}`);
 });
+
+// ── Card reader engine: warm only when the route is enabled ──
+let ocrPool = null;
+function ocrEngine() {
+  if (!ocrPool) ocrPool = sharedEnginePool();
+  return ocrPool;
+}
+if (ocrEnabled()) {
+  ocrEngine()
+    .warm()
+    .then(() => console.log(`ocr engine ready workers=${ocrPool.size}`))
+    .catch((e) => console.error("ocr engine warm failed:", e.message));
+  startCardRefSweeper({
+    deleteVault: (id) => deleteVaultCustomer({ customerVaultId: id }),
+  });
+} else {
+  console.log("ocr route disabled: OCR_TICKET_SECRET not set");
+}
 
 // ── Mercury → CRM payment sync: on boot, then every 5 minutes ──
 let lastPaySync = null;
