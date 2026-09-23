@@ -270,6 +270,11 @@ export async function handleChargeRequest(req, res, deps = {}) {
     return finish(410, { ok: false, error: "token_ref_spent_or_expired", decline_reason_human: "That card reference has expired. Take the photo again." }, { outcome: `token_ref_gone:${held.error}`, brand: brandId, amount_cents: amountCents });
   }
   const entry = held.entry;
+  // A code that came WITH a typed / pasted / spoken card (card-hold, 23 Sep) sits in the hold as a
+  // Buffer beside the number. The rep's typed code on this body wins; otherwise the held one goes.
+  // zeroHold() below wipes both, whatever the gateway says.
+  const cvvUse = cvv || (entry.cvv && typeof entry.cvv.toString === "function" ? entry.cvv.toString("latin1") : "");
+  if (deps.trace && Array.isArray(deps.trace.buffers) && entry.cvv) deps.trace.buffers.push(entry.cvv);
   // The same trace seam handleOcrRequest uses: the suite collects every Buffer
   // this path touches and asserts each one is all-zero when the answer is out.
   if (deps.trace && Array.isArray(deps.trace.buffers)) deps.trace.buffers.push(entry.pan);
@@ -289,7 +294,7 @@ export async function handleChargeRequest(req, res, deps = {}) {
       zip: str(body.zip, 20),
       country: str(body.country, 2),
       email: str(body.email, 120),
-      rawCard: { number: entry.pan.toString("latin1"), expMMYY: entry.expMMYY, cvv },
+      rawCard: { number: entry.pan.toString("latin1"), expMMYY: entry.expMMYY, cvv: cvvUse },
       paymentToken: "",
       fetchImpl: deps.fetchImpl,
       privateKey: deps.privateKey,
@@ -314,9 +319,9 @@ export async function handleChargeRequest(req, res, deps = {}) {
         brand: brandId === "jrm" ? BRANDS.jrm.id : BRANDS.nesher.id,
         last4: entry.last4,
         amount_cents: amountCents,
-        cvv_sent: Boolean(cvv),
+        cvv_sent: Boolean(cvvUse),
       },
-      { outcome: "outcome_unknown", brand: brandId === "jrm" ? "jrm" : "nesher", amount_cents: amountCents, cvv_sent: Boolean(cvv) }
+      { outcome: "outcome_unknown", brand: brandId === "jrm" ? "jrm" : "nesher", amount_cents: amountCents, cvv_sent: Boolean(cvvUse) }
     );
   }
   if (!sale || !sale.ok) {
@@ -333,9 +338,9 @@ export async function handleChargeRequest(req, res, deps = {}) {
         brand: brand.id,
         last4: entry.last4,
         amount_cents: amountCents,
-        cvv_sent: Boolean(cvv),
+        cvv_sent: Boolean(cvvUse),
       },
-      { outcome: `declined:${code || (sale && sale.error) || "unknown"}`, brand: brand.id, amount_cents: amountCents, cvv_sent: Boolean(cvv) }
+      { outcome: `declined:${code || (sale && sale.error) || "unknown"}`, brand: brand.id, amount_cents: amountCents, cvv_sent: Boolean(cvvUse) }
     );
   }
   return finish(
@@ -355,10 +360,10 @@ export async function handleChargeRequest(req, res, deps = {}) {
       cvv: sale.cvvResponse || null,
       // Did a security code go with this sale? The tile and the ledger show
       // this: a sale without one is worse interchange and no CVV protection.
-      cvv_sent: Boolean(cvv),
+      cvv_sent: Boolean(cvvUse),
       order_id: sale.orderId,
     },
-    { outcome: "approved", brand: brand.id, amount_cents: amountCents, txn: sale.transactionId, cvv_sent: Boolean(cvv) }
+    { outcome: "approved", brand: brand.id, amount_cents: amountCents, txn: sale.transactionId, cvv_sent: Boolean(cvvUse) }
   );
 }
 

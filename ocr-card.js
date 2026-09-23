@@ -94,17 +94,21 @@ export function ocrEnabled(env = process.env) {
 }
 
 const REP_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
-/** ocr = one upload; charge / void / refund = one money action bound to one reference (card-charge.js). */
-export const TICKET_KINDS = ["ocr", "charge", "void", "refund"];
+/**
+ * ocr = one upload; hold = one typed / pasted / spoken card put behind a
+ * reference (card-hold, 23 Sep); charge / void / refund = one money action
+ * bound to one reference (card-charge.js).
+ */
+export const TICKET_KINDS = ["ocr", "hold", "charge", "void", "refund"];
 const KIND_RE = /^[a-z]{2,10}$/;
 
 function b64url(buf) {
   return Buffer.from(buf).toString("base64url");
 }
 
-/** Short hash of the value a money ticket is bound to (a card ref or a txn id); "-" for ocr. */
+/** Short hash of the value a money ticket is bound to (a card ref or a txn id); "-" for ocr and hold. */
 export function bindHashOf(kind, bind) {
-  if (kind === "ocr") return "-";
+  if (kind === "ocr" || kind === "hold") return "-";
   const v = String(bind || "").trim();
   if (!v) return "";
   return crypto.createHash("sha256").update(v).digest("hex").slice(0, 16);
@@ -714,9 +718,10 @@ async function recognizeCardOnce(input, opts) {
  */
 const cardHolds = new Map();
 
-/** Overwrite the number in place. Safe to call twice. */
+/** Overwrite the number (and a held security code) in place. Safe to call twice. */
 export function zeroHold(entry) {
   if (entry && entry.pan && typeof entry.pan.fill === "function") entry.pan.fill(0);
+  if (entry && entry.cvv && typeof entry.cvv.fill === "function") entry.cvv.fill(0);
   return entry;
 }
 
@@ -734,9 +739,15 @@ export function registerCardHold(entry, { now = Date.now(), ttlMs = CARD_HOLD_TT
   if (!expMMYY) return { ok: false, error: "expiry_unknown" };
   const life = Math.min(Number(ttlMs) || CARD_HOLD_TTL_MS, CARD_HOLD_TTL_MS);
   const expiresAt = now + life;
+  // A security code only ever arrives with a typed / pasted / spoken card
+  // (card-hold); the photo path never has one. Held as a Buffer beside the
+  // number, spent by the one charge, zeroed with it.
+  const cvvText = entry.cvv == null ? "" : String(entry.cvv);
+  if (cvvText && !/^\d{3,4}$/.test(cvvText)) return { ok: false, error: "cvv_invalid" };
   const ref = "cr_" + crypto.randomBytes(24).toString("base64url");
   cardHolds.set(ref, {
     pan: Buffer.from(number, "latin1"),
+    cvv: cvvText ? Buffer.from(cvvText, "latin1") : null,
     expMMYY,
     brand: entry.brand || brandOf(number),
     last4: number.slice(-4),
@@ -1078,4 +1089,107 @@ export async function handleOcrRequest(req, res, deps = {}) {
     ...fields,
     outcome: `ok:${result.confidence}${held.ok ? "" : ":" + held.error}`,
   });
+}
+
+// ── the card-hold door: a typed, pasted or spoken card (23 Sep 2026) ────────
+//
+// Joseph, 23 Sep: "make it work by uploading a picture, make it also work by
+// pasting in numbers or by writing in numbers or by speaking in numbers."
+// The desk chat reads the number out of the rep's words (never the model) and
+// sends it HERE, server to server, with a one-time "hold" ticket bound to the
+// rep. This puts it behind the SAME in-memory hold the photo reader uses and
+// answers with the SAME shape as /ocr, so the chat draws the same tile and the
+// charge door spends it the same way. Nothing is written anywhere: the access
+// line carries the ticket id and an outcome word, never a digit.
+
+export const CARD_HOLD_PATH = "/__nesher_pay/card-hold";
+const CARD_HOLD_BODY_MAX = 4 * 1024;
+
+export function isCardHoldPath(pathname) {
+  const p = String(pathname || "").split("?")[0].replace(/\/+$/, "");
+  return p === CARD_HOLD_PATH;
+}
+
+/** "12/30", "1230", "12/2030", "12-30", "12 30" -> "MM/YY" when it is a real, unexpired month. */
+export function normalizeExpiry(raw, now = new Date()) {
+  const s = String(raw == null ? "" : raw).trim();
+  let m = /^(\d{1,2})\s*[\/\-. ]\s*(\d{2}|\d{4})$/.exec(s) || /^(\d{2})(\d{2})$/.exec(s) || /^(\d{2})(\d{4})$/.exec(s);
+  if (!m) return null;
+  return parseExpiry(`${String(m[1]).padStart(2, "0")}/${m[2]}`, now);
+}
+
+export async function handleCardHoldRequest(req, res, deps = {}) {
+  const clock = typeof deps.clock === "function" ? deps.clock : Date.now;
+  const t0 = clock();
+  const log = typeof deps.log === "function" ? deps.log : console.log;
+  const method = String(req.method || "GET").toUpperCase();
+  const secret = deps.secret == null ? ocrSecret() : String(deps.secret || "");
+  const done = (status, body, fields) => {
+    send(res, status, body, { close: true });
+    log(`hold ${JSON.stringify({ method, ticket: fields.ticket || null, outcome: fields.outcome || null, ms: clock() - t0 })}`);
+  };
+  if (!secret) return done(404, { ok: false, error: "not_found" }, { outcome: "disabled" });
+  if (method !== "POST") return done(405, { ok: false, error: "post_only" }, { outcome: "method" });
+  const token = ticketFromHeaders(req.headers || {});
+  if (!token) return done(401, { ok: false, error: "ticket_required" }, { outcome: "no_ticket" });
+  const ticket = verifyTicket(token, { secret, now: clock(), kind: "hold" });
+  if (!ticket.ok) {
+    return done(401, { ok: false, error: `ticket_${ticket.error}` }, { ticket: ticket.ticketId || null, outcome: `bad_ticket:${ticket.error}` });
+  }
+  consumeTicket(ticket.ticketId, ticket.expiresAt, { now: clock() });
+  const fields = { ticket: ticket.ticketId };
+
+  const read = await readLimitedBody(req, CARD_HOLD_BODY_MAX);
+  if (read.error) return done(read.error === "body_too_large" ? 413 : 400, { ok: false, error: read.error }, { ...fields, outcome: read.error });
+  let body = null;
+  try {
+    body = JSON.parse(read.buffer.toString("utf8") || "{}");
+  } catch {
+    body = null;
+  }
+  purge([read.buffer]);
+  if (!body || typeof body !== "object" || Array.isArray(body)) return done(400, { ok: false, error: "invalid_json" }, { ...fields, outcome: "invalid_json" });
+
+  const digits = String(body.pan == null ? "" : body.pan).replace(/[\s\-.]/g, "");
+  const expRaw = body.exp == null ? body.expiry : body.exp;
+  const cvvRaw = body.cvv == null ? "" : String(body.cvv).trim();
+  const nameRaw = typeof body.name === "string" ? body.name : "";
+  const source = body.source === "spoken" ? "spoken" : "typed";
+  // Off the body now; only the locals below hold them until the hold does.
+  body.pan = null;
+  body.cvv = null;
+  delete body.pan;
+  delete body.cvv;
+
+  if (!/^\d{13,19}$/.test(digits) || !luhnOk(digits)) return done(400, { ok: false, error: "pan_invalid" }, { ...fields, outcome: "pan_invalid" });
+  // NOT sliced: a five-digit slip must never reach the bank as a four-digit code.
+  if (cvvRaw && !/^\d{3,4}$/.test(cvvRaw)) return done(400, { ok: false, error: "cvv_invalid" }, { ...fields, outcome: "cvv_invalid" });
+  const expiry = normalizeExpiry(expRaw, new Date(clock()));
+  if (!expiry) return done(400, { ok: false, error: "expiry_invalid" }, { ...fields, outcome: "expiry_invalid" });
+  const brand = brandOf(digits);
+  const held = registerCardHold({ pan: digits, expiry, brand, rep: ticket.repId, cvv: cvvRaw }, { now: clock() });
+  if (!held.ok) return done(400, { ok: false, error: held.error }, { ...fields, outcome: held.error });
+  const name = nameCandidate(nameRaw) || null;
+
+  // Explicit allowlist, the /ocr shape: the chat reads both with one mapping.
+  return done(
+    200,
+    {
+      ok: true,
+      brand: brand || "card",
+      brandLabel: BRAND_LABEL[brand] || "Card",
+      last4: digits.slice(-4),
+      expiry: expiry,
+      name: name,
+      // Typed digits are what the rep meant; spoken ones were heard, so the rep confirms the last four.
+      confidence: source === "spoken" ? "low" : "high",
+      confirmLast4: source === "spoken",
+      source: source,
+      cvv_held: Boolean(cvvRaw),
+      token_ref: held.ref,
+      token_ref_expires_at: new Date(held.expiresAt).toISOString(),
+      token_ref_error: null,
+    },
+    { ...fields, outcome: `ok:${source}${cvvRaw ? ":cvv" : ""}` }
+  );
 }

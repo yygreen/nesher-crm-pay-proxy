@@ -20,7 +20,9 @@ import {
 import {
   OCR_PATH,
   cardHoldCount,
+  handleCardHoldRequest,
   handleOcrRequest,
+  isCardHoldPath,
   isOcrPath,
   ocrEnabled,
   ocrSecret,
@@ -1157,6 +1159,12 @@ const server = http.createServer(async (req, res) => {
     });
     return;
   }
+  // A typed, pasted or spoken card (Joseph 23 Sep): server to server from the desk chat, the same
+  // hold and the same answer shape as the photo reader. 404 with the reader when the secret is unset.
+  if (isCardHoldPath(url.pathname)) {
+    await handleCardHoldRequest(req, res, { secret: ocrSecret() });
+    return;
+  }
   const moneyDoor = chargeFamilyPath(url.pathname);
   if (moneyDoor) {
     const handler =
@@ -1496,7 +1504,7 @@ const server = http.createServer(async (req, res) => {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-09-23-off-the-pc",
+      build: "2026-09-23-card-any-input",
       instance: INSTANCE_ID,
       snapEngage: {
         enabled: SNAPENGAGE_ENABLED,
