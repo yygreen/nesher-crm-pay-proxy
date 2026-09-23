@@ -52,7 +52,13 @@
  *    and cannot be zeroed. This is the same limit every Node merchant server
  *    has, and it is why the hold's life is five minutes and one use.
  *  - The tesseract worker thread receives a structured-clone copy of each
- *    variant and frees it after the job; that copy is not zeroed by us.
+ *    variant, and tesseract.js writes it to the worker's in-memory FS at
+ *    /input and never deletes it (setImage.js), so a worker used to keep the
+ *    last card variant until its next read. recognizeCard now ends EVERY read
+ *    (success, failure, throw) with engine.scrub(): each worker that touched
+ *    the card recognises a blank (replacing /input and the API's current
+ *    image) and /input is unlinked. Released to the GC, not zeroed - the FS
+ *    is reachable only by message.
  *  - The store is in memory, so it belongs to one container. This service
  *    runs one replica (Railway numReplicas unset), and health reports an
  *    `instance` id so that stays provable. If it were ever scaled out, a
@@ -594,6 +600,17 @@ async function rotated(buffer, degrees, scratch) {
 export async function recognizeCard(input, opts = {}) {
   const engine = opts.engine;
   if (!engine || typeof engine.recognize !== "function") throw new Error("engine required");
+  try {
+    return await recognizeCardOnce(input, opts);
+  } finally {
+    if (typeof engine.scrub === "function") {
+      try { await engine.scrub(); } catch { /* scrub never fails a read */ }
+    }
+  }
+}
+
+async function recognizeCardOnce(input, opts) {
+  const engine = opts.engine;
   const clock = typeof opts.clock === "function" ? opts.clock : Date.now;
   const now = opts.now instanceof Date ? opts.now : new Date(clock());
   const deadlineMs = Number(opts.deadlineMs) || OCR_DEADLINE_MS;

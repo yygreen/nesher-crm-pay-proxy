@@ -66,6 +66,15 @@ async function loadTesseract() {
  * @param {number} [opts.size]
  * @param {string} [opts.langPath]
  */
+// An 8x8 white greyscale PNG at 300 dpi (a lower dpi makes Tesseract print a warning). Run through a worker after a card read so the worker's
+// in-memory filesystem (/input, written by tesseract.js setImage and never
+// deleted) and the Tesseract API's own current image both hold a blank, not
+// the last card variant (plan 13.3.7, audit 23 Sep).
+export const BLANK_PNG = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAAAAADhZOFXAAAACXBIWXMAAC4jAAAuIwF4pT92AAAADklEQVR4nGP4DwUMlDEA98A/wbI0QbsAAAAASUVORK5CYII=",
+  "base64"
+);
+
 export function createEnginePool(opts = {}) {
   const size = poolSizeFor(opts.size ?? POOL_SIZE);
   const langPath = opts.langPath || LANG_DIR;
@@ -75,6 +84,7 @@ export function createEnginePool(opts = {}) {
   let warmPromise = null;
   let warmError = null;
   let closed = false;
+  const dirty = new Set(); // workers that have held a card image since the last scrub
 
   async function makeWorker() {
     const { createWorker, OEM } = await loadTesseract();
@@ -130,6 +140,7 @@ export function createEnginePool(opts = {}) {
         tessedit_char_whitelist: whitelist,
         tessedit_pageseg_mode: psm,
       });
+      dirty.add(w);
       const r = await w.recognize(buffer);
       return {
         text: String((r && r.data && r.data.text) || ""),
@@ -138,6 +149,35 @@ export function createEnginePool(opts = {}) {
     } finally {
       release(w);
     }
+  }
+
+  /**
+   * After a card read (success, failure or throw): each worker that touched a
+   * card image recognises the blank, which replaces /input and the API's
+   * current image, then /input is unlinked. The freed bytes are released to
+   * the garbage collector, not zeroed - the worker FS is reachable only by
+   * message, so there is no in-place overwrite to call. Never throws.
+   */
+  async function scrub() {
+    const ws = [...dirty];
+    dirty.clear();
+    await Promise.all(ws.map(async (w) => {
+      try { await w.recognize(BLANK_PNG); } catch { /* worker gone: nothing left to scrub */ }
+      try { await w.removeFile("/input"); } catch { /* already absent */ }
+    }));
+    return ws.length;
+  }
+
+  /** Test and ops probe: bytes still at /input in each worker (0 = absent). */
+  async function inputResidue() {
+    return Promise.all(workers.map(async (w) => {
+      try {
+        const b = (await w.FS("readFile", ["/input"]))?.data;
+        return b && b.length ? b.length : 0;
+      } catch {
+        return 0;
+      }
+    }));
   }
 
   async function close() {
@@ -150,6 +190,8 @@ export function createEnginePool(opts = {}) {
   return {
     warm,
     recognize,
+    scrub,
+    inputResidue,
     close,
     get size() {
       return workers.length;
