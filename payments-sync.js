@@ -10,6 +10,7 @@
 
 import { fetchWithTimeout } from "./http.js";
 import { mercuryApiBase, normalizeToken } from "./mercury.js";
+import { postConfirmedPayment } from "./payment-posts.js";
 
 /** JRM-1{req}[-O{offer}] | RES-{code} → CRM target. */
 export function parseInvoiceNumber(num) {
@@ -75,17 +76,24 @@ async function recordHotelPayment(pool, inv, target, out, channel = "mercury") {
   const ch = describeChannel(inv, channel);
   // Already recorded by a previous sync run?
   const dup = await pool.query(
-    `SELECT id FROM core_jrmhotelpayment WHERE reference LIKE $1 LIMIT 1`,
-    [`%${ch.marker}%`]
+    channel === "nmi"
+      ? `SELECT id, request_id, amount, currency FROM core_jrmhotelpayment WHERE reference ~ $1 LIMIT 1`
+      : `SELECT id FROM core_jrmhotelpayment WHERE reference LIKE $1 LIMIT 1`,
+    [channel === "nmi" ? `(^|[[:space:]])${ch.marker}($|[[:space:]])` : `%${ch.marker}%`]
   );
   if (dup.rows.length) {
+    if (channel === "nmi" && (Number(dup.rows[0].request_id) !== target.requestId || Math.round(Number(dup.rows[0].amount) * 100) !== Math.round(amount * 100) || !['USD', 'US$', '$'].includes(String(dup.rows[0].currency || '').trim().toUpperCase()))) {
+      out.errors.push("legacy_transaction_conflict");
+      return;
+    }
     out.skipped.push(`${inv.invoiceNumber}: already synced`);
     return;
   }
   // Same amount already entered by staff? Don't double-count.
   const manual = await pool.query(
     `SELECT id FROM core_jrmhotelpayment
-     WHERE request_id = $1 AND ABS(amount - $2) < 0.01 LIMIT 1`,
+     WHERE request_id = $1 AND ABS(amount - $2) < 0.01
+       ${channel === "nmi" ? "AND COALESCE(reference, '') !~ '(mercury|nmi):[A-Za-z0-9_-]+'" : ""} LIMIT 1`,
     [target.requestId, amount]
   );
   if (manual.rows.length) {
@@ -103,6 +111,9 @@ async function recordHotelPayment(pool, inv, target, out, channel = "mercury") {
     );
     if (off.rows.length && Number(off.rows[0].request_id) === target.requestId) {
       offerId = target.offerId;
+    } else if (channel === "nmi") {
+      out.errors.push("hotel_offer_mismatch");
+      return;
     }
   }
   const req = await pool.query(
@@ -136,14 +147,16 @@ async function recordHotelPayment(pool, inv, target, out, channel = "mercury") {
   out.recorded.push(`${inv.invoiceNumber}: $${amount.toFixed(2)} → hotel request #${target.requestId}`);
 }
 
-async function recordReservationPayment(pool, inv, target, out, channel = "mercury") {
+async function recordReservationPayment(pool, inv, target, out, channel = "mercury", inTransaction = false) {
   const amount = Number(inv.amount);
   const ch = describeChannel(inv, channel);
   const dup = await pool.query(
-    `SELECT id FROM core_payment WHERE notes LIKE $1 LIMIT 1`,
-    [`%${ch.marker}%`]
+    channel === "nmi"
+      ? `SELECT id, reservation_id, amount FROM core_payment WHERE notes ~ $1 LIMIT 1`
+      : `SELECT id FROM core_payment WHERE notes LIKE $1 LIMIT 1`,
+    [channel === "nmi" ? `(^|[[:space:]])${ch.marker}($|[[:space:]])` : `%${ch.marker}%`]
   );
-  if (dup.rows.length) {
+  if (dup.rows.length && channel !== "nmi") {
     out.skipped.push(`${inv.invoiceNumber}: already synced`);
     return;
   }
@@ -159,9 +172,16 @@ async function recordReservationPayment(pool, inv, target, out, channel = "mercu
     return;
   }
   const reservationId = Number(res.rows[0].id);
+  if (dup.rows.length) {
+    if (Number(dup.rows[0].reservation_id) !== reservationId || Math.round(Number(dup.rows[0].amount) * 100) !== Math.round(amount * 100)) {
+      out.errors.push("legacy_transaction_conflict");
+    } else out.skipped.push(`${inv.invoiceNumber}: already synced`);
+    return;
+  }
   const manual = await pool.query(
     `SELECT id FROM core_payment
-     WHERE reservation_id = $1 AND ABS(amount - $2) < 0.01 LIMIT 1`,
+     WHERE reservation_id = $1 AND ABS(amount - $2) < 0.01
+       ${channel === "nmi" ? "AND COALESCE(notes, '') !~ '(mercury|nmi):[A-Za-z0-9_-]+'" : ""} LIMIT 1`,
     [reservationId, amount]
   );
   if (manual.rows.length) {
@@ -170,9 +190,9 @@ async function recordReservationPayment(pool, inv, target, out, channel = "mercu
     );
     return;
   }
-  const client = await pool.connect();
+  const client = inTransaction ? pool : await pool.connect();
   try {
-    await client.query("BEGIN");
+    if (!inTransaction) await client.query("BEGIN");
     await client.query(
       `INSERT INTO core_payment
          (amount, method, paid_at, notes, created_at, created_by_id,
@@ -196,12 +216,12 @@ async function recordReservationPayment(pool, inv, target, out, channel = "mercu
        WHERE id = $3`,
       [amount, ch.reservationAppend, reservationId]
     );
-    await client.query("COMMIT");
+    if (!inTransaction) await client.query("COMMIT");
   } catch (e) {
-    try { await client.query("ROLLBACK"); } catch { /* ignore */ }
+    if (!inTransaction) { try { await client.query("ROLLBACK"); } catch { /* ignore */ } }
     throw e;
   } finally {
-    client.release();
+    if (!inTransaction) client.release();
   }
   out.recorded.push(`${inv.invoiceNumber}: $${amount.toFixed(2)} → reservation #${reservationId}`);
 }
@@ -216,6 +236,7 @@ export async function recordNmiPaidInvoice({
   amountUsd,
   transactionId,
   paidAt,
+  reviewReason,
 } = {}) {
   const out = { ok: false, recorded: [], skipped: [], errors: [] };
   const target = parseInvoiceNumber(invoiceNumber);
@@ -224,23 +245,38 @@ export async function recordNmiPaidInvoice({
     return out;
   }
   const amount = Number(amountUsd);
-  if (!(amount > 0)) {
+  if (!Number.isFinite(amount) || !(amount > 0)) {
     out.errors.push("amount");
     return out;
   }
   const inv = {
-    id: String(transactionId || "").trim() || "unknown",
+    id: String(transactionId || "").trim(),
     invoiceNumber: String(invoiceNumber || "").trim(),
     amount,
     paidAt: paidAt || new Date().toISOString(),
   };
-  if (target.kind === "hotel") {
-    await recordHotelPayment(pool, inv, target, out, "nmi");
-  } else {
-    await recordReservationPayment(pool, inv, target, out, "nmi");
-  }
-  out.ok = out.errors.length === 0;
-  return out;
+  return postConfirmedPayment({
+    pool, invoiceNumber: inv.invoiceNumber, amountUsd: amount, transactionId: inv.id,
+    paidAt: inv.paidAt, brand: target.kind === "hotel" ? "jrm" : "nesher",
+    write: async (client, result) => {
+      if (reviewReason) {
+        result.errors.push(["invoice_transaction_conflict", "invoice_amount_mismatch", "invoice_reference_missing"].includes(reviewReason) ? reviewReason : "review_required");
+        return;
+      }
+      // A transaction imported before the event table existed may already be
+      // recorded under the other brand. Preserve it for review, never copy it.
+      const other = await client.query(target.kind === "hotel"
+        ? `SELECT id FROM core_payment WHERE notes ~ $1 LIMIT 1`
+        : `SELECT id FROM core_jrmhotelpayment WHERE reference ~ $1 LIMIT 1`,
+      [`(^|[[:space:]])nmi:${inv.id}($|[[:space:]])`]);
+      if (other.rows.length) {
+        result.errors.push("legacy_transaction_conflict");
+        return;
+      }
+      if (target.kind === "hotel") await recordHotelPayment(client, inv, target, result, "nmi");
+      else await recordReservationPayment(client, inv, target, result, "nmi", true);
+    },
+  });
 }
 
 /**

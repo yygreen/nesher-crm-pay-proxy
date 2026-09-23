@@ -1050,7 +1050,15 @@ export async function chargeWithToken(opts = {}) {
   };
   if (processorId) body.processor_id = processorId;
   const fetchImpl = opts.fetchImpl || fetch;
-  const res = await fetchImpl(`${NMI_HOST}/api/v5/payments/sale`, {
+  let res;
+  let text;
+  const unknown = () => ({
+    ok: false, error: "outcome_unknown", outcomeUnknown: true, ...base,
+    message: "We could not confirm the payment yet. Please contact the desk before trying again.",
+    httpStatus: 503,
+  });
+  try {
+    res = await fetchImpl(`${NMI_HOST}/api/v5/payments/sale`, {
     method: "POST",
     headers: {
       Authorization: key,
@@ -1058,15 +1066,20 @@ export async function chargeWithToken(opts = {}) {
       "Content-Type": "application/json",
     },
     body: JSON.stringify(body),
-  });
-  const text = await res.text();
+    });
+    text = await res.text();
+  } catch {
+    return unknown();
+  }
   let json = {};
   try {
     json = JSON.parse(text);
   } catch {
-    json = { raw: text };
+    return unknown();
   }
-  const approved = String(json.response ?? json.action?.success ?? "") === "1";
+  const response = String(json.response ?? json.action?.success ?? "");
+  if (res.status >= 500 || !["0", "1", "2", "3"].includes(response)) return unknown();
+  const approved = response === "1";
   if (!res.ok || !approved) {
     const message = guestCardMessage({
       ...json,
@@ -1287,7 +1300,7 @@ export async function chargePayCode(opts = {}) {
     privateKey: opts.privateKey,
   });
   if (!sale.ok) {
-    if (typeof opts.releaseInvoicePaidClaim === "function") {
+    if (!sale.outcomeUnknown && typeof opts.releaseInvoicePaidClaim === "function") {
       try {
         await opts.releaseInvoicePaidClaim(code, claimed.paidAt || claimedAt);
       } catch (e) {
@@ -1301,6 +1314,7 @@ export async function chargePayCode(opts = {}) {
       error: err,
       message,
       blockedReason: message || sale.blockedReason,
+      outcomeUnknown: Boolean(sale.outcomeUnknown),
       httpStatus:
         err === "second_dba_pending"
           ? 403
@@ -1321,6 +1335,7 @@ export async function chargePayCode(opts = {}) {
     claimNmiNote: opts.claimNmiNote,
     appendReservationNote: opts.appendReservationNote,
     appendHotelNote: opts.appendHotelNote,
+    recordNmiPaidInvoice: opts.recordNmiPaidInvoice,
   });
   return {
     ok: true,
@@ -1328,6 +1343,9 @@ export async function chargePayCode(opts = {}) {
     httpStatus: 200,
     note: recorded.note,
     noteWritten: Boolean(recorded.noteWritten),
+    crmRecorded: Boolean(recorded.crmRecorded),
+    crmPending: recorded.ok === false,
+    needsReview: Boolean(recorded.needsReview),
   };
 }
 
@@ -1341,13 +1359,54 @@ export async function recordNmiPaid(opts = {}) {
   const invoice = opts.invoice || {};
   const transactionId = String(opts.transactionId || "").trim() || null;
   const paidAt = opts.paidAt || new Date().toISOString();
+  // A successful sale and a completed CRM posting are separate facts. Never
+  // let an already-written note suppress a missing ledger entry.
+  let invoiceMarked = false;
+  let invoiceConflict = false;
   if (typeof opts.markInvoicePaid === "function") {
     try {
-      await opts.markInvoicePaid(code, { paidAt, transactionId });
+      const mark = await opts.markInvoicePaid(code, { paidAt, transactionId });
+      invoiceMarked = mark?.ok === true;
+      if (mark?.error === "transaction_conflict") {
+        invoiceConflict = true;
+      }
     } catch (e) {
-      console.warn("markInvoicePaid failed", e.message);
+      console.warn("markInvoicePaid failed");
     }
   }
+  if (typeof opts.recordNmiPaidInvoice === "function") {
+    let posted;
+    try {
+      posted = await opts.recordNmiPaidInvoice({
+        invoiceNumber: invoice.invoiceNumber,
+        amountUsd: invoice.amountUsd,
+        transactionId,
+        paidAt,
+        ...(invoiceConflict ? { reviewReason: "invoice_transaction_conflict" } : {}),
+      });
+    } catch {
+      posted = { ok: false };
+    }
+    // The ledger writer includes its own note in the same transaction as the
+    // payment. Do not also run the older claim-before-write note path.
+    const crmRecorded = posted?.ok === true;
+    return {
+      ok: crmRecorded && invoiceMarked,
+      error: !crmRecorded ? "crm_posting_pending" : !invoiceMarked ? "invoice_update_pending" : null,
+      httpStatus: crmRecorded && invoiceMarked ? 200 : 503,
+      transactionId,
+      crmRecorded,
+      crmPending: !crmRecorded,
+      invoiceUpdatePending: !invoiceMarked,
+      durable: posted?.durable === true,
+      postingState: posted?.state || null,
+      needsReview: !crmRecorded,
+      noteWritten: crmRecorded && Boolean(posted.recorded?.length),
+      alreadyNoted: crmRecorded && !posted.recorded?.length,
+    };
+  }
+  if (invoiceConflict) return { ok: false, error: "transaction_conflict", httpStatus: 503,
+    transactionId, crmRecorded: false, needsReview: true };
   const note = nmiPaidStaffNote({
     amountUsd: invoice.amountUsd,
     transactionId,

@@ -235,22 +235,21 @@ export async function markInvoicePaid(idOrToken, extra = {}, poolImpl) {
     const pool = storePool(poolImpl);
     await ensureTable(pool);
     const r = await pool.query(
-      `SELECT payload FROM nesher_pay_invoices WHERE id = $1`,
-      [key.toLowerCase()]
+      `UPDATE nesher_pay_invoices
+         SET payload = COALESCE(payload, '{}'::jsonb) || $2::jsonb
+       WHERE id = $1
+         AND (COALESCE(payload->>'transactionId', '') = '' OR payload->>'transactionId' = $3)
+       RETURNING payload`,
+      [key.toLowerCase(), JSON.stringify({
+        paidAt: extra.paidAt || new Date().toISOString(),
+        ...(extra.transactionId ? { transactionId: String(extra.transactionId) } : {}),
+      }), String(extra.transactionId || "")]
     );
     const row = r.rows[0];
-    if (!row) return { ok: false, error: "not found" };
-    const prev =
-      row.payload && typeof row.payload === "object" ? row.payload : {};
-    const payload = {
-      ...prev,
-      paidAt: extra.paidAt || prev.paidAt || new Date().toISOString(),
-      transactionId: extra.transactionId || prev.transactionId || null,
-    };
-    await pool.query(
-      `UPDATE nesher_pay_invoices SET payload = $2::jsonb WHERE id = $1`,
-      [key.toLowerCase(), JSON.stringify(payload)]
-    );
+    if (!row) {
+      const exists = await pool.query(`SELECT payload FROM nesher_pay_invoices WHERE id = $1`, [key.toLowerCase()]);
+      return { ok: false, error: exists.rows.length ? "transaction_conflict" : "not found" };
+    }
     return { ok: true };
   } catch (e) {
     console.warn("markInvoicePaid failed", e.message);

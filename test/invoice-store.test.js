@@ -23,6 +23,13 @@ function memoryPool(seed = {}) {
         const patch = JSON.parse(params[1]);
         const row = rows.get(id);
         if (!row) return { rows: [] };
+        if (s.includes("payload->>'transactionId'") && s.includes("= $3")) {
+          const currentTxn = String(row.payload?.transactionId || "");
+          const requestedTxn = String(params[2] || "");
+          if (currentTxn && currentTxn !== requestedTxn) return { rows: [] };
+          row.payload = { ...row.payload, ...patch };
+          return { rows: [{ payload: row.payload }] };
+        }
         const gate = s.includes("nmiNoteAt") ? "nmiNoteAt" : "paidAt";
         const cur = row.payload && row.payload[gate];
         if (cur) return { rows: [] };
@@ -149,5 +156,71 @@ describe("invoice-store paidAt CAS", () => {
     assert.equal(second.ok, false);
     assert.equal(second.error, "already_noted");
     assert.equal(pool.rows.get("abc12xyz").payload.nmiNoteAt, "n1");
+  });
+
+  it("mark preserves an existing nmi note", async () => {
+    const pool = memoryPool({
+      abc12xyz: { invoiceNumber: "RES-X", nmiNoteAt: "note-1" },
+    });
+    const out = await markInvoicePaid(
+      "abc12xyz",
+      { transactionId: "txn-1", paidAt: "paid-1" },
+      pool
+    );
+    assert.equal(out.ok, true);
+    assert.deepEqual(pool.rows.get("abc12xyz").payload, {
+      invoiceNumber: "RES-X",
+      nmiNoteAt: "note-1",
+      transactionId: "txn-1",
+      paidAt: "paid-1",
+    });
+  });
+
+  it("same transaction retry succeeds without overwriting the note", async () => {
+    const pool = memoryPool({
+      abc12xyz: { invoiceNumber: "RES-X", nmiNoteAt: "note-1" },
+    });
+    const first = await markInvoicePaid(
+      "abc12xyz",
+      { transactionId: "txn-1", paidAt: "paid-1" },
+      pool
+    );
+    const retry = await markInvoicePaid(
+      "abc12xyz",
+      { transactionId: "txn-1", paidAt: "paid-2" },
+      pool
+    );
+    assert.equal(first.ok, true);
+    assert.equal(retry.ok, true);
+    assert.equal(pool.rows.get("abc12xyz").payload.nmiNoteAt, "note-1");
+    assert.equal(pool.rows.get("abc12xyz").payload.paidAt, "paid-2");
+  });
+
+  it("different transaction is rejected without overwriting the confirmed payment", async () => {
+    const pool = memoryPool({
+      abc12xyz: {
+        invoiceNumber: "RES-X",
+        nmiNoteAt: "note-1",
+        transactionId: "txn-1",
+        paidAt: "paid-1",
+      },
+    });
+    const out = await markInvoicePaid(
+      "abc12xyz",
+      { transactionId: "txn-2", paidAt: "paid-2" },
+      pool
+    );
+    assert.equal(out.ok, false);
+    assert.equal(out.error, "transaction_conflict");
+    assert.equal(pool.rows.get("abc12xyz").payload.transactionId, "txn-1");
+    assert.equal(pool.rows.get("abc12xyz").payload.paidAt, "paid-1");
+  });
+
+  it("reports a missing short code without writing", async () => {
+    const pool = memoryPool();
+    const out = await markInvoicePaid("missing12", { transactionId: "txn-1" }, pool);
+    assert.equal(out.ok, false);
+    assert.equal(out.error, "not found");
+    assert.equal(pool.rows.has("missing12"), false);
   });
 });

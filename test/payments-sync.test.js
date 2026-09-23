@@ -41,16 +41,114 @@ function fakeFetch(invoices) {
 /** Records every query; routes SELECTs via matchers. */
 function fakePool(routes) {
   const calls = [];
+  const paymentPosts = new Map();
+  const committedWrites = [];
+  let transaction = null;
+  const clonePosts = (source) => new Map([...source].map(([k, v]) => [k, { ...v }]));
   const run = async (sql, params = []) => {
     const norm = sql.replace(/\s+/g, " ").trim();
     calls.push({ sql: norm, params });
+    if (norm === "BEGIN") {
+      transaction = { posts: clonePosts(paymentPosts), writes: [], savepoint: null };
+      return { rows: [] };
+    }
+    if (norm === "SAVEPOINT crm_payment_write") {
+      if (transaction) transaction.savepoint = { posts: clonePosts(transaction.posts), writes: [...transaction.writes] };
+      return { rows: [] };
+    }
+    if (norm === "ROLLBACK TO SAVEPOINT crm_payment_write") {
+      if (transaction?.savepoint) {
+        transaction.posts = clonePosts(transaction.savepoint.posts);
+        transaction.writes = [...transaction.savepoint.writes];
+      }
+      return { rows: [] };
+    }
+    if (norm === "COMMIT") {
+      if (transaction) {
+        paymentPosts.clear();
+        for (const [key, value] of transaction.posts) paymentPosts.set(key, value);
+        committedWrites.push(...transaction.writes);
+      }
+      transaction = null;
+      return { rows: [] };
+    }
+    if (norm === "ROLLBACK") {
+      transaction = null;
+      return { rows: [] };
+    }
+    if (/^CREATE TABLE IF NOT EXISTS nesher_money_payment_posts/.test(norm)) {
+      return { rows: [] };
+    }
+    if (/^INSERT INTO nesher_money_payment_posts/.test(norm)) {
+      const [transactionId, invoiceNumber, amountCents, brand, paidAt] = params;
+      const posts = transaction?.posts || paymentPosts;
+      if (!posts.has(transactionId)) {
+        posts.set(transactionId, {
+          transaction_id: transactionId,
+          invoice_number: invoiceNumber,
+          amount_cents: amountCents,
+          brand,
+          paid_at: paidAt,
+          state: "pending",
+          reason: null,
+          attempts: 0,
+        });
+      }
+      return { rows: [] };
+    }
+    if (/^SELECT \* FROM nesher_money_payment_posts WHERE transaction_id/.test(norm)) {
+      const posts = transaction?.posts || paymentPosts;
+      const row = posts.get(params[0]);
+      return { rows: row ? [{ ...row }] : [] };
+    }
+    if (/^SELECT transaction_id, invoice_number, amount_cents, paid_at FROM nesher_money_payment_posts/.test(norm)) {
+      const posts = transaction?.posts || paymentPosts;
+      const limit = Number(params[0]);
+      return {
+        rows: [...posts.values()]
+          .filter((row) => row.state === "pending")
+          .sort((a, b) => String(a.transaction_id).localeCompare(String(b.transaction_id)))
+          .slice(0, limit)
+          .map(({ transaction_id, invoice_number, amount_cents, paid_at }) => ({
+            transaction_id, invoice_number, amount_cents, paid_at,
+          })),
+      };
+    }
+    if (/^UPDATE nesher_money_payment_posts SET state = 'posted'/.test(norm)) {
+      const posts = transaction?.posts || paymentPosts;
+      const row = posts.get(params[0]);
+      if (row) Object.assign(row, { state: "posted", reason: null, attempts: row.attempts + 1, posted_at: "now" });
+      return { rows: [] };
+    }
+    if (/^UPDATE nesher_money_payment_posts SET state = 'review'/.test(norm)) {
+      const posts = transaction?.posts || paymentPosts;
+      const row = posts.get(params[0]);
+      if (row && row.state === "pending") Object.assign(row, { state: "review", reason: params[1], attempts: row.attempts + 1 });
+      return { rows: [] };
+    }
+    if (/^UPDATE nesher_money_payment_posts SET reason = 'posting_failed'/.test(norm)) {
+      const posts = transaction?.posts || paymentPosts;
+      const row = posts.get(params[0]);
+      if (row && row.state === "pending") Object.assign(row, { reason: "posting_failed", attempts: row.attempts + 1 });
+      return { rows: [] };
+    }
+    if (/^INSERT INTO (core_|fake_)/.test(norm) || /^UPDATE core_/.test(norm)) {
+      const write = { sql: norm, params: [...params] };
+      if (transaction) transaction.writes.push(write);
+      else committedWrites.push(write);
+    }
     for (const r of routes) {
-      if (r.match.test(norm)) return { rows: r.rows(params) };
+      if (r.match.test(norm)) {
+        if (r.throw) throw new Error(typeof r.throw === "string" ? r.throw : "fake query failure");
+        return { rows: r.rows(params) };
+      }
     }
     return { rows: [] };
   };
   return {
     calls,
+    paymentPosts,
+    committedWrites,
     query: run,
     connect: async () => ({ query: run, release() {} }),
   };
@@ -83,7 +181,7 @@ describe("syncPaidInvoices", () => {
     });
     assert.equal(out.recorded.length, 1);
     assert.match(out.recorded[0], /hotel request #90/);
-    const ins = pool.calls.filter((c) => c.sql.startsWith("INSERT"));
+    const ins = pool.calls.filter((c) => c.sql.startsWith("INSERT INTO core_"));
     assert.equal(ins.length, 2); // payment + note
     assert.match(ins[0].sql, /core_jrmhotelpayment/);
     assert.ok(ins[0].params.some((p) => String(p).includes("mercury:minv-1")));
@@ -167,7 +265,7 @@ describe("recordNmiPaidInvoice", () => {
     });
     assert.equal(out.ok, true);
     assert.equal(out.recorded.length, 1);
-    const ins = pool.calls.filter((c) => c.sql.startsWith("INSERT"));
+    const ins = pool.calls.filter((c) => c.sql.startsWith("INSERT INTO core_"));
     assert.equal(ins.length, 2);
     assert.match(ins[0].sql, /core_jrmhotelpayment/);
     assert.ok(ins[0].params.some((p) => String(p).includes("nmi:txn_crm")));
@@ -208,7 +306,8 @@ describe("recordNmiPaidInvoice", () => {
 
   it("is idempotent on the nmi: marker", async () => {
     const pool = fakePool([
-      { match: /WHERE notes LIKE/, rows: () => [{ id: 1 }] },
+      { match: /WHERE notes ~/, rows: () => [{ id: 1, reservation_id: 347, amount: 40, currency: "USD" }] },
+      { match: /FROM core_reservation WHERE UPPER/, rows: () => [{ id: 347, amount_paid: "0.00" }] },
     ]);
     const out = await recordNmiPaidInvoice({
       pool,
@@ -219,6 +318,23 @@ describe("recordNmiPaidInvoice", () => {
     assert.equal(out.ok, true);
     assert.equal(out.recorded.length, 0);
     assert.match(out.skipped[0], /already synced/);
-    assert.equal(pool.calls.filter((c) => c.sql.startsWith("INSERT")).length, 0);
+    assert.equal(pool.calls.filter((c) => c.sql.startsWith("INSERT INTO core_")).length, 0);
+  });
+
+  it("rejects a legacy nmi marker attached to another reservation or amount", async () => {
+    const pool = fakePool([
+      { match: /WHERE notes ~/, rows: () => [{ id: 1, reservation_id: 999, amount: 40, currency: "USD" }] },
+      { match: /FROM core_reservation WHERE UPPER/, rows: () => [{ id: 347, amount_paid: "0.00" }] },
+    ]);
+    const out = await recordNmiPaidInvoice({
+      pool,
+      invoiceNumber: "RES-AFV2WG",
+      amountUsd: 40,
+      transactionId: "txn_res_conflict",
+    });
+    assert.equal(out.ok, false);
+    assert.equal(out.needsReview, true);
+    assert.match(out.errors[0], /legacy_transaction_conflict/);
+    assert.equal(pool.calls.filter((c) => c.sql.startsWith("INSERT INTO core_")).length, 0);
   });
 });

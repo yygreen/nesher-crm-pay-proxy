@@ -725,18 +725,23 @@ async function chargeOfficeCrmRef(opts, classified) {
       httpStatus: httpStatusFor(err),
     };
   }
+  let crmRecorded = false;
+  let crmPending = false;
   if (kind === "hotel" || kind === "reservation") {
     const record = opts.recordNmiPaidInvoice || recordNmiPaidInvoice;
     if (typeof record === "function") {
       try {
-        await record({
+        const posted = await record({
           invoiceNumber,
           amountUsd: parsed.amountUsd,
           transactionId: sale.transactionId,
           paidAt: opts.now || new Date().toISOString(),
         });
+        crmRecorded = posted?.ok === true;
+        crmPending = !crmRecorded;
       } catch (e) {
-        console.warn("recordNmiPaidInvoice failed", e.message);
+        crmPending = true;
+        console.warn("recordNmiPaidInvoice failed");
       }
     }
   }
@@ -745,6 +750,8 @@ async function chargeOfficeCrmRef(opts, classified) {
     amountUsd: parsed.amountUsd,
     invoiceNumber,
     transactionId: sale.transactionId || null,
+    crmRecorded,
+    crmPending,
     httpStatus: 200,
   };
 }
@@ -774,6 +781,7 @@ export async function chargeOfficePay(opts = {}) {
       claimNmiNote: opts.claimNmiNote,
       appendReservationNote: opts.appendReservationNote,
       appendHotelNote: opts.appendHotelNote,
+      recordNmiPaidInvoice: opts.recordNmiPaidInvoice,
       fetchImpl: opts.fetchImpl,
       privateKey: opts.privateKey,
     });

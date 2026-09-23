@@ -231,17 +231,30 @@ export async function applyNmiSaleSuccess(parsed, opts = {}) {
     return { ok: false, error: "store_missing", httpStatus: 503 };
   }
 
+  // Signed successful CRM sales that cannot be assigned to a stored request
+  // are real money, too. Keep them as explicit durable exceptions. A failure
+  // to persist must return 503 so delivery can retry; it is never a new sale.
+  const review = async (reason, ignored) => {
+    if (typeof opts.recordNmiPaidInvoice !== "function" || !/^(?:RES-|JRM-1\d+)/i.test(orderId)) {
+      return { ok: true, ignored };
+    }
+    const posted = await opts.recordNmiPaidInvoice({ invoiceNumber: orderId,
+      amountUsd: parsed.amountUsd, transactionId, paidAt: opts.now || new Date().toISOString(), reviewReason: reason });
+    if (posted?.durable) return { ok: true, ignored, needsReview: posted.state === 'review' };
+    return { ok: false, error: 'exception_recording_failed', httpStatus: 503 };
+  };
+
   const rows = await opts.findInvoicesByOrderId(orderId);
-  if (!rows || !rows.length) return { ok: true, ignored: "not_found" };
+  if (!rows || !rows.length) return review('invoice_reference_missing', 'not_found');
   const row = pickInvoiceRow(rows, transactionId);
   if (!row || !isShortPayCode(row.id)) return { ok: true, ignored: "not_found" };
   const invoice = row.payload || {};
   if (!amountsMatch(parsed.amountUsd, invoice.amountUsd)) {
-    return { ok: true, ignored: "amount_mismatch" };
+    return review('invoice_amount_mismatch', 'amount_mismatch');
   }
   const existingTxn = String(invoice.transactionId || "").trim();
   if (invoice.paidAt && existingTxn && existingTxn !== transactionId) {
-    return { ok: true, already: true, ignored: "other_txn" };
+    return { ...await review('invoice_transaction_conflict', 'other_txn'), already: true };
   }
 
   const paidAt = opts.now || new Date().toISOString();
@@ -270,12 +283,20 @@ export async function applyNmiSaleSuccess(parsed, opts = {}) {
     claimNmiNote: opts.claimNmiNote,
     appendReservationNote: opts.appendReservationNote,
     appendHotelNote: opts.appendHotelNote,
+    recordNmiPaidInvoice: opts.recordNmiPaidInvoice,
   });
+  if (recorded.ok === false) {
+    if (recorded.durable && recorded.postingState === 'review') {
+      return { ok: true, transactionId, needsReview: true, crmRecorded: false, httpStatus: 200 };
+    }
+    return recorded;
+  }
   return {
     ok: true,
     transactionId,
     noteWritten: Boolean(recorded.noteWritten),
     alreadyNoted: Boolean(recorded.alreadyNoted),
+    crmRecorded: Boolean(recorded.crmRecorded),
     httpStatus: 200,
   };
 }

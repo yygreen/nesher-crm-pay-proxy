@@ -98,6 +98,7 @@ import {
   appendReservationNote,
 } from "./db.js";
 import { syncPaidInvoices, recordNmiPaidInvoice } from "./payments-sync.js";
+import { retryPaymentPosts, listPaymentPostExceptions } from "./payment-posts.js";
 import { validateStaffSession, extractSessionId } from "./auth.js";
 import {
   buildReservationDraft,
@@ -1309,6 +1310,7 @@ const server = http.createServer(async (req, res) => {
       claimNmiNote,
       appendHotelNote,
       appendReservationNote,
+      recordNmiPaidInvoice: (args) => recordNmiPaidInvoice({ pool: getPool(), ...args }),
     });
     if (result.ok) {
       sendJson(res, 200, {
@@ -1365,11 +1367,23 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (url.pathname === "/__nesher_pay/posting-exceptions") {
+    if (req.method !== "GET") { sendJson(res, 405, { error: "GET only" }); return; }
+    if (!(await requireStaff(req, res))) return;
+    try {
+      const items = await listPaymentPostExceptions({ pool: getPool() });
+      sendJson(res, 200, { ok: true, items });
+    } catch {
+      sendJson(res, 503, { ok: false, error: "posting_status_unavailable" });
+    }
+    return;
+  }
+
   if (url.pathname === "/__nesher_pay/health") {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-09-23-card-hold",
+      build: "2026-09-23-money-posting",
       instance: INSTANCE_ID,
       snapEngage: {
         enabled: SNAPENGAGE_ENABLED,
@@ -1386,6 +1400,7 @@ const server = http.createServer(async (req, res) => {
             errors: lastPaySync.errors.length,
           }
         : null,
+      paymentPosting: lastPaymentPosting,
       hasMercury: Boolean(
         process.env.MERCURY_TOKEN_NESHER || process.env.MERCURY_TOKEN
       ),
@@ -1466,6 +1481,7 @@ const server = http.createServer(async (req, res) => {
         claimNmiNote,
         appendHotelNote,
         appendReservationNote,
+        recordNmiPaidInvoice: (args) => recordNmiPaidInvoice({ pool: getPool(), ...args }),
       });
       if (result.ok === false) {
         sendJson(res, result.httpStatus || 503, {
@@ -1731,6 +1747,25 @@ if (ocrEnabled()) {
 }
 
 // ── Mercury → CRM payment sync: on boot, then every 5 minutes ──
+let lastPaymentPosting = null;
+let paymentPostingBusy = false;
+async function runPaymentPosting() {
+  if (paymentPostingBusy) return;
+  paymentPostingBusy = true;
+  try {
+    const out = await retryPaymentPosts({ pool: getPool(), post: recordNmiPaidInvoice });
+    lastPaymentPosting = { at: new Date().toISOString(), ...out };
+  } catch {
+    lastPaymentPosting = { at: new Date().toISOString(), errors: 1, error: 'posting_recovery_failed' };
+  } finally {
+    paymentPostingBusy = false;
+  }
+}
+if (process.env.DATABASE_URL || process.env.DATABASE_PUBLIC_URL) {
+  setTimeout(runPaymentPosting, 10 * 1000).unref();
+  setInterval(runPaymentPosting, 60 * 1000).unref();
+}
+
 let lastPaySync = null;
 let paySyncBusy = false;
 
