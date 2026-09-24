@@ -18,7 +18,7 @@ RUN rm -rf node_modules/@tesseract.js-data/eng/4.0.0 \
           node_modules/tesseract.js-core/tesseract-core-relaxedsimd.wasm.js
 # ⚠ Explicit list — a new module MUST be added here or the container crashes
 # on boot with ERR_MODULE_NOT_FOUND and the site 502s.
-COPY mercury.js nmi-card.js nmi-webhook.js nmi-recovery.js invoice-page.js open-pay.js invoice-store.js inject.js strip-stripe.js db.js auth.js quote.js http.js draft.js payments-sync.js payment-posts.js whatsapp-ui.js whatsapp-media.js whatsapp-webhook.js snapengage.js public-ui.js intake-ui.js status-extra.js needs-axis.js board.js money-hop.js mercury-gateway.js money-watch.js ocr-card.js ocr-engine.js card-charge.js server.js ./
+COPY mercury.js nmi-card.js nmi-webhook.js nmi-recovery.js invoice-page.js open-pay.js invoice-store.js inject.js strip-stripe.js db.js auth.js quote.js http.js draft.js payments-sync.js payment-posts.js whatsapp-ui.js whatsapp-media.js whatsapp-webhook.js snapengage.js public-ui.js intake-ui.js status-extra.js needs-axis.js board.js money-hop.js mercury-gateway.js money-watch.js money-map.js ocr-card.js ocr-engine.js card-charge.js server.js ./
 ENV NODE_ENV=production
 EXPOSE 8080
 CMD ["node", "server.js"]
