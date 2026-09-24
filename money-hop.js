@@ -23,7 +23,8 @@ import crypto from "node:crypto";
 export const MONEY_HOP_PREFIX = "/__money_hop";
 export const MONEY_HOP_KEY_ID = "hop";
 // /money-map (F6, 24 Sep) is answered by the pay-proxy itself through the direct hook, never by the seat.
-export const MONEY_HOP_FORWARDABLE = ["/health", "/balances", "/transactions", "/caps", "/state", "/invoices", "/money-map"];
+// /crm-search (Mr. AQ, 24 Sep) is answered by the pay-proxy itself too, read-only (crm-search.js).
+export const MONEY_HOP_FORWARDABLE = ["/health", "/balances", "/transactions", "/caps", "/state", "/invoices", "/money-map", "/crm-search"];
 export const MONEY_HOP_BUILD = "2026-09-24-money-map";
 export const MONEY_HOP_MAX_SKEW_MS = 5 * 60 * 1000;
 export const MONEY_HOP_NONCE_TTL_MS = 10 * 60 * 1000;
