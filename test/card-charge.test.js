@@ -17,7 +17,11 @@ import {
   salesFromXml,
   matchSales,
   _resetSaleCache,
+  _resetArmingsForTests,
+  PRE_REVERSAL_READ_MS,
+  CRM_WRITE_MS,
 } from "../card-charge.js";
+import { REVERSAL_TIMEOUT_MS } from "../nmi-card.js";
 import { mintTicket, mintOcrTicket, registerCardHold, redeemCardHold, CARD_HOLD_TTL_MS, _resetCardRefsForTests } from "../ocr-card.js";
 
 const SECRET = "test-ocr-secret-0123456789abcdef";
@@ -730,6 +734,105 @@ describe("unknown gateway outcome at the desk charge door (Gabbai 23 Sep F5)", (
       } finally {
         await s.close();
       }
+    }
+  });
+});
+
+describe("a refund or void whose outcome is not known is never told as 'did not go through' (Gabbai 24 Sep C2-C5)", () => {
+  beforeEach(() => { _resetSaleCache(); _resetArmingsForTests(); });
+  const unknowns = [
+    ["a throw", async () => { throw new Error("socket hang up"); }],
+    ["a 5xx", async () => ({ ok: false, status: 502, text: async () => "<html>bad gateway</html>" })],
+    ["a 408", async () => ({ ok: false, status: 408, text: async () => "{}" })],
+    ["an unreadable 200", async () => ({ ok: true, status: 200, text: async () => "not json" })],
+    ["a 200 with no known response", async () => ({ ok: true, status: 200, text: async () => JSON.stringify({ hello: "world" }) })],
+  ];
+  for (const [label, answer] of unknowns) {
+    for (const [kind, path, txn, cents] of [["refund", REFUND_PATH, "txn-100", 500], ["void", VOID_PATH, "txn-300", 8000]]) {
+      it(`${kind}: ${label} -> 503 outcome_unknown, do-not-send-again words, CRM untouched`, async () => {
+        const pm = processorMock();
+        const fetchImpl = async (u, init) => (/query\.php$/.test(String(u)) ? pm.fetchImpl(u, init) : answer());
+        const crm = [];
+        const s = await startDoor(kind === "refund" ? handleRefundRequest : handleVoidRequest, { secret: SECRET, fetchImpl, privateKey: "k", env: CAPS_ON, recordReversal: async (f) => { crm.push(f); return { state: "posted" }; } });
+        try {
+          const p = await post(s.url, path, mintTicket({ kind, repId: "joseph", bind: txn, secret: SECRET }).token, { txn_id: txn, amount_cents: cents, arming: "mcabc123:1700000000000" });
+          assert.equal(p.status, 503, p.text);
+          assert.equal(p.body.error, "outcome_unknown");
+          assert.match(p.body.decline_reason_human, /Do not send it again - check the sale\./);
+          assert.equal(crm.length, 0);
+          const again = await post(s.url, path, mintTicket({ kind, repId: "joseph", bind: txn, secret: SECRET }).token, { txn_id: txn, amount_cents: cents, arming: "mcabc123:1700000000000" });
+          assert.equal(again.status, 503, "the same arming is answered from its claim");
+          assert.equal(again.body.repeated, true);
+        } finally {
+          await s.close();
+        }
+      });
+    }
+  }
+
+  it("one arming, one gateway call: a second fire while the first is still at the gateway gets in_flight, then the saved answer", async () => {
+    const pm = processorMock();
+    let release;
+    let refunds = 0;
+    const slow = async (u, init) => {
+      if (/query\.php$/.test(String(u))) return pm.fetchImpl(u, init);
+      refunds++;
+      await new Promise((r) => { release = r; });
+      return { ok: true, status: 200, text: async () => JSON.stringify({ response: "1", id: "rf-slow" }) };
+    };
+    const s = await startDoor(handleRefundRequest, { secret: SECRET, fetchImpl: slow, privateKey: "k", env: CAPS_ON });
+    try {
+      const body = { txn_id: "txn-100", amount_cents: 20000, arming: "mcslow0001:1700000000000" };
+      const first = post(s.url, REFUND_PATH, mintTicket({ kind: "refund", repId: "joseph", bind: "txn-100", secret: SECRET }).token, body);
+      await new Promise((r) => setTimeout(r, 150));
+      const second = await post(s.url, REFUND_PATH, mintTicket({ kind: "refund", repId: "joseph", bind: "txn-100", secret: SECRET }).token, body);
+      assert.equal(second.status, 409);
+      assert.equal(second.body.error, "in_flight");
+      release();
+      const a = await first;
+      assert.equal(a.status, 200, a.text);
+      const third = await post(s.url, REFUND_PATH, mintTicket({ kind: "refund", repId: "joseph", bind: "txn-100", secret: SECRET }).token, body);
+      assert.equal(third.status, 200);
+      assert.equal(third.body.repeated, true);
+      assert.equal(third.body.refund_txn_id, "rf-slow");
+      assert.equal(refunds, 1, "the gateway saw exactly ONE refund");
+    } finally {
+      await s.close();
+    }
+  });
+
+  it("a refund already went back on this sale in the last 15 minutes (any screen, the portal) -> refused with its time and amount", async () => {
+    const list = ledger();
+    list.push({ id: "txn-102", orig: "txn-100", proc: "mav7067", cond: "complete", actions: [{ type: "refund", amount: "-20.00", at: NOW_MS - 5 * 60000 }] });
+    const pm = processorMock(list);
+    const s = await startDoor(handleRefundRequest, { secret: SECRET, fetchImpl: pm.fetchImpl, privateKey: "k", env: CAPS_ON });
+    try {
+      const p = await post(s.url, REFUND_PATH, mintTicket({ kind: "refund", repId: "joseph", bind: "txn-100", secret: SECRET }).token, { txn_id: "txn-100", amount_cents: 1000, arming: "mcother001:1700000000001" });
+      assert.equal(p.status, 409);
+      assert.equal(p.body.error, "recent_refund");
+      assert.match(p.body.decline_reason_human, /^A refund of \$20\.00 went back on this sale at \d\d:\d\d \(Israel time\)\./);
+      assert.equal(pm.moved().length, 0);
+    } finally {
+      await s.close();
+    }
+  });
+
+  it("the time budget: the read before money moves is 10 s, the gateway 15 s, the CRM write 8 s - 33 s in all", () => {
+    assert.equal(PRE_REVERSAL_READ_MS, 10000);
+    assert.equal(REVERSAL_TIMEOUT_MS, 15000);
+    assert.equal(CRM_WRITE_MS, 8000);
+    assert.ok(PRE_REVERSAL_READ_MS + REVERSAL_TIMEOUT_MS + CRM_WRITE_MS < 45000, "inside the desk chat's 45 s wait");
+  });
+
+  it("a slow CRM write is reported as slow, never waited on past its limit", async () => {
+    const pm = processorMock();
+    const s = await startDoor(handleRefundRequest, { secret: SECRET, fetchImpl: pm.fetchImpl, privateKey: "k", env: CAPS_ON, crmWriteMs: 50, recordReversal: () => new Promise(() => {}) });
+    try {
+      const p = await post(s.url, REFUND_PATH, mintTicket({ kind: "refund", repId: "joseph", bind: "txn-100", secret: SECRET }).token, { txn_id: "txn-100", amount_cents: 100 });
+      assert.equal(p.status, 200);
+      assert.deepEqual(p.body.crm, { state: "not_recorded", reason: "crm_slow" });
+    } finally {
+      await s.close();
     }
   });
 });

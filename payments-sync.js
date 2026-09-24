@@ -413,6 +413,9 @@ export async function recordNmiReversal({ pool, kind = "refund", saleTxn, revers
   const amt = amount.toFixed(2);
   const mark = `${isVoid ? "nmi-void" : "nmi-refund"}:${isVoid ? sale : key}`;
   const words = `${isVoid ? "VOID" : "REFUND"} of NMI card sale txn ${sale}: -$${amt} USD${isVoid ? "" : ` (refund txn ${key})`}${last4 ? `, card ending ${last4}` : ""}${who ? `, sent by ${who} from the desk chat` : ""}.`;
+  // Gabbai 24 Sep C7: the cash went back; whether the PRICE came down too (a cancellation) is a person's
+  // call, in the CRM's own Refund entry. Said on the note, or the booking shows the amount as due again.
+  const cancelWords = (where) => `If this was a cancellation, add the refund on ${where} in the CRM, or it will show $${amt} due.`;
   const markRe = `(^|[[:space:]])${mark}($|[[:space:]])`;
   const saleRe = `(^|[[:space:]])nmi:${sale}($|[[:space:]])`;
   const write = async (client, out) => {
@@ -436,7 +439,7 @@ export async function recordNmiReversal({ pool, kind = "refund", saleTxn, revers
       );
       await client.query(
         `UPDATE core_reservation SET amount_paid = COALESCE(amount_paid, 0) - $1, notes = COALESCE(notes,'') || $2, updated_at = NOW() WHERE id = $3`,
-        [amount, `\n${words}`, Number(r.reservation_id)]
+        [amount, `\n${words} ${cancelWords("the booking")}`, Number(r.reservation_id)]
       );
       out.recorded.push(`${mark}: -$${amt} -> reservation #${r.reservation_id}`);
       return;
@@ -451,7 +454,7 @@ export async function recordNmiReversal({ pool, kind = "refund", saleTxn, revers
     );
     await client.query(
       `INSERT INTO core_jrmhotelnote (note, created_at, created_by_id, request_id) VALUES ($1, NOW(), $3, $2)`,
-      [words, Number(h.request_id), by]
+      [`${words} ${cancelWords(`hotel request #${h.request_id}`)}`, Number(h.request_id), by]
     );
     out.recorded.push(`${mark}: -$${amt} -> hotel request #${h.request_id}`);
   };

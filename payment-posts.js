@@ -142,11 +142,22 @@ export async function postConfirmedPayment({ pool, invoiceNumber, amountUsd, tra
 export async function retryPaymentPosts({ pool, post, limit = 50 }) {
   await ensureTable(pool);
   const batch = Math.min(100, Math.max(1, Math.floor(Number(limit) || 50)));
-  const pending = await pool.query(`SELECT transaction_id, invoice_number, amount_cents, paid_at
+  const pending = await pool.query(`SELECT transaction_id, invoice_number, amount_cents, paid_at, kind
     FROM nesher_money_payment_posts WHERE state = 'pending'
     ORDER BY updated_at, transaction_id LIMIT $1`, [batch]);
   const out = { checked: pending.rows.length, posted: 0, review: 0, errors: 0 };
   for (const row of pending.rows) {
+    // THE RETRY DISPATCHES ON KIND (Gabbai 24 Sep, B1). `post` is the SALE writer: handed a refund
+    // it would write the money coming back as money coming in (a sign flip). A reversal whose CRM
+    // write failed goes to a person, never to the sale writer.
+    if (row.kind === 'refund') {
+      try {
+        await pool.query(`UPDATE nesher_money_payment_posts SET state = 'review', reason = 'reversal_retry_requires_review',
+          attempts = attempts + 1, updated_at = NOW() WHERE transaction_id = $1 AND state = 'pending'`, [row.transaction_id]);
+        out.review++;
+      } catch { out.errors++; }
+      continue;
+    }
     try {
       const r = await post({ pool, transactionId: row.transaction_id, invoiceNumber: row.invoice_number,
         amountUsd: Number(row.amount_cents) / 100, paidAt: row.paid_at });

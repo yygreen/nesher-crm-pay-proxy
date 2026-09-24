@@ -59,7 +59,8 @@ function fakePool() {
       const row = (tx?.posts || posts).get(params[0]);
       return { rows: row ? [{ ...row }] : [] };
     }
-    if (/^SELECT transaction_id, invoice_number, amount_cents, paid_at FROM nesher_money_payment_posts/.test(norm)) {
+    // 24 Sep: the retry also reads `kind` (a reversal is never handed to the sale writer).
+    if (/^SELECT transaction_id, invoice_number, amount_cents, paid_at(, kind)? FROM nesher_money_payment_posts/.test(norm)) {
       const limit = Number(params[0]);
       return {
         rows: [...(tx?.posts || posts).values()]

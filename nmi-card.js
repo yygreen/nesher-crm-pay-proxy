@@ -1146,12 +1146,18 @@ export function cardLastFour(obj) {
   return null;
 }
 
-async function nmiJson(path, { method = "POST", body, fetchImpl, privateKey } = {}) {
+/** The gateway's reversal calls get their own time limit (Gabbai 24 Sep C5): the door's worst case
+ *  must fit inside the desk chat's wait. A timeout is an UNKNOWN outcome, never a "no". */
+export const REVERSAL_TIMEOUT_MS = 15000;
+
+async function nmiJson(path, { method = "POST", body, fetchImpl, privateKey, timeoutMs = REVERSAL_TIMEOUT_MS } = {}) {
   const key = String(privateKey || nmiPrivateKey()).trim();
   if (!key) return { ok: false, error: "keys_missing", status: 0 };
   const doFetch = fetchImpl || fetch;
   let res;
   let text = "";
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), Math.max(1, Number(timeoutMs) || REVERSAL_TIMEOUT_MS));
   try {
     res = await doFetch(`${NMI_HOST}${path}`, {
       method,
@@ -1161,20 +1167,43 @@ async function nmiJson(path, { method = "POST", body, fetchImpl, privateKey } = 
         ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
       },
       body: body !== undefined ? JSON.stringify(body) : undefined,
+      signal: ctl.signal,
     });
     text = await res.text();
   } catch {
-    return { ok: false, error: "gateway_unreachable", status: 0 };
+    // The request may have left before the throw (or the timeout): nobody knows whether money moved.
+    return { ok: false, error: "gateway_unreachable", status: 0, outcomeUnknown: true };
+  } finally {
+    clearTimeout(timer);
   }
   let json = {};
+  let parsed = true;
   try {
     json = JSON.parse(text);
+    if (!json || typeof json !== "object") { json = {}; parsed = false; }
   } catch {
     json = {};
+    parsed = false;
   }
   const responseCode = json.response_code != null ? String(json.response_code) : null;
   const responseText = String(json.response_text || json.responsetext || json.message || "").slice(0, 200) || null;
-  return { res, json, status: res.status, responseCode, responseText };
+  return { res, json, parsed, status: res.status, responseCode, responseText };
+}
+
+/**
+ * The sale's outcome classes, applied to a refund or a void (Gabbai 24 Sep C2, canon s.4): a
+ * 4xx other than 408 is a refused REQUEST (nothing moved); a throw, a timeout, 408, 5xx, an
+ * unreadable body or a 2xx without a known response code = we do not know. Unknown is never
+ * reported as "did not go through" - that would invite a second refund.
+ */
+function reversalOutcome(r) {
+  if (r.error) return r.outcomeUnknown ? { unknown: true } : { unknown: false };
+  const status = Number(r.status) || 0;
+  const refusedRequest = status >= 400 && status < 500 && status !== 408;
+  if (refusedRequest) return { unknown: false };
+  const response = String(r.json.response ?? "");
+  if (status >= 500 || status === 408 || !r.parsed || !["0", "1", "2", "3"].includes(response)) return { unknown: true };
+  return { unknown: false, approved: status >= 200 && status < 300 && response === "1" };
 }
 
 // No Customer Vault door here on purpose: Joseph declined that value-added
@@ -1182,7 +1211,7 @@ async function nmiJson(path, { method = "POST", body, fetchImpl, privateKey } = 
 // it. The card reader holds its own reference in memory (ocr-card.js).
 
 /** POST /api/v5/payments/{id}/void with the documented empty body. Unsettled sales only. */
-export async function voidPayment({ transactionId, fetchImpl, privateKey } = {}) {
+export async function voidPayment({ transactionId, fetchImpl, privateKey, timeoutMs } = {}) {
   const id = String(transactionId || "").trim();
   if (!id) return { ok: false, error: "transactionId required" };
   const r = await nmiJson(`/api/v5/payments/${encodeURIComponent(id)}/void`, {
@@ -1190,12 +1219,14 @@ export async function voidPayment({ transactionId, fetchImpl, privateKey } = {})
     body: {},
     fetchImpl,
     privateKey,
+    timeoutMs,
   });
+  const o = reversalOutcome(r);
+  if (o.unknown) return { ok: false, error: "outcome_unknown", outcomeUnknown: true, status: r.status || 0 };
   if (r.error) return r;
-  const approved = String(r.json.response ?? "") === "1";
   return {
-    ok: r.status >= 200 && r.status < 300 && approved,
-    error: r.status >= 200 && r.status < 300 && approved ? null : "void_failed",
+    ok: o.approved === true,
+    error: o.approved ? null : "void_failed",
     status: r.status,
     responseCode: r.responseCode,
     responseText: r.responseText,
@@ -1204,7 +1235,7 @@ export async function voidPayment({ transactionId, fetchImpl, privateKey } = {})
 }
 
 /** POST /api/v5/payments/{id}/refund {amount}. Settled sales; amount <= settled amount. */
-export async function refundPayment({ transactionId, amountUsd, fetchImpl, privateKey } = {}) {
+export async function refundPayment({ transactionId, amountUsd, fetchImpl, privateKey, timeoutMs } = {}) {
   const id = String(transactionId || "").trim();
   const amount = money2(amountUsd);
   if (!id) return { ok: false, error: "transactionId required" };
@@ -1214,12 +1245,14 @@ export async function refundPayment({ transactionId, amountUsd, fetchImpl, priva
     body: { amount: Number(amount) },
     fetchImpl,
     privateKey,
+    timeoutMs,
   });
+  const o = reversalOutcome(r);
+  if (o.unknown) return { ok: false, error: "outcome_unknown", outcomeUnknown: true, status: r.status || 0, amountUsd: Number(amount) };
   if (r.error) return r;
-  const approved = String(r.json.response ?? "") === "1";
   return {
-    ok: r.status >= 200 && r.status < 300 && approved,
-    error: r.status >= 200 && r.status < 300 && approved ? null : "refund_failed",
+    ok: o.approved === true,
+    error: o.approved ? null : "refund_failed",
     status: r.status,
     responseCode: r.responseCode,
     responseText: r.responseText,

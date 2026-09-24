@@ -167,6 +167,8 @@ export function salesFromXml(xml, { nameNeedle = "", nowMs = Date.now() } = {}) 
   const txns = parseNmiTransactions(xml);
   const extras = saleExtras(xml, nameNeedle);
   const back = new Map();
+  const lastBack = new Map();
+  const noteBack = (id, at, cents) => { const p = lastBack.get(id); if (at != null && (!p || at > p.at)) lastBack.set(id, { at, cents }); };
   let dayBackCents = 0;
   for (const t of txns) {
     const c = classifyTransaction(t);
@@ -175,10 +177,12 @@ export function salesFromXml(xml, { nameNeedle = "", nowMs = Date.now() } = {}) 
       if ((a.type === "refund" || a.type === "credit") && a.at != null && nowMs - a.at < DAY_MS) dayBackCents += Math.round(Math.abs(a.amount) * 100);
     }
     if (c.voided && c.kind === "sale" && c.voidAt != null && nowMs - c.voidAt < DAY_MS) dayBackCents += Math.round(c.amount * 100);
-    if (c.kind === "refund" && t.originalId) back.set(t.originalId, (back.get(t.originalId) || 0) + Math.round(c.amount * 100));
+    if (c.kind === "refund" && t.originalId) { back.set(t.originalId, (back.get(t.originalId) || 0) + Math.round(c.amount * 100)); noteBack(t.originalId, c.at, Math.round(c.amount * 100)); }
     if (c.kind === "sale") {
-      const own = t.actions.filter((a) => a.success && (a.type === "refund" || a.type === "credit")).reduce((s, a) => s + Math.round(Math.abs(a.amount) * 100), 0);
+      const ownActs = t.actions.filter((a) => a.success && (a.type === "refund" || a.type === "credit"));
+      const own = ownActs.reduce((s, a) => s + Math.round(Math.abs(a.amount) * 100), 0);
       if (own) back.set(t.id, (back.get(t.id) || 0) + own);
+      for (const a of ownActs) noteBack(t.id, a.at, Math.round(Math.abs(a.amount) * 100));
     }
   }
   const sales = [];
@@ -205,6 +209,8 @@ export function salesFromXml(xml, { nameNeedle = "", nowMs = Date.now() } = {}) 
       at_ms: c.at,
       amount_cents: amountCents,
       refunded_cents: refundedCents,
+      last_back_at: lastBack.get(t.id) ? new Date(lastBack.get(t.id).at).toISOString() : null,
+      last_back_cents: lastBack.get(t.id) ? lastBack.get(t.id).cents : 0,
       refundable_cents: action === "refund" ? amountCents - refundedCents : 0,
       voidable_cents: action === "void" ? amountCents : 0,
       settled,
@@ -250,6 +256,12 @@ export function matchSales(sales, q = {}) {
   return { error: null, matches: out };
 }
 
+/** The read right before money moves (Gabbai C5): at most 10 s, so the door's worst case - 10 s read +
+ *  15 s gateway (nmi-card REVERSAL_TIMEOUT_MS) + 8 s CRM write - is 33 s, inside the desk chat's 45 s
+ *  wait, inside its 60 s function limit. A lookup may take 20 s. */
+export const PRE_REVERSAL_READ_MS = 10000;
+export const LOOKUP_READ_MS = 20000;
+export const CRM_WRITE_MS = 8000;
 async function readSales({ deps = {}, nameNeedle = "", fresh = false } = {}) {
   const clock = typeof deps.clock === "function" ? deps.clock : Date.now;
   const key = String(deps.privateKey || (deps.env || process.env).NMI_PRIVATE_KEY || "").trim();
@@ -265,7 +277,7 @@ async function readSales({ deps = {}, nameNeedle = "", fresh = false } = {}) {
         since: new Date(now - SALE_WINDOW_DAYS * DAY_MS),
         until: new Date(now + 60000),
         fetchImpl: deps.fetchImpl || fetch,
-        timeoutMs: 25000,
+        timeoutMs: fresh ? PRE_REVERSAL_READ_MS : LOOKUP_READ_MS,
       });
     } catch (e) {
       const msg = String(e?.message || "");
@@ -332,7 +344,8 @@ async function saleBeforeReversal(txnId, deps) {
   const read = await readSales({ deps, fresh: true });
   if (!read.ok) return { ok: false, error: read.error };
   const sale = read.sales.find((s) => s.txn_id === txnId) || null;
-  return { ok: true, sale, dayBackCents: read.dayBackCents };
+  const clock = typeof deps.clock === "function" ? deps.clock : Date.now;
+  return { ok: true, sale, dayBackCents: read.dayBackCents, nowMs: clock() };
 }
 
 /** Plain words for a gateway response_code. The raw code stays in its own field. */
@@ -626,6 +639,7 @@ export async function handleChargeRequest(req, res, deps = {}) {
  * sale. Both are held to the per-refund cap and the 24-hour cap. Returns null when all pass, or the
  * refusal to send.
  */
+export const RECENT_REFUND_MS = 15 * 60 * 1000;
 function reversalRefusal(kind, txnId, amountCents, facts, env) {
   const cap = refundCapCents(env);
   const dayCap = refundDayCapCents(env);
@@ -637,6 +651,14 @@ function reversalRefusal(kind, txnId, amountCents, facts, env) {
   if (!s) return say(404, "sale_not_found", `No card sale with that transaction in the last ${SALE_WINDOW_DAYS} days. Refund it in the gateway portal.`);
   if (s.voided) return say(409, "sale_voided", "That sale was already voided - nothing is left to send back.");
   if (kind === "refund") {
+    // ONE ARMING, AT MOST ONE REFUND (Gabbai 24 Sep C4): a refund already went back on this sale in the
+    // last 15 minutes - from this chat, another screen or the portal - so a second one waits for a person.
+    const lastMs = Date.parse(s.last_back_at || "");
+    const nowMs = typeof facts.nowMs === "number" ? facts.nowMs : Date.now();
+    if (Number.isFinite(lastMs) && nowMs - lastMs < RECENT_REFUND_MS) {
+      const hhmm = new Intl.DateTimeFormat("en-GB", { timeZone: "Asia/Jerusalem", hour: "2-digit", minute: "2-digit" }).format(new Date(lastMs));
+      return say(409, "recent_refund", `A refund of $${moneyCents(s.last_back_cents)} went back on this sale at ${hhmm} (Israel time). Check it before sending another - or wait 15 minutes.`, { last_back_at: s.last_back_at, last_back_cents: s.last_back_cents });
+    }
     if (!s.settled) return say(409, "not_settled", "That sale has not settled yet, so the processor will not refund it. Void it instead (the whole sale), or refund after tonight's batch.", { settled: false });
     const left = s.amount_cents - s.refunded_cents;
     if (left <= 0) return say(409, "fully_refunded", "That sale is already fully refunded.", { refunded_cents: s.refunded_cents });
@@ -662,7 +684,11 @@ async function recordReversal(deps, fields) {
   const rec = typeof deps.recordReversal === "function" ? deps.recordReversal : null;
   if (!rec) return { state: "not_recorded", reason: "no_crm_door" };
   try {
-    const r = await rec(fields);
+    let slow;
+    const r = await Promise.race([
+      rec(fields),
+      new Promise((resolve) => { slow = setTimeout(() => resolve({ ok: false, state: "slow", errors: ["crm_slow"] }), deps.crmWriteMs || CRM_WRITE_MS); }),
+    ]).finally(() => clearTimeout(slow));
     if (r && r.state === "posted") {
       // "nmi-refund:<id>: -$15.00 -> reservation #7" -> "reservation #7" (the marker itself holds a colon).
       const where = Array.isArray(r.recorded) && r.recorded[0] ? (String(r.recorded[0]).split("->")[1] || "").trim() : "";
@@ -675,59 +701,43 @@ async function recordReversal(deps, fields) {
   }
 }
 
-/**
- * POST /__nesher_pay/void {txn_id, amount_cents, rep}. Ticket kind "void", bound to txn_id.
- * For a sale that has NOT settled: the whole sale is cancelled before it ever settles.
- */
-export async function handleVoidRequest(req, res, deps = {}) {
-  const door = await openDoor(req, res, deps, "void", "txn_id");
-  if (!door) return;
-  const { body, finish, ticket } = door;
-  const env = deps.env || process.env;
-  const txnId = str(body.txn_id, 64);
-  if (!TXN_ID_RE.test(txnId)) return finish(400, { ok: false, error: "txn_id_invalid" }, { outcome: "bad_request:txn_id_invalid" });
-  const amountCents = body.amount_cents;
-  if (!isInt(amountCents) || amountCents < 1) return finish(400, { ok: false, error: "amount_cents_invalid" }, { outcome: "bad_request:amount_cents_invalid" });
-  const facts = await saleBeforeReversal(txnId, deps);
-  const refused = reversalRefusal("void", txnId, amountCents, facts, env);
-  if (refused) return finish(refused.status, refused.body, { outcome: refused.outcome, amount_cents: amountCents, txn: txnId });
-  const sale = facts.sale;
-  let out;
-  try {
-    out = await voidPayment({ transactionId: txnId, fetchImpl: deps.fetchImpl, privateKey: deps.privateKey });
-  } catch {
-    out = { ok: false, error: "processor_error" };
-  }
-  if (!out.ok) {
-    return finish(
-      out.error === "keys_missing" ? 503 : 402,
-      {
-        ok: false,
-        error: out.error || "void_failed",
-        decline_reason_human: out.error === "keys_missing" ? "Card processing is not configured. Tell the office." : "The void did not go through. If the sale already settled, refund it instead.",
-        decline_code: out.responseCode || null,
-        decline_text: out.responseText ? String(out.responseText).slice(0, 120) : null,
-        txn_id: txnId,
-      },
-      { outcome: `void_failed:${out.responseCode || out.error || "unknown"}`, txn: txnId }
-    );
-  }
-  _resetSaleCache();
-  const crm = await recordReversal(deps, { kind: "void", saleTxn: txnId, reversalTxn: out.transactionId || null, amountUsd: Number(moneyCents(sale.amount_cents)), brand: sale.merchant, orderId: sale.order_id, rep: ticket.repId, cardLast4: sale.last4, at: new Date().toISOString() });
-  return finish(200, { ok: true, txn_id: txnId, void_txn_id: out.transactionId || null, amount_cents: sale.amount_cents, merchant: sale.merchant, crm }, { outcome: "voided", amount_cents: sale.amount_cents, txn: txnId });
+// ONE ARMING, AT MOST ONE GATEWAY CALL (Gabbai 24 Sep C4). The desk chat sends `arming` = its tile id
+// + the moment it was armed. The first request with that key claims it BEFORE the gateway is asked;
+// any repeat is answered from the claim (the same answer, or "still being sent", or "unknown") and
+// never reaches the gateway. One container answers (health `instance`), so memory is the right
+// place; behind it stands the processor-based 15-minute guard, which survives a restart.
+const ARMING_RE = /^[A-Za-z0-9:_-]{6,80}$/;
+const ARMING_TTL_MS = 24 * 60 * 60 * 1000;
+const armings = new Map();
+export function _resetArmingsForTests() {
+  armings.clear();
+}
+function claimArming(key, now) {
+  for (const [k, v] of armings) if (now - v.at > ARMING_TTL_MS) armings.delete(k);
+  const prior = armings.get(key);
+  if (prior) return prior;
+  armings.set(key, { at: now, state: "in_flight" });
+  return null;
 }
 
+const UNKNOWN_WORDS = {
+  refund: "We could not confirm this refund. Do not send it again - check the sale.",
+  void: "We could not confirm this void. Do not send it again - check the sale.",
+};
+
 /**
- * POST /__nesher_pay/refund {txn_id, amount_cents, rep}. Ticket kind "refund", bound to txn_id.
- * Any settled sale on our processor in the last 180 days - a chat tile's own sale or any past one -
- * checked against the processor first (reversalRefusal), capped per refund (REFUND_CAP_CENTS,
- * absent = 0 = refused) and per 24 hours (REFUND_DAY_CAP_CENTS), then recorded in the CRM.
+ * The refund and void doors, one body (24 Sep). kind "refund": any SETTLED sale in the last 180 days,
+ * up to what is left. kind "void": a sale that has NOT settled, the whole amount. Both: the ticket
+ * bound to the txn, the caps, the processor's own fresh record (reversalRefusal), the arming claim,
+ * the gateway with the sale's outcome classes (an unknown is 503 outcome_unknown, never "did not go
+ * through"), then the CRM record through the collection loop's ledger (recordReversal).
  */
-export async function handleRefundRequest(req, res, deps = {}) {
-  const door = await openDoor(req, res, deps, "refund", "txn_id");
+async function reversalDoor(kind, req, res, deps) {
+  const door = await openDoor(req, res, deps, kind, "txn_id");
   if (!door) return;
   const { body, finish, ticket } = door;
   const env = deps.env || process.env;
+  const clock = typeof deps.clock === "function" ? deps.clock : Date.now;
   const txnId = str(body.txn_id, 64);
   const amountCents = body.amount_cents;
   if (!TXN_ID_RE.test(txnId)) return finish(400, { ok: false, error: "txn_id_invalid" }, { outcome: "bad_request:txn_id_invalid" });
@@ -735,43 +745,79 @@ export async function handleRefundRequest(req, res, deps = {}) {
   // The cap first, before the processor is even read: a door that is off stays cheap and says so.
   const cap = refundCapCents(env);
   if (cap <= 0) {
-    return finish(403, { ok: false, error: "refund_cap_not_set", cap_cents: 0, decline_reason_human: "Refunds from the chat are switched off. Refund it in the gateway portal." }, { outcome: "refund_refused:cap_not_set", amount_cents: amountCents, txn: txnId });
+    return finish(403, { ok: false, error: "refund_cap_not_set", cap_cents: 0, decline_reason_human: "Refunds from the chat are switched off. Refund it in the gateway portal." }, { outcome: `${kind}_refused:cap_not_set`, amount_cents: amountCents, txn: txnId });
   }
   if (amountCents > cap) {
-    return finish(403, { ok: false, error: "refund_over_cap", cap_cents: cap, decline_reason_human: "That refund is above the chat's cap. Refund it in the gateway portal." }, { outcome: "refund_refused:over_cap", amount_cents: amountCents, txn: txnId });
+    return finish(403, { ok: false, error: "refund_over_cap", cap_cents: cap, decline_reason_human: "That is above the chat's cap for one refund. Refund it in the gateway portal." }, { outcome: `${kind}_refused:over_cap`, amount_cents: amountCents, txn: txnId });
   }
+  const arming = ARMING_RE.test(str(body.arming, 80)) ? `${kind}:${txnId}:${str(body.arming, 80)}` : null;
+  if (arming) {
+    const prior = claimArming(arming, clock());
+    if (prior) {
+      if (prior.state === "done") return finish(prior.status, { ...prior.body, repeated: true }, { outcome: `${kind}_repeat`, txn: txnId });
+      if (prior.state === "unknown") return finish(503, { ok: false, error: "outcome_unknown", repeated: true, decline_reason_human: UNKNOWN_WORDS[kind], txn_id: txnId }, { outcome: `${kind}_repeat:unknown`, txn: txnId });
+      return finish(409, { ok: false, error: "in_flight", decline_reason_human: `That ${kind} is being sent right now - its answer lands on the tile.`, txn_id: txnId }, { outcome: `${kind}_repeat:in_flight`, txn: txnId });
+    }
+  }
+  const release = () => { if (arming) armings.delete(arming); };
   const facts = await saleBeforeReversal(txnId, deps);
-  const refused = reversalRefusal("refund", txnId, amountCents, facts, env);
-  if (refused) return finish(refused.status, refused.body, { outcome: refused.outcome, amount_cents: amountCents, txn: txnId });
+  const refused = reversalRefusal(kind, txnId, amountCents, facts, env);
+  if (refused) {
+    release();
+    return finish(refused.status, refused.body, { outcome: refused.outcome, amount_cents: amountCents, txn: txnId });
+  }
   const sale = facts.sale;
   let out;
   try {
-    out = await refundPayment({ transactionId: txnId, amountUsd: Number(moneyCents(amountCents)), fetchImpl: deps.fetchImpl, privateKey: deps.privateKey });
+    out = kind === "refund"
+      ? await refundPayment({ transactionId: txnId, amountUsd: Number(moneyCents(amountCents)), fetchImpl: deps.fetchImpl, privateKey: deps.privateKey, timeoutMs: deps.gatewayTimeoutMs })
+      : await voidPayment({ transactionId: txnId, fetchImpl: deps.fetchImpl, privateKey: deps.privateKey, timeoutMs: deps.gatewayTimeoutMs });
   } catch {
-    out = { ok: false, error: "processor_error" };
+    out = { ok: false, error: "outcome_unknown", outcomeUnknown: true };
+  }
+  if (out.outcomeUnknown) {
+    if (arming) armings.set(arming, { at: clock(), state: "unknown" });
+    _resetSaleCache();
+    return finish(503, { ok: false, error: "outcome_unknown", decline_reason_human: UNKNOWN_WORDS[kind], txn_id: txnId, amount_cents: amountCents }, { outcome: `${kind}_outcome_unknown`, amount_cents: amountCents, txn: txnId });
   }
   if (!out.ok) {
+    release();
     return finish(
       out.error === "keys_missing" ? 503 : 402,
       {
         ok: false,
-        error: out.error || "refund_failed",
-        decline_reason_human: out.error === "keys_missing" ? "Card processing is not configured. Tell the office." : "The refund did not go through. Check the sale in the gateway portal.",
+        error: out.error || `${kind}_failed`,
+        decline_reason_human: out.error === "keys_missing" ? "Card processing is not configured. Tell the office." : kind === "refund" ? "The processor refused the refund. Check the sale in the gateway portal." : "The processor refused the void. If the sale already settled, refund it instead.",
         decline_code: out.responseCode || null,
         decline_text: out.responseText ? String(out.responseText).slice(0, 120) : null,
         txn_id: txnId,
         amount_cents: amountCents,
       },
-      { outcome: `refund_failed:${out.responseCode || out.error || "unknown"}`, amount_cents: amountCents, txn: txnId }
+      { outcome: `${kind}_failed:${out.responseCode || out.error || "unknown"}`, amount_cents: amountCents, txn: txnId }
     );
   }
   _resetSaleCache();
-  const crm = out.transactionId
-    ? await recordReversal(deps, { kind: "refund", saleTxn: txnId, reversalTxn: out.transactionId, amountUsd: Number(moneyCents(amountCents)), brand: sale.merchant, orderId: sale.order_id, rep: ticket.repId, cardLast4: sale.last4, at: new Date().toISOString() })
+  const moved = kind === "refund" ? amountCents : sale.amount_cents;
+  const crm = kind === "void" || out.transactionId
+    ? await recordReversal(deps, { kind, saleTxn: txnId, reversalTxn: out.transactionId || null, amountUsd: Number(moneyCents(moved)), brand: sale.merchant, orderId: sale.order_id, rep: ticket.repId, cardLast4: sale.last4, at: new Date(clock()).toISOString() })
     : { state: "not_recorded", reason: "no_refund_txn_id" };
-  return finish(
-    200,
-    { ok: true, txn_id: txnId, refund_txn_id: out.transactionId || null, amount_cents: amountCents, refunded_cents: sale.refunded_cents + amountCents, sale_cents: sale.amount_cents, merchant: sale.merchant, crm },
-    { outcome: "refunded", amount_cents: amountCents, txn: txnId }
-  );
+  const answer = kind === "refund"
+    ? { ok: true, txn_id: txnId, refund_txn_id: out.transactionId || null, amount_cents: amountCents, refunded_cents: sale.refunded_cents + amountCents, sale_cents: sale.amount_cents, merchant: sale.merchant, crm }
+    : { ok: true, txn_id: txnId, void_txn_id: out.transactionId || null, amount_cents: sale.amount_cents, merchant: sale.merchant, crm };
+  if (arming) armings.set(arming, { at: clock(), state: "done", status: 200, body: answer });
+  return finish(200, answer, { outcome: kind === "refund" ? "refunded" : "voided", amount_cents: moved, txn: txnId });
+}
+
+/** POST /__nesher_pay/void {txn_id, amount_cents, rep, arming}. Ticket kind "void", bound to txn_id. */
+export async function handleVoidRequest(req, res, deps = {}) {
+  return reversalDoor("void", req, res, deps);
+}
+
+/**
+ * POST /__nesher_pay/refund {txn_id, amount_cents, rep, arming}. Ticket kind "refund", bound to txn_id.
+ * Any settled sale on our processor in the last 180 days - a chat tile's own sale or any past one -
+ * capped per refund (REFUND_CAP_CENTS, absent = 0 = refused) and per 24 hours (REFUND_DAY_CAP_CENTS).
+ */
+export async function handleRefundRequest(req, res, deps = {}) {
+  return reversalDoor("refund", req, res, deps);
 }

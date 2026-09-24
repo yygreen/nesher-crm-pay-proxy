@@ -310,7 +310,25 @@ describe("a refund or void from the desk chat, recorded against the sale's CRM r
     assert.equal(pays[1].offer_id, 99);
     assert.equal(pays[1].card_last4, "0008");
     const notes = (await pool.query("SELECT note FROM core_jrmhotelnote ORDER BY id")).rows.map((x) => x.note);
-    assert.match(notes[notes.length - 1], /^VOID of NMI card sale txn nmi_hot_1: -\$80\.00 USD, card ending 0008, sent by joseph from the desk chat\.$/);
+    assert.match(notes[notes.length - 1], /^VOID of NMI card sale txn nmi_hot_1: -\$80\.00 USD, card ending 0008, sent by joseph from the desk chat\. If this was a cancellation, add the refund on hotel request #42 in the CRM, or it will show \$80\.00 due\.$/);
     assert.equal((await row("SELECT kind, state FROM nesher_money_payment_posts WHERE transaction_id = 'void_nmi_hot_1'")).kind, "refund");
+  });
+});
+
+describe("the retry worker never hands a reversal to the sale writer (Gabbai 24 Sep C1)", () => {
+  it("a refund whose CRM write failed stays pending, then the retry moves it to review: no plus row, amount_paid unchanged", async () => {
+    assert.equal((await recordNmiPaidInvoice({ pool, invoiceNumber: "RES-ABC123", amountUsd: 40, transactionId: "nmi_res_1", paidAt: "2026-09-20T10:00:00.000Z" })).ok, true);
+    await addAlwaysFailTrigger("core_payment", "fail_pay", "payment table unavailable");
+    await assert.rejects(recordNmiReversal({ pool, kind: "refund", saleTxn: "nmi_res_1", reversalTxn: "nmi_rf_fail", amountUsd: 15, brand: "nesher", orderId: "RES-ABC123", rep: "joseph" }));
+    assert.equal((await row("SELECT state FROM nesher_money_payment_posts WHERE transaction_id = 'nmi_rf_fail'")).state, "pending");
+    await removeAlwaysFailTrigger("core_payment", "fail_pay");
+    // the REAL worker with the REAL sale writer, as server.js runs it
+    const out = await retryPaymentPosts({ pool, post: recordNmiPaidInvoice });
+    assert.equal(out.review, 1);
+    assert.equal(out.posted, 0);
+    assert.deepEqual(await row("SELECT state, reason, kind FROM nesher_money_payment_posts WHERE transaction_id = 'nmi_rf_fail'"), { state: "review", reason: "reversal_retry_requires_review", kind: "refund" });
+    const rows = (await pool.query("SELECT amount FROM core_payment WHERE reservation_id = 7 ORDER BY id")).rows.map((x) => Number(x.amount));
+    assert.deepEqual(rows, [40], "only the sale row - no plus row for the refund, no minus row either");
+    assert.equal(await scalar("SELECT amount_paid AS value FROM core_reservation WHERE id = 7"), 40);
   });
 });
