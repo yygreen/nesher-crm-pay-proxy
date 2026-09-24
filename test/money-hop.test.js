@@ -123,11 +123,11 @@ describe("money-hop route", () => {
     } finally { await t.close(); }
   });
 
-  it("forwards only the six GETs (plan 17.4 added /invoices); anything else is 405 not_forwardable and never becomes a job", async () => {
+  it("forwards only the seven GETs (plan 17.4 added /invoices, F6 /money-map); anything else is 405 not_forwardable and never becomes a job", async () => {
     const t = await rig();
     try {
-      assert.deepEqual(MONEY_HOP_FORWARDABLE, ["/health", "/balances", "/transactions", "/caps", "/state", "/invoices"]);
-      for (const [m, p] of [["POST", "/balances"], ["GET", "/send"], ["GET", "/balances/x"], ["GET", "/transfer?amount=1"], ["GET", "/recipients"], ["DELETE", "/state"]]) {
+      assert.deepEqual(MONEY_HOP_FORWARDABLE, ["/health", "/balances", "/transactions", "/caps", "/state", "/invoices", "/money-map"]);
+      for (const [m, p] of [["POST", "/balances"], ["POST", "/money-map"], ["GET", "/send"], ["GET", "/balances/x"], ["GET", "/transfer?amount=1"], ["GET", "/recipients"], ["DELETE", "/state"]]) {
         const r = await call(t, m, p, { body: m === "POST" ? "{}" : null });
         assert.equal(r.status, 405, m + " " + p);
         assert.equal(r.json.error, "not_forwardable");
@@ -279,7 +279,8 @@ describe("wiring", () => {
     assert.match(docker, /\bmoney-hop\.js\b/);
     const src = fs.readFileSync(new URL("../server.js", import.meta.url), "utf8");
     assert.match(src, /import \{ createMoneyHop \} from "\.\/money-hop\.js"/);
-    assert.match(src, /createMoneyHop\(\{\s+key: process\.env\.MONEY_HOP_KEY \|\| "",\s+direct: \(sub\) => mercuryGateway\.hopDirect\(sub\),\s+\}\)/);
+    // F6: the money map is answered by the pay-proxy itself; every other data GET goes to the Mercury door
+    assert.match(src, /createMoneyHop\(\{\s+key: process\.env\.MONEY_HOP_KEY \|\| "",\s+direct: \(sub\) => \(String\(sub\)\.split\("\?"\)\[0\] === MONEY_MAP_PATH \? moneyMap\.hopAnswer\(sub\) : mercuryGateway\.hopDirect\(sub\)\),\s+\}\)/);
     assert.match(src, /url\.pathname\.startsWith\("\/__money_hop\/"\)/);
     assert.match(src, /await moneyHop\.handle\(req, res\)/);
     assert.match(src, /moneyHop: moneyHop\.health\(\)/);

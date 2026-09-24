@@ -93,6 +93,7 @@ import { createMoneyHop } from "./money-hop.js";
 import { createMercuryGateway } from "./mercury-gateway.js";
 import { createMoneyWatch } from "./money-watch.js";
 import { createMoneyPay } from "./money-pay.js";
+import { createMoneyMap, MONEY_MAP_PATH } from "./money-map.js";
 import {
   getPool,
   loadHotelPayContext,
@@ -1071,13 +1072,21 @@ function proxyWithInject(req, res) {
 // signed GET /__money_hop/<seat path> becomes one job for the seat. MONEY_HOP_KEY unset = 503.
 // Off the PC (Joseph 23 Sep: "nothing needs to work through this machine"): a verified data GET
 // on the hop is answered direct to Mercury when the allowlist lets it, else by the seat as before.
+// Money map (F6): GET /__money_hop/money-map is answered HERE, read-only, behind the same hop
+// signature the desk chat already uses for the bank line - never forwarded to the seat.
 const moneyHop = createMoneyHop({
   key: process.env.MONEY_HOP_KEY || "",
-  direct: (sub) => mercuryGateway.hopDirect(sub),
+  direct: (sub) => (String(sub).split("?")[0] === MONEY_MAP_PATH ? moneyMap.hopAnswer(sub) : mercuryGateway.hopDirect(sub)),
 });
 // The one door to Mercury (mercury-gateway.js): direct first, the seat / the tunnel as fallback,
 // the seat's read-only rules as code. Health reports per token which path served each use.
 const mercuryGateway = createMercuryGateway({ getHop: () => moneyHop });
+// The money map: processed per brand, fees measured from the bank, contribution per booking. READ ONLY.
+const moneyMap = createMoneyMap({
+  nmiConfig: () => ({ host: process.env.NMI_HOST || "https://pinpointpayments.transactiongateway.com", securityKey: process.env.NMI_PRIVATE_KEY || "" }),
+  mercuryRead: (use, p) => mercuryGateway.read(use, p),
+  getPool: () => (process.env.DATABASE_URL || process.env.DATABASE_PUBLIC_URL ? getPool() : null),
+});
 // The three Nesher-Payment-Watch jobs, on the server, in SHADOW beside the PC task.
 const moneyWatch = createMoneyWatch({
   gateway: mercuryGateway,
@@ -1546,6 +1555,7 @@ const server = http.createServer(async (req, res) => {
       hasWhatsApp: wa.configured,
       hasMercuryRelay: (process.env.MERCURY_RELAY_KEY || "").length >= 24,
       moneyHop: moneyHop.health(),
+      moneyMap: moneyMap.health(),
       mercury: mercuryGateway.health(),
       moneyWatch: moneyWatch.summary(),
       whatsappWebhook: {

@@ -22,8 +22,9 @@ import crypto from "node:crypto";
 
 export const MONEY_HOP_PREFIX = "/__money_hop";
 export const MONEY_HOP_KEY_ID = "hop";
-export const MONEY_HOP_FORWARDABLE = ["/health", "/balances", "/transactions", "/caps", "/state", "/invoices"];
-export const MONEY_HOP_BUILD = "2026-09-23-money-hop-direct";
+// /money-map (F6, 24 Sep) is answered by the pay-proxy itself through the direct hook, never by the seat.
+export const MONEY_HOP_FORWARDABLE = ["/health", "/balances", "/transactions", "/caps", "/state", "/invoices", "/money-map"];
+export const MONEY_HOP_BUILD = "2026-09-24-money-map";
 export const MONEY_HOP_MAX_SKEW_MS = 5 * 60 * 1000;
 export const MONEY_HOP_NONCE_TTL_MS = 10 * 60 * 1000;
 const HEADER_NAMES = ["x-seat-key", "x-seat-ts", "x-seat-nonce", "x-seat-sig"];
