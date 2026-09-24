@@ -98,7 +98,8 @@ export function memoRefs(memo) {
   let m;
   const jrm = /\bJRM-1(\d{2,6})(?:-O\d+)?\b/gi;
   while ((m = jrm.exec(s))) out.jrmRequests.push(Number(m[1]));
-  const req = /\b(?:request|req|בקשה)\s*#?\s*(\d{3,6})\b/gi;
+  // \b does not see Hebrew letters as word characters, so the start is a space or the start.
+  const req = /(?:^|[\s(])(?:request|req|בקשה)\s*#?\s*(\d{3,6})\b/gi;
   while ((m = req.exec(s))) out.jrmRequests.push(Number(m[1]));
   const res = /\bRES-([A-Z0-9]{4,12})\b/gi;
   while ((m = res.exec(s))) out.res.push(m[1].toUpperCase());

@@ -258,6 +258,7 @@ describe("memo, payee words", () => {
     assert.equal(m.codes[0].match(/\d/) != null, true);
     assert.deepEqual(m.jrmRequests, [1084]);
     assert.deepEqual(m.res, ["Q6TWM7"]);
+    assert.deepEqual(memoRefs("05d105e705e905d4 1038").jrmRequests, [1038]);
   });
   it("names one payee or none", () => {
     const views = Object.values(R).filter((x) => payeeVerdict(x).ok).map(payeeView);
