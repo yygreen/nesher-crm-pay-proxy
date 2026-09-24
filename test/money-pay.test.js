@@ -137,7 +137,7 @@ describe("payeeVerdict: the plan's hard lines (1.5)", () => {
   });
   it("the view carries name, method, bank and last four only", () => {
     const v = payeeView(R.shloimy);
-    assert.deepEqual(Object.keys(v).sort(), ["bank", "fp", "id", "last4", "lastPaid", "method", "name", "nickname", "person"]);
+    assert.deepEqual(Object.keys(v).sort(), ["bank", "fp", "id", "last4", "lastPaid", "method", "name", "nickname", "payable", "person", "why"]);
     assert.equal(v.last4, "3483");
     assert.ok(!JSON.stringify(v).includes("021000021"));
   });

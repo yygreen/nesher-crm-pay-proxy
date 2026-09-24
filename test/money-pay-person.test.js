@@ -303,6 +303,37 @@ describe("sendPay: direct ACH from Nesher checking, every rule checked here", ()
     assert.equal(r.body.error, "client_gone_nothing_sent");
     assert.equal(s.sends.length, 0);
   });
+  it("Gabbai C2: Mercury's words echoing an account number keep only its last four", async () => {
+    const s = mercury();
+    const echo = async (url, init = {}) => {
+      if (new URL(String(url)).pathname.endsWith("/transactions") && (init.method || "GET") === "POST") {
+        return new Response(JSON.stringify({ errors: { message: `Invalid account ${ACCT} at routing ${CFSB}` } }), { status: 400 });
+      }
+      return s.fetch(url, init);
+    };
+    const g = createMercuryGateway({ env: ENV_ON, fetchImpl: echo, now: () => NOW });
+    const r = await g.sendPay(base(s));
+    assert.equal(r.body.error, "mercury_refused");
+    assert.ok(!r.body.mercury.includes(ACCT) && !r.body.mercury.includes(CFSB), r.body.mercury);
+    assert.ok(r.body.mercury.includes("••8846"));
+  });
+  it("Gabbai C6: a person's payment never says 'Supplier payment' at their bank; a supplier's still may", async () => {
+    const s = mercury();
+    await gw(s).sendPay(base(s, { memo: "JRM Hotels" }));
+    assert.equal(s.sends[0].externalMemo, "Refund");
+    const s2 = mercury();
+    await gw(s2).sendPay(base(s2, { recipientId: BASE_R.sky.id, fp: fpOf(BASE_R.sky), memo: "JRM" }));
+    assert.equal(s2.sends[0].externalMemo, "Supplier payment");
+  });
+  it("Gabbai C9: the view says whether the chat may pay this recipient", async () => {
+    const all = await gw(mercury()).payRecipientsAll();
+    const v = (id) => all.find((x) => x.view.id === id).view;
+    assert.equal(v(BASE_R.cohen.id).payable, true);
+    assert.equal(v(BASE_R.richter.id).payable, false);
+    assert.equal(v(BASE_R.richter.id).why, "richter");
+    const off = await gw(mercury(), { MONEY_PAY_RECIPIENTS: "" }).payRecipientsAll();
+    assert.equal(off.find((x) => x.view.id === BASE_R.cohen.id).view.payable, false);
+  });
   it("payTxnStatus: pending -> sending, sent -> paid, Nesher checking only", async () => {
     const s = mercury();
     const g = gw(s);

@@ -206,6 +206,14 @@ export function abaOk(routing) {
 export const ACH_TYPES = Object.freeze(["personalChecking", "personalSavings", "businessChecking", "businessSavings"]);
 const EMAIL_RE = /^[^\s@<>(),;:"]{1,64}@[A-Za-z0-9.-]{1,190}\.[A-Za-z]{2,24}$/;
 
+/** Gabbai AJ C2: any run of 5+ digits (spaces / dashes allowed inside) keeps only its last four. Pure. */
+export function scrubDigits(t) {
+  return String(t == null ? "" : t).replace(/\d[\d \-]{3,}\d/g, (m) => {
+    const d = m.replace(/\D/g, "");
+    return d.length >= 5 ? "\u2022\u2022" + d.slice(-4) : m;
+  });
+}
+
 /** "yael.sher@gmail.com" -> "y***@gmail.com". For logs and the tile. Pure. */
 export function maskEmail(e) {
   const s = String(e || "").trim();
@@ -332,6 +340,8 @@ export function payeeView(r, o = {}) {
     lastPaid: r.dateLastPaid || null,
     person: r.isBusiness !== true,
     fp: payeeFingerprint(r, o.fpKey),
+    payable: v.ok === true,
+    why: v.ok ? null : v.why,
   };
 }
 
@@ -365,7 +375,7 @@ export const NOTE_MARK = " · desk chat ";
  * carries a JRM mark - "JRM Hotels", JRM-... references and the word JRM are taken out; nothing
  * left = "Supplier payment". The full memo stays in the note, the tile and the log.
  */
-export function externalMemoOf(memo) {
+export function externalMemoOf(memo, fallback) {
   const out = String(memo || "")
     .replace(/\bJRM[-\s]?Hotels?\b/gi, " ")
     .replace(/\bJRM-[A-Z0-9-]+/gi, " ")
@@ -373,7 +383,7 @@ export function externalMemoOf(memo) {
     .replace(/\s+/g, " ")
     .replace(/^[\s,;:.\-–]+|[\s,;:\-–]+$/g, "")
     .trim();
-  return out || "Supplier payment";
+  return out || String(fallback || "Supplier payment");
 }
 
 /** The rep's memo out of an echoed memo (the part before the desk-chat marker). */
@@ -868,7 +878,7 @@ export function createMercuryGateway(opts = {}) {
   function mercuryWords(body) {
     const b = body || {};
     const m = b.message || b.error || b.errors || "";
-    return (typeof m === "string" ? m : JSON.stringify(m)).slice(0, 300);
+    return scrubDigits((typeof m === "string" ? m : JSON.stringify(m)).slice(0, 300));
   }
 
   /** Every recipient, each with its verdict. Throws on anything but a clean list. */
@@ -958,7 +968,7 @@ export function createMercuryGateway(opts = {}) {
       amount: Number((cents / 100).toFixed(2)),
       paymentMethod: payee.method,
       idempotencyKey: key,
-      externalMemo: externalMemoOf(memo),
+      externalMemo: externalMemoOf(memo, payee.view && payee.view.person ? "Refund" : ""),
       // The note BEGINS with the memo, so whichever of the two Mercury echoes as `memo`, the 24 h rule
       // and the paid-read still find it; the rest names the tile and the rep.
       note: (memo + NOTE_MARK + String(o.note || "").replace(/[\u0000-\u001f\u007f]/g, " ").trim()).slice(0, 240),
@@ -1093,7 +1103,7 @@ export function createMercuryGateway(opts = {}) {
       amount: Number((cents / 100).toFixed(2)),
       paymentMethod: "ach",
       idempotencyKey: key,
-      externalMemo: externalMemoOf(memo),
+      externalMemo: externalMemoOf(memo, payee.view && payee.view.person ? "Refund" : ""),
       note: (memo + NOTE_MARK + String(o.note || "").replace(/[\u0000-\u001f\u007f]/g, " ").trim()).slice(0, 240),
     };
     if (typeof o.isGone === "function" && o.isGone()) return { status: 499, body: { ok: false, error: "client_gone_nothing_sent" } };
