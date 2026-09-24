@@ -46,8 +46,15 @@ import {
  * here again, and the gateway cuts the whole note at 240.
  */
 const CTRL_RE = new RegExp("[" + String.fromCharCode(0) + "-" + String.fromCharCode(31) + String.fromCharCode(127) + "]", "g");
+const ISO_DATE_RE = new RegExp("\\b\\d{4}-\\d{2}-\\d{2}\\b", "g");
+const DATE_SLOT_RE = new RegExp(String.fromCharCode(1) + "(\\d+)" + String.fromCharCode(1), "g");
 export function deskNote(tile, repId, matched, repNote) {
-  const extra = scrubDigits(String(repNote == null ? "" : repNote).replace(CTRL_RE, " ").split(" ").filter(Boolean).join(" ")).slice(0, 160);
+  // An ISO date is set aside before the digit cut (Gabbai AO C1): "2026-09-24" must reach Mercury as the rep
+  // wrote it, the way the desk's own mask keeps it. A bare 5-6 digit amount still shows as its last four.
+  const dates = [];
+  const held = String(repNote == null ? "" : repNote).replace(CTRL_RE, " ").split(" ").filter(Boolean).join(" ")
+    .replace(ISO_DATE_RE, (m) => { dates.push(m); return "\u0001" + (dates.length - 1) + "\u0001"; });
+  const extra = scrubDigits(held).replace(DATE_SLOT_RE, (_, i) => dates[Number(i)] || "").slice(0, 160);
   return `${tile || "-"} by ${repId}${matched ? `; for ${matched}` : ""}${extra ? `; notes: ${extra}` : ""}`;
 }
 

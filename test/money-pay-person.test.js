@@ -499,6 +499,8 @@ describe("Mr. AO: tile notes and a returned payment", () => {
     const n = deskNote("mp0000001", "joseph", "", "Joseph: refund Sukkos 79RHW4, acct 8310006088846");
     assert.equal(n, "mp0000001 by joseph; notes: Joseph: refund Sukkos 79RHW4, acct ••8846");
     assert.ok(!n.includes(ACCT));
+    // Gabbai AO C1: a date survives the digit cut, exactly as the desk showed it
+    assert.equal(deskNote("mp1", "joseph", "", "paid 2026-09-24, acct 8310006088846"), "mp1 by joseph; notes: paid 2026-09-24, acct \u2022\u20228846");
     assert.ok(deskNote("mp1", "joseph", "", "x".repeat(500)).length <= "mp1 by joseph; notes: ".length + 160);
   });
   it("the send door puts the notes in Mercury's note and nowhere in the external memo", async () => {
