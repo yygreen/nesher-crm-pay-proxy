@@ -56,7 +56,7 @@ export function payDoorOf(pathname) {
   return null;
 }
 
-// ── Mr. AK Money: pasted bank details are HELD here, never on the desk ─────────────────────────
+// ── Mr. AJ Money: pasted bank details are HELD here, never on the desk ─────────────────────────
 // The desk parses what the rep pasted and sends the details here ONCE; it keeps only the reference
 // this returns, the last four, the name and the bank's name. The hold is in this process's memory
 // only (like the card hold), 30 minutes, bound to the rep who pasted it, spent by one successful add.
@@ -344,7 +344,7 @@ export function createMoneyPay(deps = {}) {
   }
 
   async function status(req, res) {
-    // An approval request (request_id) or, since Mr. AK, a sent payment (txn_id). One of the two.
+    // An approval request (request_id) or, since Mr. AJ, a sent payment (txn_id). One of the two.
     const door = await open(req, res, "paystat", (b) => {
       const rq = str(b.request_id, 40), tx = str(b.txn_id, 40);
       if (UUID_RE.test(rq) && !tx) return rq;
@@ -359,7 +359,7 @@ export function createMoneyPay(deps = {}) {
     finish(out.status, b, { request_id: tx ? null : str(body.request_id, 40), txn: tx || null, state: b.state || null, outcome: b.ok ? "read" : String(b.error || "error") });
   }
 
-  // ── Mr. AK: the pasted details go to the hold; the desk keeps a reference and the last four ──
+  // ── Mr. AJ: the pasted details go to the hold; the desk keeps a reference and the last four ──
   async function payeeHold(req, res) {
     const door = await open(req, res, "payprep", (b) => (TILE_RE.test(str(b.tile_id, 24)) && str(b.tile_id, 24).startsWith("pr") ? str(b.tile_id, 24) : ""));
     if (!door) return;

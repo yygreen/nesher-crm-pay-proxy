@@ -34,7 +34,7 @@ import crypto from "node:crypto";
 import { fetchWithTimeout } from "./http.js";
 import { normalizeToken } from "./mercury.js";
 
-export const MERCURY_GATEWAY_BUILD = "2026-09-24-money-ak";
+export const MERCURY_GATEWAY_BUILD = "2026-09-24-pay-person";
 export const MERCURY_DIRECT_ROOT = "https://api.mercury.com/api/v1";
 export const TOKEN_AR = "MERCURY_TOKEN_NESHER";
 export const TOKEN_FULL = "MERCURY_TOKEN_NESHER_FULL";
@@ -170,7 +170,7 @@ export function checkPayOperation(method, pathWithQuery) {
   }
   if (m === "GET" && /^\/request-send-money\/[^/]+$/.test(p)) return UUID_RE.test(p.slice(20)) ? { ok: true } : { ok: false, status: 400, error: "bad_id" };
   if (m === "POST" && p === `/account/${PAY_CHECKING.id}/request-send-money`) return { ok: true };
-  // Mr. AK Money (Joseph, 24 Sep): add a recipient; send an ACH from Nesher checking; read one
+  // Mr. AJ Money (Joseph, 24 Sep): add a recipient; send an ACH from Nesher checking; read one
   // payment of Nesher checking. Each is one exact shape; the switches (MONEY_PAY_RECIPIENTS,
   // MONEY_PAY_MODE) are checked by the functions that use them, never here.
   if (m === "POST" && p === "/recipients") return { ok: true };
@@ -183,7 +183,7 @@ export function checkPayOperation(method, pathWithQuery) {
   return { ok: false, status: 405, error: "not_in_this_ship" };
 }
 
-// ── Mr. AK Money (24 Sep 2026): pay a PERSON, add a recipient, send without an approver ─────────
+// ── Mr. AJ Money (24 Sep 2026): pay a PERSON, add a recipient, send without an approver ─────────
 // Joseph, 24 Sep, on the open item "paying individuals": he pastes a customer's bank details and
 // says "we want to refund them $630" - "would Mr money be able to do it?". Then: "it needs to be
 // able to add recipients", and "No need to wait for approvels". So, behind two switches:
@@ -829,7 +829,7 @@ export function createMercuryGateway(opts = {}) {
       on: String(env.MONEY_PAY || "").trim().toLowerCase() === "on",
       maxCents: n(env.MONEY_PAY_MAX_CENTS, PAY_MAX_CENTS_DEFAULT),
       dayCents: n(env.MONEY_PAY_DAY_CENTS, PAY_DAY_CENTS_DEFAULT),
-      // Mr. AK: both default OFF; either can be taken back by one Railway variable.
+      // Mr. AJ: both default OFF; either can be taken back by one Railway variable.
       recipients: String(env.MONEY_PAY_RECIPIENTS || "").trim().toLowerCase() === "on",
       mode: String(env.MONEY_PAY_MODE || "").trim().toLowerCase() === "direct" ? "direct" : "approval",
     };
@@ -980,7 +980,7 @@ export function createMercuryGateway(opts = {}) {
     return { status: 502, body: { ok: false, error: "mercury_refused", mercury_status: r.status, mercury: mercuryWords(r.body), payee: payee.view } };
   }
 
-  // ── Mr. AK Money ─────────────────────────────────────────────────────────────
+  // ── Mr. AJ Money ─────────────────────────────────────────────────────────────
   /**
    * ADD A RECIPIENT (moves no money). The draft is recipientDraft()'s; the numbers in it are never
    * logged or returned. A recipient with the same bank details already in Mercury is REUSED, never

@@ -1,4 +1,4 @@
-// Mr. AK Money (24 Sep 2026): pay a PERSON from pasted bank details, add a recipient, send an ACH
+// Mr. AJ Money (24 Sep 2026): pay a PERSON from pasted bank details, add a recipient, send an ACH
 // without an approver (Joseph: "No need to wait for approvels"). NO real Mercury call happens in this
 // file - every answer comes from the fake below, which counts every POST and keeps every body it got.
 import { describe, it } from "node:test";
