@@ -580,6 +580,7 @@ export function buildMoneyMap({ period, nowMs, nmi, bank, invoices, crm, sources
     for (const b of batches) if (b.fee) { feeSum += b.fee.feeExact; feeBase += b.gross_sales; }
     rateAll = feeBase > 0 ? feeSum / feeBase : null;
 
+    const midOf = (pid) => (out.merchant_accounts[pid || "unknown"] ||= { label: MERCHANT_ACCOUNTS[pid]?.label || "unknown", gross_sales: 0, sale_count: 0, fee_measured: 0, fee_measured_on: 0, effective_rate: null });
     const saleBrand = new Map();
     for (const t of txns) {
       const m = t.money;
@@ -604,7 +605,7 @@ export function buildMoneyMap({ period, nowMs, nmi, bank, invoices, crm, sources
         add(B.card.by_merchant_account, t.processorId || "unknown", m.amount);
         add(B.card.by_card_brand, t.cardType || "unknown", m.amount);
         add(B.card.by_rep, t.rep || "not stamped", m.amount);
-        const mid = (out.merchant_accounts[t.processorId || "unknown"] ||= { label: MERCHANT_ACCOUNTS[t.processorId]?.label || "unknown", gross_sales: 0, sale_count: 0, fee_measured: 0, fee_measured_on: 0, effective_rate: null });
+        const mid = midOf(t.processorId);
         mid.gross_sales += m.amount;
         mid.sale_count++;
         const st = statusOf.get(t.id);
@@ -626,7 +627,13 @@ export function buildMoneyMap({ period, nowMs, nmi, bank, invoices, crm, sources
         if (!B) { out.unbranded.count++; out.unbranded.amount -= m.amount; continue; }
         B.card.refunds += m.amount;
         B.card.refund_count++;
-        if (feeOf.has(t.id)) { B.fees.measured += feeOf.get(t.id); B.fees.on_refund_batches = (B.fees.on_refund_batches || 0) + feeOf.get(t.id); }
+        if (feeOf.has(t.id)) {
+          B.fees.measured += feeOf.get(t.id);
+          B.fees.on_refund_batches = (B.fees.on_refund_batches || 0) + feeOf.get(t.id);
+          const md = midOf(t.processorId);
+          md.fee_measured += feeOf.get(t.id);
+          md.fee_on_refund_batches = (md.fee_on_refund_batches || 0) + feeOf.get(t.id);
+        }
         const orig = t.originalId ? byId.get(t.originalId) : null;
         if (orig && orig.money.at != null && orig.money.at < period.startMs) B.card.refunds_of_earlier_sales = r2((B.card.refunds_of_earlier_sales || 0) + m.amount);
       } else if (m.kind === "auth_only" && inPeriod(m.at) && B) {
@@ -710,7 +717,7 @@ export function buildMoneyMap({ period, nowMs, nmi, bank, invoices, crm, sources
     B.mercury_invoices.fee_unmeasured_on = r2(B.mercury_invoices.fee_unmeasured_on);
     B.confirmed_total = B.card ? r2(B.card.net + B.mercury_invoices.paid) : null;
     const F = B.fees;
-    F.effective_rate = pct(F.measured, F.measured_on);
+    F.effective_rate = pct(F.measured - (F.on_refund_batches || 0), F.measured_on);
     F.measured = r2(F.measured);
     if (F.on_refund_batches) F.on_refund_batches = r2(F.on_refund_batches);
     F.measured_on = r2(F.measured_on);
@@ -721,7 +728,8 @@ export function buildMoneyMap({ period, nowMs, nmi, bank, invoices, crm, sources
     }
   }
   for (const m of Object.values(out.merchant_accounts)) {
-    m.effective_rate = pct(m.fee_measured, m.fee_measured_on);
+    m.effective_rate = pct(m.fee_measured - (m.fee_on_refund_batches || 0), m.fee_measured_on);
+    if (m.fee_on_refund_batches) m.fee_on_refund_batches = r2(m.fee_on_refund_batches);
     m.gross_sales = r2(m.gross_sales);
     m.fee_measured = r2(m.fee_measured);
     m.fee_measured_on = r2(m.fee_measured_on);
@@ -776,12 +784,13 @@ export function buildMoneyMap({ period, nowMs, nmi, bank, invoices, crm, sources
   }
 
   // ---- contribution per booking ----
-  if (crm) out.bookings = buildBookings({ crm, txns, txnToRow, rateAll, inPeriod, batches });
+  const nmiFromMs = sources?.nmi?.window?.from ? Date.parse(sources.nmi.window.from) : null;
+  if (crm) out.bookings = buildBookings({ crm, txns, txnToRow, rateAll, inPeriod, batches, nmiFromMs });
   else notes.push("Contribution per booking is not available: the CRM could not be read (" + (sources.crm?.error || "unknown") + ").");
   return out;
 }
 
-function buildBookings({ crm, txns, txnToRow, rateAll, inPeriod, batches }) {
+function buildBookings({ crm, txns, txnToRow, rateAll, inPeriod, batches, nmiFromMs }) {
   const { feeOf } = feeShares(batches);
   const resById = new Map(crm.reservations.map((r) => [String(r.id), r]));
   const resByCode = new Map(crm.reservations.map((r) => [String(r.reservation_code).toUpperCase(), r]));
@@ -841,7 +850,12 @@ function buildBookings({ crm, txns, txnToRow, rateAll, inPeriod, batches }) {
     // A CRM card row with no sale in our processor's record may have been charged by the airline or
     // another processor: its fee is NOT known and is not estimated at our rate (it may be zero).
     let notInProcessor = 0;
-    for (const r of bk.rows) if (r.method === "card" && !linkedRows.has(r.key) && r.amount > 0) notInProcessor += r.amount;
+    let notChecked = 0;
+    for (const r of bk.rows) {
+      if (r.method !== "card" || linkedRows.has(r.key) || !(r.amount > 0)) continue;
+      if (nmiFromMs != null && r.ms < nmiFromMs) notChecked += r.amount;
+      else notInProcessor += r.amount;
+    }
     const estimated = rateAll != null ? estimatedOn * rateAll : null;
     // cost
     let cost;
@@ -873,10 +887,11 @@ function buildBookings({ crm, txns, txnToRow, rateAll, inPeriod, batches }) {
         amount: r2(amount),
         estimate: estimatedOn > 0,
         final,
-        label: [
+        label: ([
           estimatedOn > 0 ? `includes an estimated card fee: ${r2(estimatedOn)} not yet deposited x measured rate ${r2(rateAll * 100)}%` : null,
           notInProcessor > 0 ? `no card fee taken off for ${r2(notInProcessor)} of card payments that are not in our processor's record (charged elsewhere - their fee is not known)` : null,
-        ].filter(Boolean).join("; ") || "every part measured or recorded"
+          notChecked > 0 ? `no card fee taken off for ${r2(notChecked)} of card payments older than the processor record read for this answer` : null,
+        ].filter(Boolean).join("; ") || "every part measured or recorded")
           + (overpaid ? "; not final - more was received than the booking price (a duplicate row or an old price) - check before trusting"
             : paidInFull ? "" : "; not final - the booking is not paid in full, so the cost is ahead of the money"),
       };
@@ -891,7 +906,7 @@ function buildBookings({ crm, txns, txnToRow, rateAll, inPeriod, batches }) {
       processor_sales_not_in_crm: r2(notInCrm),
       refunds: r2(refunds),
       cost,
-      card_fees: { measured: r2(measured), estimated: estimated == null ? null : r2(estimated), estimated_on: r2(estimatedOn), not_in_processor_record: r2(notInProcessor) },
+      card_fees: { measured: r2(measured), estimated: estimated == null ? null : r2(estimated), estimated_on: r2(estimatedOn), not_in_processor_record: r2(notInProcessor), older_than_processor_read: r2(notChecked) },
       contribution,
       flags,
     });
@@ -910,6 +925,8 @@ function buildBookings({ crm, txns, txnToRow, rateAll, inPeriod, batches }) {
       paid_in_full_with_known_cost: f.length,
       contribution_paid_in_full: f.length ? r2(f.reduce((s, i) => s + i.contribution.amount, 0)) : null,
       contribution_includes_estimate: f.some((i) => i.contribution.estimate),
+      card_payments_not_in_processor_record: r2(mine.reduce((s, i) => s + i.card_fees.not_in_processor_record, 0)),
+      card_payments_older_than_processor_read: r2(mine.reduce((s, i) => s + i.card_fees.older_than_processor_read, 0)),
     };
   }
   return {

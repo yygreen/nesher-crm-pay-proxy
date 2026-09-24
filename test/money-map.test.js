@@ -51,7 +51,7 @@ function bankRowsOf(list) {
   // the same shaping buildMoneyMap receives from createMoneyMap (via the exported classifier)
   return list.map((t) => ({ id: t.id, at: Date.parse(t.createdAt), createdMs: Date.parse(t.createdAt), amount: t.amount, pending: false, ...classifyBankRow(t) }));
 }
-function map({ nmi, bankList = [], invoices = [], crm = null, period = SEPT, nowMs = NOW }) {
+function map({ nmi, bankList = [], invoices = [], crm = null, period = SEPT, nowMs = NOW, nmiFrom = null }) {
   return buildMoneyMap({
     period,
     nowMs,
@@ -59,7 +59,7 @@ function map({ nmi, bankList = [], invoices = [], crm = null, period = SEPT, now
     bank: bankList == null ? null : bankRowsOf(bankList),
     invoices,
     crm,
-    sources: { nmi: { ok: nmi != null }, mercury: { ok: bankList != null }, invoices: { ok: true }, crm: { ok: Boolean(crm) } },
+    sources: { nmi: { ok: nmi != null, ...(nmiFrom ? { window: { from: nmiFrom } } : {}) }, mercury: { ok: bankList != null }, invoices: { ok: true }, crm: { ok: Boolean(crm) } },
   });
 }
 const emptyCrm = () => ({ nesherInPeriod: [], reservations: [], nesherAll: [], jrmInPeriod: [], jrmAll: [], offers: [], requests: [] });
@@ -348,6 +348,23 @@ describe("contribution per booking (plan 16.4.1: missing costs never become zero
     assert.equal(b.processor_sales_not_in_crm, 0);
     assert.equal(b.contribution.amount, 50); // 100 - 50, no invented fee
     assert.match(b.contribution.label, /not in our processor's record/);
+  });
+  it("a partly paid booking says BOTH what fee it left out and that it is not final; card rows older than the processor read are 'not checked'", () => {
+    const rows = [
+      { id: 1, amount: 300, method: "card", paid_at: "2026-09-10T21:00:00Z", reservation_id: 6, nmi_txn: null },
+      { id: 2, amount: 200, method: "card", paid_at: "2026-07-01T21:00:00Z", reservation_id: 6, nmi_txn: null },
+    ];
+    const crm = { ...emptyCrm(), nesherInPeriod: [rows[0]], nesherAll: rows,
+      reservations: [{ id: 6, reservation_code: "PART01", customer_price: 1000, supplier_cost: 700, booked_with_points: false }] };
+    const m = map({ nmi: xml(), bankList: [], crm, nmiFrom: "2026-08-27T00:00:00Z" });
+    const b = m.bookings.items[0];
+    assert.equal(b.card_fees.not_in_processor_record, 300);
+    assert.equal(b.card_fees.older_than_processor_read, 200);
+    assert.equal(b.contribution.final, false);
+    assert.match(b.contribution.label, /not in our processor's record/);
+    assert.match(b.contribution.label, /older than the processor record/);
+    assert.match(b.contribution.label, /not final - the booking is not paid in full/);
+    assert.equal(m.bookings.by_brand.nesher.card_payments_older_than_processor_read, 200);
   });
   it("more received than the price is flagged and kept out of the totals", () => {
     const crm = { ...emptyCrm(),
