@@ -1544,7 +1544,7 @@ const server = http.createServer(async (req, res) => {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-09-24-crm-search",
+      build: "2026-09-25-card-reader",
       instance: INSTANCE_ID,
       snapEngage: {
         enabled: SNAPENGAGE_ENABLED,
