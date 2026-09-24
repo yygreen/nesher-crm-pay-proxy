@@ -99,7 +99,8 @@ const REP_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
  * reference (card-hold, 23 Sep); charge / void / refund = one money action
  * bound to one reference (card-charge.js).
  */
-export const TICKET_KINDS = ["ocr", "hold", "charge", "void", "refund"];
+// payprep / pay / paystat: the supplier-payment doors (money-pay.js, F7, 24 Sep).
+export const TICKET_KINDS = ["ocr", "hold", "charge", "void", "refund", "payprep", "pay", "paystat"];
 const KIND_RE = /^[a-z]{2,10}$/;
 
 function b64url(buf) {

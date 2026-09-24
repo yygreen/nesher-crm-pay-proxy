@@ -24,14 +24,16 @@
 //   MERCURY_TOKEN_NESHER (AR) may touch ar/invoices and ar/customers only (the relay's own list).
 //   Any send / transfer / request-send-money / recipient(s) / attachments / internal-transfer path,
 //   and any non-GET on an account's transactions, is refused 405 not_in_this_ship for EITHER token
-//   before a request exists. Nesher accounts only: checking ••5649 matched by id AND last four,
+//   before a request exists - EXCEPT the one F7 pay path below (checkPayOperation): request-send-money
+//   for approval from Nesher checking to an existing, allowed recipient, behind MONEY_PAY=on.
+//   Nesher accounts only: checking ••5649 matched by id AND last four,
 //   savings ••5926; the Richter accounts (last four 8521 and 1588) are dropped before anything is
 //   named, and a transactions read is refused for any account id that did not pass that filter.
 // No token value is ever logged, returned or put in health: name, presence and length only.
 import { fetchWithTimeout } from "./http.js";
 import { normalizeToken } from "./mercury.js";
 
-export const MERCURY_GATEWAY_BUILD = "2026-09-23-off-the-pc";
+export const MERCURY_GATEWAY_BUILD = "2026-09-24-money-pay";
 export const MERCURY_DIRECT_ROOT = "https://api.mercury.com/api/v1";
 export const TOKEN_AR = "MERCURY_TOKEN_NESHER";
 export const TOKEN_FULL = "MERCURY_TOKEN_NESHER_FULL";
@@ -130,6 +132,124 @@ export function pickSeatAccounts(all) {
     });
   }
   return out;
+}
+
+// ── F7 (24 Sep 2026): ONE narrow path to pay a supplier ──────────────────────
+// Joseph, 22 Sep: "it should be able to show the amount in the bank account, make payment to
+// someonbe etc etc"; "also it should only have access to the nesher account".
+// What opens, and nothing else: request-send-money (Mercury's APPROVAL flow - the payment waits for
+// an approver in the Mercury app; nothing leaves on the chat's word), from Nesher checking ••5649
+// only, to an EXISTING Mercury recipient that passes payeeVerdict. The four reads it needs (the
+// recipients list, one recipient, the Nesher approval requests, one approval request) are exact
+// shapes. Direct send (POST /account/{id}/transactions), transfers, recipient create / edit /
+// delete, attachments, and every other path stay 405 not_in_this_ship - checkOperation above is
+// untouched, so the relay, the pay modal and the hop can still never reach any of them. Direct
+// only: a write is never replayed down a fallback.
+export const PAY_CHECKING = SEAT_ACCOUNTS[0];
+export const PAY_METHODS = Object.freeze(["ach", "domesticWire", "internationalWire"]);
+/** Our own accounts: paying one of them is a transfer, not a supplier payment. */
+export const OWN_LAST4 = Object.freeze(["5649", "5926"]);
+/** Another organisation of Joseph's, the Richter family, or a person of the Green family: never a payee. */
+export const PAY_BLOCK_NAME = /air\s*today|nesher|rank\s*friendly|orchim|richter|\b(?:yoseph|yosef|joseph|chava)\s+green\b/i;
+export const PAY_MIN_CENTS = 100;
+export const PAY_MAX_CENTS_DEFAULT = 10000 * 100;
+export const PAY_DAY_CENTS_DEFAULT = 25000 * 100;
+export const PAY_LIVE_STATES = Object.freeze(["pendingApproval", "approved"]);
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Is this one of the five pay shapes? Pure; used before any request exists. */
+export function checkPayOperation(method, pathWithQuery) {
+  const m = String(method || "GET").toUpperCase();
+  const [p, qs = ""] = String(pathWithQuery || "").split("?");
+  if (!p.startsWith("/") || p.includes("..") || p.includes("://")) return { ok: false, status: 400, error: "bad_path" };
+  if (m === "GET" && p === "/recipients") return { ok: true };
+  if (m === "GET" && /^\/recipient\/[^/]+$/.test(p)) return UUID_RE.test(p.slice(11)) ? { ok: true } : { ok: false, status: 400, error: "bad_id" };
+  if (m === "GET" && p === "/request-send-money") {
+    return new URLSearchParams(qs).get("accountId") === PAY_CHECKING.id ? { ok: true } : { ok: false, status: 403, error: "account_not_nesher" };
+  }
+  if (m === "GET" && /^\/request-send-money\/[^/]+$/.test(p)) return UUID_RE.test(p.slice(20)) ? { ok: true } : { ok: false, status: 400, error: "bad_id" };
+  if (m === "POST" && p === `/account/${PAY_CHECKING.id}/request-send-money`) return { ok: true };
+  return { ok: false, status: 405, error: "not_in_this_ship" };
+}
+
+function recipientLast4(r) {
+  const e = (r && r.electronicRoutingInfo) || {};
+  const w = (r && r.domesticWireRoutingInfo) || {};
+  const i = (r && r.internationalWireRoutingInfo) || {};
+  return String(e.accountNumber || w.accountNumber || i.iban || "").replace(/\s+/g, "").slice(-4);
+}
+
+/** The method this payee is paid by, when we can pay it from here; else "". */
+export function payMethodOf(r) {
+  if (!r) return "";
+  const want = r.defaultPaymentMethod;
+  const has = {
+    ach: Boolean(r.electronicRoutingInfo && r.electronicRoutingInfo.accountNumber),
+    domesticWire: Boolean(r.domesticWireRoutingInfo && r.domesticWireRoutingInfo.accountNumber),
+    internationalWire: Boolean(r.internationalWireRoutingInfo && (r.internationalWireRoutingInfo.iban || r.internationalWireRoutingInfo.swiftCode)),
+  };
+  if (PAY_METHODS.includes(want) && has[want]) return want;
+  return PAY_METHODS.find((m) => has[m]) || "";
+}
+
+/**
+ * May Nesher pay this Mercury recipient from the chat? Pure. Plan 1.5 hard lines: no personal
+ * account, no other organisation, never the Richter accounts, never our own accounts.
+ * @returns {{ok:true, method:string}|{ok:false, why:string}}
+ */
+export function payeeVerdict(r) {
+  if (!r || typeof r !== "object" || !r.id) return { ok: false, why: "unknown" };
+  if (r.status && r.status !== "active") return { ok: false, why: "inactive" };
+  const words = `${r.name || ""} ${r.nickname || ""}`;
+  if (PAY_BLOCK_NAME.test(words)) return { ok: false, why: "own_or_other_org" };
+  const l4 = recipientLast4(r);
+  if (l4 && NEVER_LAST4.includes(l4)) return { ok: false, why: "richter" };
+  if (l4 && OWN_LAST4.includes(l4)) return { ok: false, why: "own_account" };
+  const acctType = String((r.electronicRoutingInfo && r.electronicRoutingInfo.electronicAccountType) || "");
+  if (/^personal/i.test(acctType)) return { ok: false, why: "personal" };
+  if (r.isBusiness !== true) return { ok: false, why: "personal" };
+  const method = payMethodOf(r);
+  if (!method) return { ok: false, why: "no_method" };
+  return { ok: true, method };
+}
+
+/** What the desk may see of a payee: name, nickname, how it is paid, bank, last four. */
+export function payeeView(r) {
+  const v = payeeVerdict(r);
+  const method = v.ok ? v.method : payMethodOf(r);
+  const info = method === "ach" ? r.electronicRoutingInfo : method === "domesticWire" ? r.domesticWireRoutingInfo : method === "internationalWire" ? r.internationalWireRoutingInfo : null;
+  const bank = info ? (info.bankName || (info.bankDetails && info.bankDetails.bankName) || "") : "";
+  return {
+    id: r.id,
+    name: String(r.name || "").slice(0, 80),
+    nickname: String(r.nickname || "").slice(0, 120),
+    method,
+    bank: String(bank || "").slice(0, 60),
+    last4: recipientLast4(r),
+    lastPaid: r.dateLastPaid || null,
+  };
+}
+
+/** Mercury's approval request, the fields the desk needs (never a user id). */
+export function payRequestView(q) {
+  if (!q || typeof q !== "object") return null;
+  const reviews = Array.isArray(q.reviews) ? q.reviews.map((x) => ({ status: x && x.status, at: x && x.reviewedAt })) : [];
+  return {
+    id: q.requestId,
+    status: q.status,
+    amount: Number(q.amount),
+    recipientId: q.recipientId,
+    method: q.paymentMethod,
+    memo: q.memo == null ? "" : String(q.memo),
+    createdAt: q.createdAt || null,
+    approversRequired: q.numberOfApproversRequired == null ? null : Number(q.numberOfApproversRequired),
+    requesterMayApprove: q.requesterMayApprove === true,
+    reviews,
+  };
+}
+
+function memoKey(s) {
+  return String(s || "").trim().replace(/\s+/g, " ").toLowerCase();
 }
 
 class Fallback extends Error {
@@ -538,8 +658,10 @@ export function createMercuryGateway(opts = {}) {
       };
     }
     const blocked = Object.keys(t).filter((k) => t[k].direct === "blocked");
+    const pc = payCaps();
     return {
       build: MERCURY_GATEWAY_BUILD,
+      pay: { on: pc.on, max_cents: pc.maxCents, day_cents: pc.dayCents, account_last4: PAY_CHECKING.last4, path: "request-send-money only (approval in Mercury)" },
       direct_root: MERCURY_DIRECT_ROOT,
       tunnel_configured: Boolean(tunnelRoot()),
       tokens: t,
@@ -554,5 +676,178 @@ export function createMercuryGateway(opts = {}) {
     return uses[use] ? uses[use].served_by : null;
   }
 
-  return { arRequest, arFetch, hopDirect, read, listArInvoices, probe, probeStale, health, lastServed, allowedAccountIds };
+  // ── F7: the pay path (see the header above checkPayOperation) ──────────────
+  function payCaps() {
+    const n = (v, d) => (/^\d{1,10}$/.test(String(v ?? "").trim()) ? Number(String(v).trim()) : d);
+    return {
+      on: String(env.MONEY_PAY || "").trim().toLowerCase() === "on",
+      maxCents: n(env.MONEY_PAY_MAX_CENTS, PAY_MAX_CENTS_DEFAULT),
+      dayCents: n(env.MONEY_PAY_DAY_CENTS, PAY_DAY_CENTS_DEFAULT),
+    };
+  }
+
+  /** One pay-shaped call, direct only. {status, body} or {refused} / {unknown} / {unreachable}. */
+  async function payCall(use, method, path, bodyObj) {
+    const chk = checkPayOperation(method, path);
+    if (!chk.ok) {
+      tokens[TOKEN_FULL].calls.refused++;
+      uses[use] = { token: TOKEN_FULL, served_by: "refused", status: chk.status, at: iso(now()) };
+      return { refused: chk };
+    }
+    const d = await tryDirect(TOKEN_FULL, method, path, { body: bodyObj == null ? undefined : JSON.stringify(bodyObj), force: method !== "GET" });
+    if (!d.status && /^http_40[13]$/.test(String(d.failed || ""))) {
+      // Mercury said no with authority (scope, auth): nothing was created.
+      mark(use, TOKEN_FULL, "direct", Number(d.failed.slice(5)));
+      return { status: Number(d.failed.slice(5)), body: { error: tokens[TOKEN_FULL].last_error } };
+    }
+    if (!d.status) {
+      mark(use, TOKEN_FULL, "failed", null);
+      // A POST that may have reached Mercury: the caller must say "check Mercury", never "failed".
+      if (method !== "GET" && !(d.blocked || d.skipped)) return { unknown: d.failed || "unknown" };
+      return { unreachable: d.blocked ? "blocked" : (d.skipped || d.failed) };
+    }
+    mark(use, TOKEN_FULL, "direct", d.status);
+    let body;
+    try { body = d.text ? JSON.parse(d.text) : {}; } catch { body = { raw: String(d.text).slice(0, 300) }; }
+    return { status: d.status, body };
+  }
+
+  function mercuryWords(body) {
+    const b = body || {};
+    const m = b.message || b.error || b.errors || "";
+    return (typeof m === "string" ? m : JSON.stringify(m)).slice(0, 300);
+  }
+
+  /** Every recipient, each with its verdict. Throws on anything but a clean list. */
+  async function payRecipientsAll() {
+    const r = await payCall("pay/recipients", "GET", "/recipients?limit=1000");
+    if (r.status !== 200 || !r.body || !Array.isArray(r.body.recipients)) {
+      const e = new Error("recipients_unavailable");
+      e.detail = r.status ? `mercury_${r.status}` : (r.unreachable || "refused");
+      throw e;
+    }
+    return r.body.recipients.map((x) => ({ raw: x, verdict: payeeVerdict(x), view: payeeView(x) }));
+  }
+
+  async function payRecipient(id) {
+    if (!UUID_RE.test(String(id || ""))) return { ok: false, why: "bad_id" };
+    const r = await payCall("pay/recipient", "GET", `/recipient/${id}`);
+    if (r.status === 404) return { ok: false, why: "not_found" };
+    if (r.status !== 200 || !r.body || !r.body.id) return { ok: false, why: "unavailable" };
+    const v = payeeVerdict(r.body);
+    return v.ok ? { ok: true, raw: r.body, method: v.method, view: payeeView(r.body) } : { ok: false, why: v.why, view: payeeView(r.body) };
+  }
+
+  /** Nesher checking's approval requests from the last 24 hours (all states). */
+  async function payRequestsSince(sinceMs) {
+    const out = [];
+    let after = "";
+    for (let page = 0; page < 5; page++) {
+      const q = new URLSearchParams({ accountId: PAY_CHECKING.id, limit: "1000" });
+      if (after) q.set("start_after", after);
+      const r = await payCall("pay/requests", "GET", `/request-send-money?${q.toString()}`);
+      if (r.status !== 200 || !r.body || !Array.isArray(r.body.requests)) {
+        const e = new Error("requests_unavailable");
+        e.detail = r.status ? `mercury_${r.status}` : (r.unreachable || "refused");
+        throw e;
+      }
+      for (const x of r.body.requests) {
+        if (x && x.accountId === PAY_CHECKING.id && Date.parse(x.createdAt || "") >= sinceMs) out.push(x);
+      }
+      const next = r.body.page && (r.body.page.nextPage || r.body.page.startAfter || r.body.page.nextCursor);
+      if (!next || !r.body.requests.length) break;
+      after = typeof next === "string" ? next : r.body.requests[r.body.requests.length - 1].requestId;
+    }
+    return out;
+  }
+
+  /**
+   * Queue ONE payment for approval in Mercury. Everything is checked here again, whatever the desk
+   * already checked: the switch, Nesher checking by id AND last four, the payee's hard lines, the
+   * amount, the day, and the 24-hour duplicate rule (same payee, amount and memo).
+   */
+  async function requestPay(o = {}) {
+    const caps = payCaps();
+    if (!caps.on) return { status: 404, body: { ok: false, error: "money_pay_off" } };
+    const cents = o.amountCents;
+    if (!Number.isInteger(cents) || cents < PAY_MIN_CENTS) return { status: 400, body: { ok: false, error: "amount_invalid" } };
+    if (cents > caps.maxCents) return { status: 400, body: { ok: false, error: "over_cap", cap_cents: caps.maxCents } };
+    const memo = String(o.memo || "").replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, 140);
+    if (!memo) return { status: 400, body: { ok: false, error: "memo_required" } };
+    const key = String(o.idempotencyKey || "").trim();
+    if (!/^[A-Za-z0-9._:-]{8,80}$/.test(key)) return { status: 400, body: { ok: false, error: "idempotency_key_invalid" } };
+    // Nesher checking must still be what we think it is (id AND last four), or nothing is named.
+    let accounts;
+    try { accounts = await accountsDirect(); } catch (e) {
+      return { status: 503, body: { ok: false, error: e instanceof Fallback ? "mercury_unreachable" : "checking_not_verified" } };
+    }
+    if (!accounts.some((a) => a.id === PAY_CHECKING.id && a.last4 === PAY_CHECKING.last4)) {
+      return { status: 503, body: { ok: false, error: "checking_not_verified" } };
+    }
+    const payee = await payRecipient(o.recipientId);
+    if (!payee.ok) {
+      const code = payee.why === "unavailable" ? 503 : payee.why === "not_found" || payee.why === "bad_id" ? 404 : 403;
+      return { status: code, body: { ok: false, error: `payee_${payee.why}` } };
+    }
+    let recent;
+    try { recent = await payRequestsSince(now() - 24 * 3600 * 1000); } catch {
+      return { status: 503, body: { ok: false, error: "requests_unavailable" } };
+    }
+    const live = recent.filter((x) => PAY_LIVE_STATES.includes(x.status));
+    const dup = live.find((x) => x.recipientId === payee.raw.id && Math.round(Number(x.amount) * 100) === cents && memoKey(x.memo) === memoKey(memo));
+    if (dup) return { status: 409, body: { ok: false, error: "duplicate_24h", existing: payRequestView(dup) } };
+    const dayUsed = live.reduce((s, x) => s + Math.round(Number(x.amount) * 100), 0);
+    if (dayUsed + cents > caps.dayCents) return { status: 400, body: { ok: false, error: "over_day_cap", day_cap_cents: caps.dayCents, day_used_cents: dayUsed } };
+    const body = {
+      recipientId: payee.raw.id,
+      amount: Number((cents / 100).toFixed(2)),
+      paymentMethod: payee.method,
+      idempotencyKey: key,
+      externalMemo: memo,
+      note: String(o.note || "").replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, 240),
+    };
+    if (payee.method === "domesticWire" || payee.method === "internationalWire") {
+      body.purpose = { simple: { category: "vendor", additionalInfo: String(payee.raw.name || "supplier").slice(0, 100) } };
+    }
+    const r = await payCall("pay/request", "POST", `/account/${PAY_CHECKING.id}/request-send-money`, body);
+    if (r.refused) return { status: r.refused.status, body: { ok: false, error: r.refused.error } };
+    if (r.unknown) return { status: 503, body: { ok: false, error: "outcome_unknown", payee: payee.view } };
+    if (r.unreachable) return { status: 503, body: { ok: false, error: "mercury_unreachable", payee: payee.view } };
+    if (r.status >= 200 && r.status < 300 && r.body && r.body.requestId) {
+      return { status: 200, body: { ok: true, request: payRequestView(r.body), payee: payee.view } };
+    }
+    return { status: 502, body: { ok: false, error: "mercury_refused", mercury_status: r.status, mercury: mercuryWords(r.body), payee: payee.view } };
+  }
+
+  /** One approval request, Nesher checking only; once approved, the payment's own state. */
+  async function payStatus(requestId) {
+    if (!UUID_RE.test(String(requestId || ""))) return { status: 400, body: { ok: false, error: "bad_id" } };
+    const r = await payCall("pay/status", "GET", `/request-send-money/${requestId}`);
+    if (r.status === 404) return { status: 404, body: { ok: false, error: "not_found" } };
+    if (r.status !== 200 || !r.body || !r.body.requestId) return { status: 503, body: { ok: false, error: "mercury_unreachable" } };
+    if (r.body.accountId !== PAY_CHECKING.id) return { status: 403, body: { ok: false, error: "account_not_nesher" } };
+    const q = payRequestView(r.body);
+    let state = q.status === "pendingApproval" ? "waiting" : q.status;
+    let txn = null;
+    if (q.status === "approved") {
+      state = "approved";
+      try {
+        const start = isoDate(addDays(new Date(Date.parse(q.createdAt || iso(now()))), -1));
+        const end = isoDate(addDays(new Date(now()), 1));
+        const rows = await accountTransactionsDirect(PAY_CHECKING.id, { start, end, limit: 500 });
+        const cents = Math.round(q.amount * 100);
+        const hit = rows.find((t) => Math.round(Number(t.amount) * 100) === -cents && (memoKey(t.externalMemo) === memoKey(q.memo) || !q.memo));
+        if (hit) {
+          txn = { id: hit.id, status: hit.status, postedAt: hit.postedAt || null, dashboardLink: hit.dashboardLink || null };
+          if (hit.status === "sent") state = "paid";
+          else if (hit.status === "failed" || hit.status === "cancelled" || hit.status === "reversed") state = "failed";
+          else state = "sending";
+        }
+      } catch { /* the approval stands; the payment's own state is read next time */ }
+    }
+    return { status: 200, body: { ok: true, state, request: q, txn } };
+  }
+
+  return { arRequest, arFetch, hopDirect, read, listArInvoices, probe, probeStale, health, lastServed, allowedAccountIds,
+    payCaps, payRecipientsAll, payRecipient, payRequestsSince, requestPay, payStatus };
 }

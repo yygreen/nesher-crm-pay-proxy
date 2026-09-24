@@ -92,6 +92,7 @@ import { handleBoardPage, handleBoardDone } from "./board.js";
 import { createMoneyHop } from "./money-hop.js";
 import { createMercuryGateway } from "./mercury-gateway.js";
 import { createMoneyWatch } from "./money-watch.js";
+import { createMoneyPay } from "./money-pay.js";
 import {
   getPool,
   loadHotelPayContext,
@@ -1082,6 +1083,12 @@ const moneyWatch = createMoneyWatch({
   gateway: mercuryGateway,
   getPool: () => (process.env.DATABASE_URL || process.env.DATABASE_PUBLIC_URL ? getPool() : null),
 });
+// F7 (24 Sep): pay a supplier from the desk chat - Mercury request-send-money ONLY (approval in the
+// Mercury app), Nesher checking only, existing allowed recipients only. Off unless MONEY_PAY=on.
+const moneyPay = createMoneyPay({
+  gateway: mercuryGateway,
+  getPool: () => (process.env.DATABASE_URL || process.env.DATABASE_PUBLIC_URL ? getPool() : null),
+});
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
@@ -1164,6 +1171,9 @@ const server = http.createServer(async (req, res) => {
   if (isCardHoldPath(url.pathname)) {
     await handleCardHoldRequest(req, res, { secret: ocrSecret() });
     return;
+  }
+  if (url.pathname.startsWith("/__nesher_pay/pay/")) {
+    if (await moneyPay.handle(req, res, url.pathname)) return;
   }
   const moneyDoor = chargeFamilyPath(url.pathname);
   if (moneyDoor) {
@@ -1504,7 +1514,7 @@ const server = http.createServer(async (req, res) => {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-09-23-card-any-input",
+      build: "2026-09-24-money-pay",
       instance: INSTANCE_ID,
       snapEngage: {
         enabled: SNAPENGAGE_ENABLED,

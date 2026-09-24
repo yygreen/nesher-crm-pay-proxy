@@ -725,7 +725,7 @@ describe("wiring", () => {
     assert.ok(src.indexOf("isOcrPath(url.pathname)") < src.indexOf("isOpenPayPath(url.pathname)"), "reader answers before the pay pages");
     assert.ok(src.indexOf("isOcrPath(url.pathname)") < src.lastIndexOf("proxyWithInject(req, res)"), "reader answers before the proxy");
     assert.match(src, /ocr: \{\s*enabled: ocrEnabled\(\)/);
-    assert.match(src, /build: "2026-09-23-card-any-input"/);
+    assert.match(src, /build: "2026-09-24-money-pay"/);
     assert.match(src, /startCardHoldSweeper\(/);
     // The replica proof lives in health: one boot id per process.
     assert.match(src, /const INSTANCE_ID = crypto\.randomBytes\(6\)\.toString\("hex"\)/);
