@@ -40,7 +40,12 @@ import {
   ocrSecret,
   ocrEnabled,
   _resetCardRefsForTests,
+  sayForFailure,
+  sniffFormat,
+  imageFromPdf,
 } from "../ocr-card.js";
+import sharp from "sharp";
+import { pdfWithJpeg } from "./ocr-hard-fixtures.js";
 import { tinyImage } from "./ocr-fixtures.js";
 
 const SECRET = "test-ocr-secret-0123456789abcdef";
@@ -291,9 +296,14 @@ describe("purge + image pipeline", () => {
 
   it("recognizeCard: rotation ladder is 0, 90, 270, 180 and stops at the first hit", async () => {
     assert.deepEqual(ROTATION_LADDER, [0, 90, 270, 180]);
+    // The fast whole-card passes are the block-mode calls: 1-4 at 0 degrees, 5-8 at 90 (the rescue
+    // stage between them uses sparse / line modes and finds nothing here).
+    let block = 0;
     const engine = fakeEngine((i, o) => {
       if (o.charset === "text") return "VALID THRU 10/29\nRIVKA KLEIN";
-      return i >= 4 && i < 8 ? PAN : "";
+      if (o.mode !== "block") return "";
+      block += 1;
+      return block >= 5 && block <= 8 ? PAN : "";
     });
     const r = await recognizeCard(await tinyImage(), { engine, now: NOW_DATE });
     assert.equal(r.ok, true);
@@ -301,15 +311,64 @@ describe("purge + image pipeline", () => {
     assert.equal(r.name, "RIVKA KLEIN");
   });
 
-  it("recognizeCard: a lone hit gets a sparse second pass and stays low when nothing agrees", async () => {
+  it("recognizeCard: a lone hit gets a sparse second pass and is NEVER accepted on its own (24 Sep)", async () => {
+    // One read that nothing else agrees with was a "low" card before 24 Sep. On the hard set two such
+    // reads were wrong numbers that passed Luhn by luck, so a number now needs two agreeing reads.
     const engine = fakeEngine((i, o) => (o.charset === "text" ? "" : i === 0 ? PAN : ""));
     const r = await recognizeCard(await tinyImage(), { engine, now: NOW_DATE });
-    assert.equal(r.ok, true);
-    assert.equal(r.confidence, "low");
-    assert.equal(r.sources, 1);
+    assert.equal(r.ok, false);
+    assert.equal(r.error, "no_card_found");
+    assert.equal(r.pan, undefined, "no number leaves a failed read");
     assert.ok(engine.calls.some((c) => c.mode === "sparse" && c.charset === "digits"), "sparse pass ran");
-    assert.equal(r.name, null);
-    assert.equal(r.expiry, null);
+    assert.match(r.say, /type the number here/, "the failure says what to do");
+  });
+
+  it("recognizeCard: two agreeing reads are accepted as LOW (the rep confirms the last four); three are high", async () => {
+    const two = fakeEngine((i, o) => (o.charset === "text" ? "" : i < 2 ? PAN : ""));
+    const r2 = await recognizeCard(await tinyImage(), { engine: two, now: NOW_DATE });
+    assert.equal(r2.ok, true);
+    assert.equal(r2.pan, PAN);
+    assert.equal(r2.sources, 2);
+    assert.equal(r2.confidence, "low");
+    const three = fakeEngine((i, o) => (o.charset === "text" ? "" : i < 3 ? PAN : ""));
+    const r3 = await recognizeCard(await tinyImage(), { engine: three, now: NOW_DATE });
+    assert.equal(r3.ok, true);
+    assert.equal(r3.confidence, "high");
+  });
+
+  it("recognizeCard: a 13-digit leftover is never a card from a photo (a 16 that lost three digits)", async () => {
+    const thirteen = "4000055565556"; // Luhn-valid 13-digit Visa shape - what h11 on the hard set produced
+    const engine = fakeEngine((i, o) => (o.charset === "text" ? "" : thirteen));
+    const r = await recognizeCard(await tinyImage(), { engine, now: NOW_DATE });
+    assert.equal(r.ok, false);
+  });
+
+  it("sayForFailure: what went wrong, what to do, and what WAS read", () => {
+    assert.match(sayForFailure("glare"), /glare.*type the number here/);
+    const s = sayForFailure("glare", { last4: "4242", expiry: "10/29", name: null });
+    assert.match(s, /ends 4242/);
+    assert.match(s, /expiry 10\/29/);
+    assert.match(s, /only need to type the full number/);
+    assert.match(sayForFailure("heic_unsupported"), /HEIC/);
+    assert.match(sayForFailure("two_cards"), /two cards/);
+  });
+
+  it("sniffFormat + imageFromPdf: a PDF's picture is read; a PDF with no picture says so", async () => {
+    assert.equal(sniffFormat(Buffer.from("%PDF-1.4 rest")), "pdf");
+    const heic = Buffer.alloc(16); heic.write("ftypheic", 4, "latin1");
+    assert.equal(sniffFormat(heic), "heic");
+    const img = await tinyImage();
+    assert.equal(sniffFormat(img), "image");
+    const jpeg = await sharp(img).jpeg().toBuffer();
+    const meta = await sharp(jpeg).metadata();
+    const pdf = pdfWithJpeg(jpeg, meta.width, meta.height);
+    const out = await imageFromPdf(pdf, []);
+    assert.ok(out && out.equals(jpeg), "the embedded JPEG comes back byte for byte");
+    assert.equal(await imageFromPdf(Buffer.from("%PDF-1.4\n1 0 obj << /Type /Catalog >> endobj\n%%EOF"), []), null);
+    const engine = fakeEngine(() => "");
+    const r = await recognizeCard(Buffer.from("%PDF-1.4\n%%EOF"), { engine, now: NOW_DATE });
+    assert.equal(r.error, "pdf_no_image");
+    assert.match(r.say, /PDF has no picture/);
   });
 
   it("recognizeCard: nothing found -> no_card_found after the whole ladder; bad bytes -> decode_failed", async () => {
@@ -317,7 +376,10 @@ describe("purge + image pipeline", () => {
     const r = await recognizeCard(await tinyImage(), { engine, now: NOW_DATE });
     assert.equal(r.ok, false);
     assert.equal(r.error, "no_card_found");
-    assert.equal(engine.calls.length, 16, "4 variants x 4 rotations");
+    // Every fast whole-card pass ran: 4 variants x 4 rotations (the rescue passes come on top).
+    assert.equal(engine.calls.filter((c) => c.mode === "block").length, 16, "4 variants x 4 rotations");
+    assert.ok(r.problem, "a failure names its problem");
+    assert.match(r.say, /type the number here/);
     const bad = await recognizeCard(Buffer.from("not an image"), { engine, now: NOW_DATE });
     assert.equal(bad.ok, false);
     assert.equal(bad.error, "decode_failed");
@@ -609,7 +671,8 @@ describe("POST /__nesher_pay/ocr", () => {
   it("low confidence asks for the last four; a hold that cannot be made is reported, not fatal; multipart + json bodies", async () => {
     // No expiry anywhere in the text pass: the card is read, but it cannot be
     // held (a sale needs an expiry), so the tile gets the card and no token_ref.
-    const lone = () => fakeEngine((i, o) => (o.charset === "text" ? "NO DATE HERE" : i === 0 ? PAN : ""));
+    // Two agreeing reads (the least that is accepted) = low confidence.
+    const lone = () => fakeEngine((i, o) => (o.charset === "text" ? "NO DATE HERE" : i < 2 ? PAN : ""));
     const fetchImpl = async () => { throw new Error("the reader must not call the gateway"); };
     let s = await startServer({ secret: SECRET, engine: lone(), fetchImpl, privateKey: "k" });
     try {
@@ -656,7 +719,11 @@ describe("POST /__nesher_pay/ocr", () => {
       assert.equal(body.ok, false);
       assert.equal(body.error, "no_card_found");
       assert.equal(body.confidence, "none");
-      assert.equal(body.passes, 16);
+      assert.ok(body.passes >= 16, "at least the whole fast ladder ran");
+      assert.equal(typeof body.say, "string", "the tile gets the reader's own sentence");
+      assert.match(body.say, /type the number here/);
+      assert.ok("partial" in body && "problem" in body);
+      assert.doesNotMatch(JSON.stringify(body), /\d{6,}/, "no long digit run in a failure body");
       r = await fetch(s2.url, { method: "POST", headers: { "content-type": "image/png", "x-ocr-ticket": mint() }, body: Buffer.from("this is not an image at all") });
       assert.equal(r.status, 415);
       assert.equal((await r.json()).error, "decode_failed");

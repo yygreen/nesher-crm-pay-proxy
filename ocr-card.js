@@ -68,6 +68,7 @@
 
 import crypto from "node:crypto";
 import { chargeWithToken } from "./nmi-card.js";
+import { readLineGlyphs, findRows } from "./ocr-glyphs.js";
 
 export const OCR_PATH = "/__nesher_pay/ocr";
 export const OCR_TICKET_SECRET_NAME = "OCR_TICKET_SECRET";
@@ -292,8 +293,16 @@ export const BRAND_LABEL = {
   discover: "Discover",
 };
 
+/**
+ * Lengths a PHOTO may produce: 15 (Amex), 16, 19. A 13-digit Visa has not been issued for
+ * decades, and 13 is exactly what a read that dropped three digits of a 16 looks like -
+ * on the hard set such a leftover passed Luhn and was accepted as a wrong card (24 Sep).
+ * The typed card-hold door keeps its own 13-19 rule.
+ */
+const PHOTO_LENGTHS = new Set([15, 16, 19]);
+
 function panIfValid(digits) {
-  if (digits.length < 13 || digits.length > 19) return null;
+  if (!PHOTO_LENGTHS.has(digits.length)) return null;
   const brand = brandOf(digits);
   if (!brand) return null;
   if (!luhnOk(digits)) return null;
@@ -302,37 +311,102 @@ function panIfValid(digits) {
 
 /**
  * Every run of 13-19 digits (spaces and dashes ignored inside a line) that
- * passes Luhn and a brand range. A run with one or two stray digits glued on
- * (chip noise, a logo digit) is tried with up to two digits trimmed from
- * either end, longest first.
+ * passes Luhn and a brand range. Stray digits glued on (chip noise, a logo
+ * digit) are dropped only when they stand as their OWN printed group: the run
+ * is split where the card prints its gaps and every window of whole groups is
+ * tried. A digit blob with no gaps is never trimmed (24 Sep: cutting one or
+ * two digits off either end of a 17-18 digit blob gives six more chances for
+ * a wrong number to pass Luhn by luck - that is how two wrong numbers were
+ * accepted on the hard set).
  */
 export function extractPans(text) {
   const out = [];
   const seen = new Set();
+  const keep = (hit) => {
+    if (!hit || seen.has(hit.pan)) return;
+    seen.add(hit.pan);
+    out.push(hit);
+  };
   for (const line of String(text || "").split(/\r?\n/)) {
     const runs = line.replace(/[^0-9 \-]/g, "\n").split("\n");
     for (const run of runs) {
-      const digits = run.replace(/[ \-]/g, "");
-      if (digits.length < 13 || digits.length > 21) continue;
-      const found = [];
-      const whole = panIfValid(digits);
-      if (whole) found.push(whole);
-      if (!found.length) {
-        for (let cut = 1; cut <= 2 && !found.length; cut += 1) {
-          for (let head = 0; head <= cut; head += 1) {
-            const tail = cut - head;
-            const sub = digits.slice(head, digits.length - tail);
-            const hit = panIfValid(sub);
-            if (hit) found.push(hit);
-          }
+      const groups = run.split(/[ \-]+/).filter(Boolean);
+      const digits = groups.join("");
+      if (digits.length < 13) continue;
+      if (digits.length <= 19) {
+        const whole = panIfValid(digits);
+        if (whole) { keep(whole); continue; }
+      }
+      for (let i = 0; i < groups.length; i += 1) {
+        let s = "";
+        for (let j = i; j < groups.length; j += 1) {
+          s += groups[j];
+          if (s.length > 19) break;
+          if (i === 0 && j === groups.length - 1) continue; // the whole run, tried above
+          if (s.length >= 13) keep(panIfValid(s));
         }
       }
-      for (const hit of found) {
-        if (seen.has(hit.pan)) continue;
-        seen.add(hit.pan);
-        out.push(hit);
+    }
+  }
+  return out;
+}
+
+/**
+ * The printed groups of a number line, for voting digit by digit across reads
+ * that each got a different digit wrong. Returns [{key, groups}] for every
+ * window of whole groups that has a card's shape (4-4-4-4, 4-6-5, or two
+ * lines of 4-4). The text is never kept past the read.
+ */
+const GROUP_SHAPES = ["4-4-4-4", "4-6-5", "4-4-4-4-3"];
+export function groupedReads(text) {
+  const out = [];
+  const lines = String(text || "").split(/\r?\n/).map((l) => l.replace(/[^0-9 \-]/g, " ").split(/[ \-]+/).filter(Boolean));
+  const scan = (groups) => {
+    for (let i = 0; i < groups.length; i += 1) {
+      for (const shape of GROUP_SHAPES) {
+        const lens = shape.split("-").map(Number);
+        if (i + lens.length > groups.length) continue;
+        let ok = true;
+        for (let k = 0; k < lens.length; k += 1) if (groups[i + k].length !== lens[k]) { ok = false; break; }
+        if (ok) out.push({ key: shape, groups: groups.slice(i, i + lens.length) });
       }
     }
+  };
+  for (let li = 0; li < lines.length; li += 1) {
+    scan(lines[li]);
+    // A vertical card prints the number on two lines: 4-4 over 4-4, or 4-6 over 5.
+    if (li + 1 < lines.length) scan([...lines[li].slice(-2), ...lines[li + 1].slice(0, 2)]);
+  }
+  return out;
+}
+
+/**
+ * Digit-by-digit majority across the reads of one number line that share a
+ * shape. Needs three reads; every position must have a clear winner (more
+ * than half the reads). Returns the card numbers that pass Luhn + brand.
+ */
+export function consensusPans(reads) {
+  const byKey = new Map();
+  for (const r of reads || []) {
+    if (!byKey.has(r.key)) byKey.set(r.key, []);
+    byKey.get(r.key).push(r.groups.join(""));
+  }
+  const out = [];
+  for (const [, strs] of byKey) {
+    if (strs.length < 3) continue;
+    const L = strs[0].length;
+    let s = "";
+    let clear = true;
+    for (let p = 0; p < L; p += 1) {
+      const count = new Map();
+      for (const x of strs) count.set(x[p], (count.get(x[p]) || 0) + 1);
+      const [best, n] = [...count.entries()].sort((a, b) => b[1] - a[1])[0];
+      if (n * 2 <= strs.length) { clear = false; break; }
+      s += best;
+    }
+    if (!clear) continue;
+    const hit = panIfValid(s);
+    if (hit) out.push(hit);
   }
   return out;
 }
@@ -436,7 +510,9 @@ export function voteCandidates(hits) {
   const winner = ranked[0];
   const runner = ranked[1] ? ranked[1].sources : 0;
   const high = winner.sources >= 2 && winner.sources >= 2 * runner;
-  return { ...winner, confidence: high ? "high" : "low" };
+  const second = ranked[1] ? { pan: ranked[1].pan, sources: ranked[1].sources } : null;
+  // `second` stays inside the reader (the two-cards decision); it never reaches a response.
+  return { ...winner, confidence: high ? "high" : "low", second };
 }
 
 // ── image pipeline ─────────────────────────────────────────────────────────
@@ -528,6 +604,8 @@ function sampledMean(buf) {
  */
 export async function buildVariants(input, { scratch = [], maxSide = OCR_MAX_SIDE } = {}) {
   const sharp = await loadSharp();
+  const meta = await sharp(input, { failOn: "none", limitInputPixels: 60e6 }).metadata();
+  const origMaxSide = Math.max(meta.width || 0, meta.height || 0);
   const base = await sharp(input, { failOn: "none", limitInputPixels: 60e6 })
     .rotate()
     .resize({ width: maxSide, height: maxSide, fit: "inside", withoutEnlargement: true })
@@ -584,7 +662,7 @@ export async function buildVariants(input, { scratch = [], maxSide = OCR_MAX_SID
     { name: "unsharp", buffer: unsharp },
   ];
   for (const v of variants) scratch.push(v.buffer);
-  return { variants, width, height };
+  return { variants, width, height, gray, origMaxSide };
 }
 
 async function rotated(buffer, degrees, scratch) {
@@ -595,11 +673,415 @@ async function rotated(buffer, degrees, scratch) {
   return out;
 }
 
+// ── formats: PDF, HEIC ─────────────────────────────────────────────────────
+
+/** What the bytes are, by their first bytes (the content type is the sender's guess). */
+export function sniffFormat(buf) {
+  if (!buf || buf.length < 12) return "unknown";
+  if (buf[0] === 0x25 && buf[1] === 0x50 && buf[2] === 0x44 && buf[3] === 0x46) return "pdf";
+  if (buf.toString("latin1", 4, 8) === "ftyp") {
+    const brand = buf.toString("latin1", 8, 12);
+    if (/^(heic|heix|hevc|hevx|heim|heis|hevm|hevs)$/.test(brand)) return "heic";
+    if (/^(avif|avis|mif1|msf1)$/.test(brand)) return "heif";
+  }
+  return "image";
+}
+
 /**
- * Read one card photo. `engine.recognize(buffer, {mode, charset})` is the only
- * OCR door (real pool in ocr-engine.js, fake in tests).
+ * The largest picture inside a PDF (a scan, a "print to PDF" of a photo, a
+ * bank statement page with the card on it). JPEG streams (DCTDecode) are
+ * handed over as they are; 8-bit Flate streams (RGB or grey, PNG predictors
+ * included) are rebuilt as raw pixels. A PDF with no picture (vector text
+ * only) returns null - "that PDF has no picture of a card in it".
+ * Every intermediate Buffer goes to `scratch` so the caller zeroes it.
+ */
+export async function imageFromPdf(pdf, scratch = []) {
+  const zlib = await import("node:zlib");
+  const src = pdf.toString("latin1");
+  const found = [];
+  const re = /<<((?:[^<>]|<<(?:[^<>]|<<[^<>]*>>)*>>)*)>>\s*stream\r?\n/g;
+  let m;
+  while ((m = re.exec(src))) {
+    const dict = m[1];
+    if (!/\/Subtype\s*\/Image/.test(dict)) continue;
+    const start = m.index + m[0].length;
+    const end = src.indexOf("endstream", start);
+    if (end < 0) continue;
+    let stop = end;
+    while (stop > start && (src.charCodeAt(stop - 1) === 0x0a || src.charCodeAt(stop - 1) === 0x0d)) stop -= 1;
+    const w = Number((/\/Width\s+(\d+)/.exec(dict) || [])[1] || 0);
+    const h = Number((/\/Height\s+(\d+)/.exec(dict) || [])[1] || 0);
+    if (!w || !h) continue;
+    found.push({ dict, start, stop, w, h });
+  }
+  found.sort((a, b) => b.w * b.h - a.w * a.h);
+  for (const f of found) {
+    const bytes = Buffer.from(pdf.subarray(f.start, f.stop));
+    scratch.push(bytes);
+    if (/\/DCTDecode/.test(f.dict)) return bytes;
+    if (!/\/FlateDecode/.test(f.dict) || /\/Filter\s*\[[^\]]*\/\w+\s+\/\w+/.test(f.dict)) continue;
+    const bpc = Number((/\/BitsPerComponent\s+(\d+)/.exec(f.dict) || [])[1] || 8);
+    if (bpc !== 8) continue;
+    const ch = /\/DeviceGray/.test(f.dict) ? 1 : /\/DeviceRGB/.test(f.dict) ? 3 : 0;
+    if (!ch) continue;
+    let raw;
+    try { raw = zlib.inflateSync(bytes); } catch { continue; }
+    scratch.push(raw);
+    const pred = Number((/\/Predictor\s+(\d+)/.exec(f.dict) || [])[1] || 1);
+    let pix = raw;
+    if (pred >= 10) {
+      const row = f.w * ch;
+      pix = Buffer.alloc(row * f.h);
+      scratch.push(pix);
+      for (let y = 0; y < f.h; y += 1) {
+        const t = raw[y * (row + 1)];
+        for (let x = 0; x < row; x += 1) {
+          const v = raw[y * (row + 1) + 1 + x];
+          const a = x >= ch ? pix[y * row + x - ch] : 0;
+          const b = y ? pix[(y - 1) * row + x] : 0;
+          const c = x >= ch && y ? pix[(y - 1) * row + x - ch] : 0;
+          let p = 0;
+          if (t === 1) p = a;
+          else if (t === 2) p = b;
+          else if (t === 3) p = (a + b) >> 1;
+          else if (t === 4) { const q = a + b - c; const pa = Math.abs(q - a); const pb = Math.abs(q - b); const pc = Math.abs(q - c); p = pa <= pb && pa <= pc ? a : pb <= pc ? b : c; }
+          pix[y * row + x] = (v + p) & 255;
+        }
+      }
+    }
+    if (pix.length < f.w * f.h * ch) continue;
+    const sharp = await loadSharp();
+    const png = await sharp(pix, { raw: { width: f.w, height: f.h, channels: ch } }).png({ compressionLevel: 1 }).toBuffer();
+    scratch.push(png);
+    return png;
+  }
+  return null;
+}
+
+// ── the stronger read (24 Sep 2026) ────────────────────────────────────────
+//
+// Joseph, 24 Sep: "i need better reading abilties for complicated cards" and
+// "set yourself up for success that you should be able to read them all".
+// The fast passes above read a clean card in well under a second. When they
+// do not agree, the reader now FINDS the number line (tesseract's own word
+// boxes, digits only), cuts that one line out of the full-size picture,
+// straightens it, scales it so the digits are ~40 px tall (where the engine
+// reads best), and reads the line alone in six preparations (contrast,
+// local contrast, inverted, threshold, sharpened, de-noised) and two line
+// modes, both ways up. Every read votes. A number is accepted only when two
+// different reads agree on it digit for digit and nothing else comes close;
+// otherwise the answer is "could not read" with what WAS read (the last four
+// when reads agree on them, the expiry, the name) and why.
+
+/** The whole read, fast passes and rescue together, stays under this (Joseph: under ~8 s). */
+export const OCR_TOTAL_MS = 7000;
+/** Height the line reader scales printed digits to. */
+export const LINE_DIGIT_PX = 40;
+/** A glyph-matcher reading votes only when every glyph in it was a clear match (calibrated on the hard set). */
+export const GLYPH_MIN_MARGIN = 0.04;
+export const GLYPH_MIN_SCORE = 0.35;
+const LOCATE_SIDE = 1100;
+
+/** CLAHE tile that fits the picture (libvips refuses a window larger than the image: 'hist_local: window too large'). */
+function claheTile(want, w, h) {
+  return Math.max(3, Math.min(want, w - 1, h - 1));
+}
+
+function toGray1(data, info) {
+  if (info.channels === 1) return data;
+  const one = Buffer.alloc(info.width * info.height);
+  for (let i = 0, j = 0; i < one.length; i += 1, j += info.channels) one[i] = data[j];
+  return one;
+}
+
+async function rawGray(sharpChain, scratch) {
+  const r = await sharpChain.raw().toBuffer({ resolveWithObject: true });
+  scratch.push(r.data);
+  const g = toGray1(r.data, r.info);
+  if (g !== r.data) scratch.push(g);
+  return { data: g, width: r.info.width, height: r.info.height };
+}
+
+async function rotateGray(img, deg, scratch) {
+  if (!deg) return img;
+  const sharp = await loadSharp();
+  const mean = Math.round(sampledMean(img.data));
+  return rawGray(
+    sharp(img.data, { raw: { width: img.width, height: img.height, channels: 1 } })
+      .rotate(deg, { background: { r: mean, g: mean, b: mean } })
+      .toColourspace("b-w"),
+    scratch
+  );
+}
+
+/** Mean, share of blown-out pixels, and sharpness (variance of the Laplacian) of a region. */
+export function regionStats(img, box) {
+  const { data, width } = img;
+  const x0 = Math.max(1, Math.floor(box ? box.left : 1));
+  const y0 = Math.max(1, Math.floor(box ? box.top : 1));
+  const x1 = Math.min(img.width - 2, Math.ceil(box ? box.left + box.width : img.width - 2));
+  const y1 = Math.min(img.height - 2, Math.ceil(box ? box.top + box.height : img.height - 2));
+  let n = 0, sum = 0, sat = 0, lap = 0, lap2 = 0;
+  const step = Math.max(1, Math.floor(Math.sqrt(((x1 - x0) * (y1 - y0)) / 60000)));
+  for (let y = y0; y < y1; y += step) {
+    for (let x = x0; x < x1; x += step) {
+      const i = y * width + x;
+      const v = data[i];
+      sum += v;
+      if (v >= 250) sat += 1;
+      const L = 4 * v - data[i - 1] - data[i + 1] - data[i - width] - data[i + width];
+      lap += L;
+      lap2 += L * L;
+      n += 1;
+    }
+  }
+  if (!n) return { mean: 0, sat: 0, sharp: 0 };
+  const mu = lap / n;
+  return { mean: sum / n, sat: sat / n, sharp: lap2 / n - mu * mu };
+}
+
+function digitsIn(s) {
+  return (String(s).match(/\d/g) || []).length;
+}
+
+/**
+ * Where are the number lines? tesseract's sparse mode with the digit
+ * whitelist, on two or three preparations of the whole picture, gives word
+ * boxes; boxes are merged into lines and ranked by how many digits they hold.
+ * Only geometry leaves this function.
+ */
+async function locateLines(engine, img, scratch, budget, { textPass = false, notAfter } = {}) {
+  const sharp = await loadSharp();
+  const k = LOCATE_SIDE / Math.max(img.width, img.height);
+  const lw = Math.max(1, Math.round(img.width * k));
+  const lh = Math.max(1, Math.round(img.height * k));
+  const base = () => sharp(img.data, { raw: { width: img.width, height: img.height, channels: 1 } }).resize(lw, lh);
+  const preps = textPass ? [] : await Promise.all([
+    base().normalise().png({ compressionLevel: 1 }).toBuffer(),
+    base().negate().normalise().png({ compressionLevel: 1 }).toBuffer(),
+    base().clahe({ width: claheTile(64, lw, lh), height: claheTile(64, lw, lh), maxSlope: 4 }).png({ compressionLevel: 1 }).toBuffer(),
+    // A photo of a screen: the moire is fine and regular, the digits are not - a soft blur keeps only the digits.
+    base().blur(1.6).normalise().png({ compressionLevel: 1 }).toBuffer(),
+  ]);
+  for (const p of preps) scratch.push(p);
+  const words = [];
+  let passes = 0;
+  const results = await Promise.all(preps.map(async (p) => {
+    if (budget.left() < 400) return { words: [] };
+    passes += 1;
+    return engine.recognize(p, { mode: "sparse", charset: "digits", words: true, notAfter });
+  }));
+  // One text pass too: with letters allowed, tesseract keeps a faint digit group it drops under the digit-only list.
+  // It runs on the full-size picture (up to 1600 px): Joseph's own card of 24 Sep, a light card with
+  // faint embossed digits, showed its number line only there.
+  // It is the SECOND locate, run only when the first found nothing to accept (rescue() below), and
+  // de-noised first: on a noisy dark photo an undenoised full-size text pass took 11 s on its own.
+  const scaled = results.map(() => k);
+  if (textPass && budget.left() >= 2500) {
+    passes += 1;
+    const full = await sharp(img.data, { raw: { width: img.width, height: img.height, channels: 1 } }).median(3).normalise().png({ compressionLevel: 1 }).toBuffer();
+    scratch.push(full);
+    results.push(await engine.recognize(full, { mode: "sparse", charset: "text", words: true, notAfter }));
+    scaled.push(1);
+  }
+  results.forEach((r, ri) => {
+    const kk = scaled[ri];
+    for (const w of r.words || []) {
+      const d = digitsIn(w.text);
+      if (d < 2 || d < 0.6 * w.text.replace(/\s/g, "").length || w.height < 6) continue;
+      words.push({ left: w.left / kk, top: w.top / kk, width: w.width / kk, height: w.height / kk, d });
+    }
+  });
+  // Rows of digit-sized shapes, found without tesseract (embossed and metal cards).
+  const small = textPass ? null : await rawGray(base().toColourspace("b-w"), scratch);
+  const shapeLines = !small ? [] : findRows(small.data, small.width, small.height).map((L) => ({ ...L, left: L.left / k, right: L.right / k, top: L.top / k, bottom: L.bottom / k, h: L.h / k }));
+  // Dedupe the same word seen in several preparations: keep the one with more digits.
+  words.sort((a, b) => b.d - a.d);
+  const uniq = [];
+  for (const w of words) {
+    const dup = uniq.find((u) => {
+      const ix = Math.max(0, Math.min(u.left + u.width, w.left + w.width) - Math.max(u.left, w.left));
+      const iy = Math.max(0, Math.min(u.top + u.height, w.top + w.height) - Math.max(u.top, w.top));
+      return ix * iy > 0.5 * Math.min(u.width * u.height, w.width * w.height);
+    });
+    if (!dup) uniq.push(w);
+  }
+  // Words into lines: centres within half a word height, allowing a slope.
+  uniq.sort((a, b) => a.left - b.left);
+  const lines = [];
+  for (const w of uniq) {
+    const cy = w.top + w.height / 2;
+    let best = null;
+    for (const L of lines) {
+      const last = L.words[L.words.length - 1];
+      const gap = w.left - (last.left + last.width);
+      const lcy = last.top + last.height / 2;
+      const hh = Math.max(last.height, w.height);
+      if (Math.abs(cy - lcy) < 0.6 * hh && gap < 6 * hh && gap > -0.5 * hh && w.height < 1.8 * last.height && last.height < 1.8 * w.height) {
+        if (!best || Math.abs(cy - lcy) < best.dy) best = { L, dy: Math.abs(cy - lcy) };
+      }
+    }
+    if (best) best.L.words.push(w);
+    else lines.push({ words: [w] });
+  }
+  const out = lines.map((L) => {
+    const ws = L.words;
+    const left = Math.min(...ws.map((w) => w.left));
+    const right = Math.max(...ws.map((w) => w.left + w.width));
+    const top = Math.min(...ws.map((w) => w.top));
+    const bottom = Math.max(...ws.map((w) => w.top + w.height));
+    const hs = ws.map((w) => w.height).sort((a, b) => a - b);
+    const h = hs[Math.floor(hs.length / 2)];
+    let angle = 0;
+    if (ws.length >= 2) {
+      const xs = ws.map((w) => w.left + w.width / 2);
+      const ys = ws.map((w) => w.top + w.height / 2);
+      const mx = xs.reduce((a, b) => a + b, 0) / xs.length;
+      const my = ys.reduce((a, b) => a + b, 0) / ys.length;
+      let sxy = 0, sxx = 0;
+      for (let i = 0; i < xs.length; i += 1) { sxy += (xs[i] - mx) * (ys[i] - my); sxx += (xs[i] - mx) ** 2; }
+      if (sxx > 0) angle = (Math.atan(sxy / sxx) * 180) / Math.PI;
+    }
+    return { left, right, top, bottom, h, angle, digits: ws.reduce((a, w) => a + w.d, 0), words: ws.length };
+  // Four digits are enough to be a candidate: on a light embossed card the engine may see only one group.
+  }).filter((L) => L.digits >= 4);
+  // A line box taller than one row has swallowed a word from the row above or below (Joseph's card,
+  // 24 Sep): also offer a tight line around its strongest word, full width.
+  for (const L of [...out]) {
+    if (L.bottom - L.top <= 1.3 * L.h) continue;
+    const ws = lines.find((x) => x.words && Math.min(...x.words.map((w) => w.top)) === L.top);
+    const core = ws ? [...ws.words].sort((a, b) => b.d - a.d)[0] : null;
+    if (!core) continue;
+    out.push({ ...L, top: core.top, bottom: core.top + core.height, h: core.height, angle: 0, core: true });
+  }
+  for (const S of shapeLines) {
+    const same = out.find((L) => Math.abs((L.top + L.bottom) / 2 - (S.top + S.bottom) / 2) < 0.6 * S.h && L.left < S.right && S.left < L.right);
+    if (same) { same.digits = Math.max(same.digits, S.digits); same.left = Math.min(same.left, S.left); same.right = Math.max(same.right, S.right); }
+    else out.push(S);
+  }
+  out.sort((a, b) => b.digits - a.digits || b.h - a.h);
+  // Two short lines stacked (a vertical card's 4-4 over 4-4): one band over both.
+  for (let i = 0; i < out.length; i += 1) {
+    for (let j = 0; j < out.length; j += 1) {
+      const a = out[i], b = out[j];
+      if (i === j || a.stacked || b.stacked) continue;
+      const gap = b.top - a.bottom;
+      if (gap > 0 && gap < 1.2 * a.h && Math.abs(a.left - b.left) < 2 * a.h && Math.abs(a.h - b.h) < 0.35 * a.h && a.digits >= 6 && b.digits >= 4 && a.digits + b.digits >= 13 && a.digits <= 12) {
+        out.push({ left: Math.min(a.left, b.left), right: Math.max(a.right, b.right), top: a.top, bottom: b.bottom, h: a.h, angle: 0, digits: a.digits + b.digits, words: a.words + b.words, stacked: true, parts: [a, b] });
+      }
+    }
+  }
+  // The number is the card's BIGGEST row of digits: rank by digits (capped) times height^1.5, so a
+  // row of small print (legal text, a phone number) never pushes the number line out.
+  // A row that touches the edge of the photo is cut off - it is tried last.
+  const edge = (L) => (L.top <= 2 || L.bottom >= img.height - 2 ? 0.2 : 1);
+  const rank = (L) => Math.min(L.stacked ? 16 : L.digits, 19) * Math.pow(L.h, 1.5) * edge(L);
+  out.sort((a, b) => rank(b) - rank(a));
+  return { lines: out, passes };
+}
+
+/** Cut one line out of the picture, straighten it, scale digits to LINE_DIGIT_PX tall. Returns gray raw. */
+async function cutLine(img, line, { flip = false, below = false } = {}, scratch) {
+  const sharp = await loadSharp();
+  const h = line.h;
+  const padX = below ? 1.5 * h : 8 * h;
+  let x0 = Math.max(0, Math.floor(line.left - padX));
+  let x1 = Math.min(img.width, Math.ceil(line.right + padX));
+  const slope = Math.tan((line.angle * Math.PI) / 180);
+  const drift = Math.abs(slope) * (x1 - x0) / 2;
+  let y0, y1;
+  if (below) {
+    y0 = Math.floor(line.bottom + 0.2 * h);
+    y1 = Math.ceil(line.bottom + 5.5 * h + drift);
+  } else {
+    // Generous above and below: a line box found on a busy picture can sit off the digits.
+    y0 = Math.floor(line.top - 0.75 * h - drift);
+    y1 = Math.ceil(line.bottom + 0.75 * h + drift);
+  }
+  y0 = Math.max(0, y0);
+  y1 = Math.min(img.height, y1);
+  x1 = Math.max(x1, x0 + 4);
+  if (y1 - y0 < 4 || x1 - x0 < 8) return null;
+  let chain = sharp(img.data, { raw: { width: img.width, height: img.height, channels: 1 } })
+    .extract({ left: x0, top: y0, width: Math.min(img.width - x0, x1 - x0), height: y1 - y0 });
+  let band = await rawGray(chain.toColourspace("b-w"), scratch);
+  if (Math.abs(line.angle) > 1.5) band = await rotateGray(band, -line.angle, scratch);
+  if (flip) band = await rotateGray(band, 180, scratch);
+  const f = Math.max(0.25, Math.min(5, LINE_DIGIT_PX / Math.max(4, h)));
+  const W = Math.min(3000, Math.max(16, Math.round(band.width * f)));
+  const H = Math.max(16, Math.round(band.height * (W / band.width)));
+  const scaled = await rawGray(sharp(band.data, { raw: { width: band.width, height: band.height, channels: 1 } }).resize(W, H, { kernel: "lanczos3" }).toColourspace("b-w"), scratch);
+  return scaled;
+}
+
+/** The six preparations of a cut line, as PNGs (dark ink on a light field where it matters). */
+async function linePreps(band, scratch, which) {
+  const sharp = await loadSharp();
+  const raw = { raw: { width: band.width, height: band.height, channels: 1 } };
+  const png = { compressionLevel: 1 };
+  const tile = Math.max(8, Math.round(LINE_DIGIT_PX * 2));
+  const darkField = sampledMean(band.data) < 128;
+  let ink = band.data;
+  if (darkField) {
+    ink = Buffer.alloc(band.data.length);
+    for (let i = 0; i < ink.length; i += 1) ink[i] = 255 - band.data[i];
+    scratch.push(ink);
+  }
+  const win = Math.max(15, Math.round(LINE_DIGIT_PX * 1.6)) | 1;
+  const makers = {
+    n: () => sharp(band.data, raw).normalise().png(png).toBuffer(),
+    c: () => sharp(band.data, raw).clahe({ width: claheTile(tile, band.width, band.height), height: claheTile(tile, band.width, band.height), maxSlope: 5 }).normalise().png(png).toBuffer(),
+    i: () => sharp(band.data, raw).negate().normalise().png(png).toBuffer(),
+    t: async () => {
+      const th = adaptiveThreshold(ink, band.width, band.height, win, 12);
+      scratch.push(th);
+      return sharp(th, raw).png(png).toBuffer();
+    },
+    s: () => sharp(ink, raw).sharpen({ sigma: 1.2 }).normalise().png(png).toBuffer(),
+    m: () => sharp(ink, raw).median(3).normalise().png(png).toBuffer(),
+  };
+  const out = [];
+  for (const k of which) {
+    const b = await makers[k]();
+    scratch.push(b);
+    out.push({ name: k, buffer: b });
+  }
+  return out;
+}
+
+const PROBLEM_SAY = {
+  glare: "I couldn't read the card number - the photo has glare on it. Take it again flat, out of direct light, or type the number here.",
+  dark: "I couldn't read the card number - the photo is too dark. Take it again in better light, or type the number here.",
+  blurry: "I couldn't read the card number - the photo is blurry. Hold the phone still and take it again, or type the number here.",
+  small: "I couldn't read the card number - the card is too small in the photo. Take it again closer, so the card fills the picture, or type the number here.",
+  no_number: "I couldn't find a card number in that picture. If the number is on the back of the card, send the back, or type the number here.",
+  unclear: "I couldn't read the whole card number. Take it again straight on and flat, or type the number here.",
+  two_cards: "I see two cards in that photo. Send one card at a time.",
+  covered: "I couldn't read the whole card number - part of it is covered. Take it again with the whole number showing, or type the number here.",
+  decode_failed: "That file did not open as a picture. Send a photo or screenshot (JPEG or PNG), or type the number here.",
+  heic_unsupported: "That is an iPhone HEIC photo, and I can't open that format here. Send it as a screenshot or JPEG, or type the number here.",
+  pdf_no_image: "That PDF has no picture of a card in it. Send a photo or screenshot of the card, or type the number here.",
+};
+
+/** The sentence the tile shows when the read failed: what went wrong, what to do, and what WAS read. */
+export function sayForFailure(problem, partial) {
+  let s = PROBLEM_SAY[problem] || PROBLEM_SAY.unclear;
+  if (partial && (partial.last4 || partial.expiry || partial.name)) {
+    const got = [];
+    if (partial.last4) got.push(`the number ends ${partial.last4}`);
+    if (partial.expiry) got.push(`expiry ${partial.expiry}`);
+    if (partial.name) got.push(`name ${partial.name}`);
+    s += ` What I did read: ${got.join(", ")}.`;
+    if (partial.expiry) s += " So you only need to type the full number with that expiry.";
+  }
+  return s;
+}
+
+/**
+ * Read one card photo. `engine.recognize(buffer, {mode, charset, words})` is
+ * the only OCR door (real pool in ocr-engine.js, fake in tests).
  *
- * @returns {Promise<object>} ok:false -> {ok:false, error, ms, passes}
+ * @returns {Promise<object>} ok:false -> {ok:false, error, problem, say, partial, ms, passes}
  *   ok:true -> {ok:true, pan, brand, last4, expiry, name, confidence, sources, rotation, ms, passes}
  *   The caller must drop `pan` before anything leaves the process.
  */
@@ -620,33 +1102,61 @@ async function recognizeCardOnce(input, opts) {
   const clock = typeof opts.clock === "function" ? opts.clock : Date.now;
   const now = opts.now instanceof Date ? opts.now : new Date(clock());
   const deadlineMs = Number(opts.deadlineMs) || OCR_DEADLINE_MS;
+  const totalMs = Math.max(deadlineMs, Number(opts.totalMs) || OCR_TOTAL_MS);
   const ladder = Array.isArray(opts.rotations) && opts.rotations.length ? opts.rotations : ROTATION_LADDER;
   const scratch = opts.trace && Array.isArray(opts.trace.buffers) ? opts.trace.buffers : [];
   if (Buffer.isBuffer(input)) scratch.push(input);
   const t0 = clock();
+  const budget = { left: () => totalMs - (clock() - t0) };
+  // Wall-clock cut-off the engine honours when a queued pass finally gets a worker (Date.now, as the pool uses).
+  const notAfter = Date.now() + totalMs - 400;
   let passes = 0;
   const hits = [];
   const texts = [];
+  const lineReads = []; // grouped reads of the number line, for the digit vote
+  const lastGroups = []; // the last printed group of every line read, for the partial "ends in"
+  const noteLast = (text) => {
+    for (const l of String(text || "").split(/\r?\n/)) {
+      const g = l.replace(/[^0-9 ]/g, " ").split(/ +/).filter(Boolean);
+      if (g.length >= 3 && (g[g.length - 1].length === 4 || g[g.length - 1].length === 5)) lastGroups.push(g[g.length - 1].slice(-4));
+    }
+  };
 
   const finish = (result) => {
     purge(scratch);
     return { ...result, ms: clock() - t0, passes };
   };
+  const fail = (error, problem, partial = null) => finish({
+    ok: false, error, problem, say: sayForFailure(problem || error, partial), partial,
+  });
+
+  // Formats the picture decoder does not take: PDF (the picture inside it) and HEIC.
+  let source = input;
+  const format = sniffFormat(input);
+  if (format === "pdf") {
+    try { source = await imageFromPdf(input, scratch); } catch { source = null; }
+    if (!source) return fail("pdf_no_image", "pdf_no_image");
+  }
 
   let built;
   try {
-    built = await buildVariants(input, { scratch });
+    built = await buildVariants(source, { scratch });
   } catch {
-    return finish({ ok: false, error: "decode_failed" });
+    if (format === "heic") return fail("heic_unsupported", "heic_unsupported");
+    return fail("decode_failed", "decode_failed");
   }
   const { variants } = built;
 
+  const accepted = (v) => v && v.confidence === "high";
+  const vote = () => voteCandidates(hits);
+
+  // Stage 1: the fast whole-card passes (unchanged from 23 Sep), one rotation at a time.
   const runPass = async (rotation, mode, charset) => {
     const imgs = await Promise.all(variants.map((v) => rotated(v.buffer, rotation, scratch)));
     const results = await Promise.all(
       imgs.map(async (buf, i) => {
         passes += 1;
-        const r = await engine.recognize(buf, { mode, charset });
+        const r = await engine.recognize(buf, { mode, charset, notAfter });
         return { variant: variants[i].name, ...r };
       })
     );
@@ -655,58 +1165,283 @@ async function recognizeCardOnce(input, opts) {
       texts.push({ source, rotation, variant: r.variant, text: r.text, confidence: r.confidence });
       for (const hit of extractPans(r.text)) hits.push({ ...hit, source });
     }
-    return voteCandidates(hits);
+    return vote();
   };
 
-  let vote = null;
-  let rotation = 0;
-  for (const rot of ladder) {
-    if (clock() - t0 > deadlineMs) break;
-    vote = await runPass(rot, "block", "digits");
-    if (vote) {
-      rotation = rot;
-      if (vote.confidence !== "high" && clock() - t0 <= deadlineMs) {
-        // 13.3.3 second pass, sparse text, for embossed cards - at the found orientation only.
-        vote = await runPass(rot, "sparse", "digits");
+  // Stage 2: find the number line, cut it out, read it alone.
+  let base = null;
+  const bases = new Map();
+  const baseAt = async (rot) => {
+    if (!base) base = { data: built.gray, width: built.width, height: built.height };
+    if (!bases.has(rot)) bases.set(rot, await rotateGray(base, rot, scratch));
+    return bases.get(rot);
+  };
+  const seenLines = []; // {rot, line, img} for the partial read and the problem words
+  const readLine = async (img, line, rot, flip, which, modes) => {
+    const band = await cutLine(img, line, { flip }, scratch);
+    if (!band) return;
+    const preps = await linePreps(band, scratch, which);
+    if (opts.debugBands) for (const p of preps) opts.debugBands(`${Math.round(line.top)}-${rot}-${flip ? 1 : 0}-${p.name}`, Buffer.from(p.buffer));
+    // The glyph matcher on the same cut (ocr-glyphs.js): a second reader that knows card fonts.
+    // Also on a local-contrast copy (glare lifts one part of the line), and for a number printed on
+    // two lines, on each line alone with the two readings joined.
+    const glyphReads = [];
+    const sharpG = await loadSharp();
+    const clahe = await rawGray(sharpG(band.data, { raw: { width: band.width, height: band.height, channels: 1 } })
+      .clahe({ width: claheTile(LINE_DIGIT_PX * 2, band.width, band.height), height: claheTile(LINE_DIGIT_PX * 2, band.width, band.height), maxSlope: 6 }).toColourspace("b-w"), scratch);
+    if (line.parts) {
+      const halves = [];
+      for (const part of line.parts) {
+        const pb = await cutLine(img, part, { flip }, scratch);
+        halves.push(pb ? readLineGlyphs(pb, { digitPx: LINE_DIGIT_PX, minGlyphs: 6 }) : []);
       }
-      break;
+      for (const a of halves[flip ? 1 : 0] || []) {
+        const b = (halves[flip ? 0 : 1] || []).find((x) => x.prep === a.prep && x.font === a.font);
+        if (!b) continue;
+        glyphReads.push({ ...a, text: a.text + " " + b.text, minMargin: Math.min(a.minMargin, b.minMargin), minScore: Math.min(a.minScore, b.minScore), meanScore: (a.meanScore + b.meanScore) / 2 });
+      }
+    } else {
+      glyphReads.push(...readLineGlyphs(band, { digitPx: LINE_DIGIT_PX }));
+      glyphReads.push(...readLineGlyphs(clahe, { digitPx: LINE_DIGIT_PX }).map((g) => ({ ...g, prep: "c" + g.prep })));
+      // A photo of a screen: soften the moire before the glyphs are cut.
+      const soft = await rawGray(sharpG(band.data, { raw: { width: band.width, height: band.height, channels: 1 } }).blur(1.4).toColourspace("b-w"), scratch);
+      glyphReads.push(...readLineGlyphs(soft, { digitPx: LINE_DIGIT_PX }).map((g) => ({ ...g, prep: "b" + g.prep })));
+    }
+    for (const g of glyphReads) {
+      if (g.minScore >= GLYPH_MIN_SCORE) noteLast(g.text);
+      if (opts.debug) opts.debug({ stage: "glyph", prep: g.prep, font: g.font, text: g.text, mean: +g.meanScore.toFixed(3), minS: +g.minScore.toFixed(3), minM: +g.minMargin.toFixed(3) });
+      const gsrc = `glyph:${g.prep}@${rot}${flip ? "f" : ""}`;
+      const lk = `${rot}:${Math.round(line.top)}:${flip ? 1 : 0}`;
+      for (const gr of groupedReads(g.text)) lineReads.push({ ...gr, lineKey: lk });
+      if (g.minScore >= GLYPH_MIN_SCORE && (g.minMargin >= GLYPH_MIN_MARGIN || (g.thin <= 1 && g.minMargin >= 0))) {
+        const direct = extractPans(g.text);
+        for (const hit of direct) hits.push({ ...hit, source: gsrc, lineKey: lk, h: line.h });
+        if (!direct.length && g.alt && g.thin === 1) {
+          for (const hit of extractPans(g.alt)) hits.push({ ...hit, source: gsrc + ":2nd", lineKey: lk, h: line.h });
+        }
+      }
+    }
+    // The glyph matcher is pure arithmetic and runs first; when two of its readings already agree on
+    // a card number, the slow tesseract passes on this cut are not needed (a slow box keeps its budget).
+    if (!accepted(vote())) {
+      const jobs = [];
+      for (const p of preps) for (const mode of modes) jobs.push({ p, mode });
+      await Promise.all(jobs.map(async ({ p, mode }) => {
+        if (budget.left() < 250) return;
+        passes += 1;
+        const r = await engine.recognize(p.buffer, { mode: line.stacked ? "block" : mode, charset: "digits", notAfter });
+        const source = `line${Math.round(line.top)}:${p.name}@${rot}${flip ? "f" : ""}#${mode}`;
+        texts.push({ source, rotation: rot, variant: p.name, text: r.text, confidence: r.confidence, line: true });
+        noteLast(r.text);
+        if (opts.debug) opts.debug({ stage: "line", source, text: r.text.trim() });
+        for (const hit of extractPans(r.text)) hits.push({ ...hit, source, lineKey: `${rot}:${Math.round(line.top)}:${flip ? 1 : 0}`, h: line.h });
+        for (const g of groupedReads(r.text)) lineReads.push({ ...g, lineKey: `${rot}:${Math.round(line.top)}:${flip ? 1 : 0}` });
+      }));
+    }
+    // Digit-by-digit vote across this line's reads: one more source when it lands on a real number.
+    const key = `${rot}:${Math.round(line.top)}:${flip ? 1 : 0}`;
+    for (const hit of consensusPans(lineReads.filter((x) => x.lineKey === key))) {
+      hits.push({ ...hit, source: `vote:${key}`, lineKey: key, h: line.h });
+    }
+  };
+  const rescue = async (rot) => {
+    if (budget.left() < 900) return;
+    const img = await baseAt(rot);
+    const inside = (L) => L.top > 2 && L.bottom < img.height - 2;
+    const locate = async (textPass) => {
+      const { lines, passes: lp } = await locateLines(engine, img, scratch, budget, { textPass, notAfter });
+      passes += lp;
+      if (opts.debug) opts.debug({ stage: "locate", rot, text: textPass, lines: lines.slice(0, 5).map((l) => ({ top: Math.round(l.top), bot: Math.round(l.bottom), left: Math.round(l.left), right: Math.round(l.right), h: Math.round(l.h), d: l.digits, ang: Math.round(l.angle), st: !!l.stacked, sh: !!l.shapes })) });
+      return lines;
+    };
+    const tried = (L) => seenLines.some((s) => s.rot === rot && Math.abs(s.line.top - L.top) < 0.5 * L.h && Math.abs(s.line.bottom - L.bottom) < 0.5 * L.h && Math.abs((s.line.angle || 0) - (L.angle || 0)) < 1);
+    const readAll = async (lines) => {
+      // Rows cut off by the photo's edge only when there is nothing else.
+      const fresh = lines.filter((L) => !tried(L));
+      const pool = fresh.filter(inside).length ? fresh.filter(inside) : fresh;
+      const top = pool.slice(0, 4);
+      for (const line of top) seenLines.push({ rot, line, img });
+      for (const line of top) {
+        if (accepted(vote()) || budget.left() < 700) break;
+        await readLine(img, line, rot, false, ["n", "c", "i", "t", "s", "m"], ["line", "raw"]);
+        const lk = `${rot}:${Math.round(line.top)}:0`;
+        const gotHere = hits.some((x) => x.lineKey === lk);
+        if (!gotHere && !accepted(vote()) && budget.left() > 700) {
+          // Upside down, or the digit line is really the other way round: the same cut, turned.
+          await readLine(img, line, rot, true, ["n", "c", "i", "t"], ["line"]);
+        }
+      }
+    };
+    const rankOf = (L) => Math.min(L.stacked ? 16 : L.digits, 19) * Math.pow(L.h, 1.5) * (inside(L) ? 1 : 0.2);
+    let lines = await locate(false);
+    let textDone = false;
+    // No row inside the photo that already looks like most of a number: find rows the other way
+    // (the full-size text pass) BEFORE spending the time on weak rows - that order is what reads
+    // Joseph's light embossed card inside the budget on a slow box.
+    if (!lines.some((L) => inside(L) && L.digits >= 10) && budget.left() >= 2500) {
+      lines = [...lines, ...(await locate(true))].sort((a, b) => rankOf(b) - rankOf(a));
+      textDone = true;
+    }
+    await readAll(lines);
+    if (!textDone && !accepted(vote()) && budget.left() >= 2500) await readAll(await locate(true));
+  };
+
+  const stages = [];
+  const order = [...ladder];
+  // Fast pass at the first rotation, then the rescue at 0 and 90 (turned cuts cover 180 and 270),
+  // then the remaining fast rotations.
+  stages.push(["fast", order[0]]);
+  stages.push(["rescue", 0]);
+  for (const r of order.slice(1)) {
+    stages.push(["fast", r]);
+    if (r === 90) stages.push(["rescue", 90]);
+  }
+  let fastRotation = null;
+  for (const [kind, rot] of stages) {
+    if (accepted(vote())) break;
+    if (kind === "fast") {
+      if (clock() - t0 > deadlineMs) continue;
+      const v = await runPass(rot, "block", "digits");
+      if (v && !accepted(v) && clock() - t0 <= deadlineMs) {
+        // 13.3.3 second pass, sparse text, for embossed cards - at the found orientation only.
+        await runPass(rot, "sparse", "digits");
+      }
+      if (v && fastRotation == null) fastRotation = rot;
+    } else {
+      // The rescue is extra: if it throws (an odd picture size, a decoder edge), what was read stands.
+      try { await rescue(rot); } catch (e) { if (opts.debug) opts.debug({ stage: "rescue_error", error: String(e && e.message).slice(0, 80) }); }
     }
   }
-  if (!vote) return finish({ ok: false, error: "no_card_found" });
 
-  // Expiry from what the digit passes already saw at this rotation, then one text pass for the name.
+  const final = vote();
+  // Two different numbers each read more than once: two cards in the frame, unless one is plainly bigger.
+  if (final && final.second && final.second.sources >= 2 && !accepted(final)) {
+    const sizeOf = (pan) => Math.max(0, ...hits.filter((x) => x.pan === pan && x.h).map((x) => x.h));
+    const a = sizeOf(final.pan);
+    const b = sizeOf(final.second.pan);
+    if (!(a && b && Math.max(a, b) > 1.35 * Math.min(a, b))) {
+      return fail("two_cards", "two_cards", null);
+    }
+    const bigger = a > b ? final.pan : final.second.pan;
+    const own = hits.filter((x) => x.pan === bigger);
+    hits.length = 0;
+    hits.push(...own);
+  }
+  const win = vote();
+  if (opts.debug) opts.debug({ stage: "hits", hits: hits.map((x) => x.pan + " " + x.source) });
+
+  // What was read of the number line even when the whole number was not: the last group, when two reads agree.
+  const partialLast4 = () => {
+    const tally = new Map();
+    for (const l4 of lastGroups) tally.set(l4, (tally.get(l4) || 0) + 1);
+    const best = [...tally.entries()].sort((x, y) => y[1] - x[1])[0];
+    // Shown to the rep as fact ("the number ends ..."), so it needs three agreeing reads and a clear lead.
+    if (!best || best[1] < 3) return null;
+    const next = [...tally.entries()].sort((x, y) => y[1] - x[1])[1];
+    return next && next[1] * 3 > best[1] ? null : best[0];
+  };
+
+  // Expiry and name: from what the passes already saw, then the strip under the number line.
+  const readBelow = async (rot, line, img, flip) => {
+    let expiry = null;
+    let name = null;
+    const band = await cutLine(img, { ...line, angle: line.angle }, { below: true, flip }, scratch);
+    if (!band) return { expiry, name };
+    const preps = await linePreps(band, scratch, ["n", "i"]);
+    for (const p of preps) {
+      if (expiry && name) break;
+      if (budget.left() < 200) break;
+      passes += 1;
+      const r = await engine.recognize(p.buffer, { mode: "sparse", charset: "text", notAfter });
+      if (!expiry) expiry = parseExpiry(r.text, now);
+      if (!name) name = pickName(r.text, expiry);
+    }
+    return { expiry, name };
+  };
+
+  if (!win || !accepted(win)) {
+    // Nothing accepted: say why, and hand back what was read.
+    let expiry = null;
+    for (const t of texts) { expiry = parseExpiry(t.text, now); if (expiry) break; }
+    let name = null;
+    const best = seenLines[0];
+    if (best && budget.left() > 300 && !best.line.stacked) {
+      const got = await readBelow(best.rot, best.line, best.img, false);
+      expiry = expiry || got.expiry;
+      name = got.name;
+    }
+    const last4 = partialLast4();
+    const partial = last4 || expiry || name ? { last4, expiry, name } : null;
+    let problem = "unclear";
+    const whole = regionStats({ data: built.gray, width: built.width, height: built.height });
+    if (!seenLines.length) {
+      problem = whole.mean < 55 ? "dark" : whole.sharp < 40 ? "blurry" : "no_number";
+    } else {
+      const L = best.line;
+      const st = regionStats(best.img, { left: L.left, top: L.top - 0.5 * L.h, width: L.right - L.left, height: 2 * L.h });
+      const scaleBack = Math.max(1, built.origMaxSide || 1) / Math.max(built.width, built.height);
+      if (st.sat > 0.03) problem = "glare";
+      else if (st.mean < 55 || whole.mean < 50) problem = "dark";
+      else if (L.h * scaleBack < 13) problem = "small";
+      else if (st.sharp < 60) problem = "blurry";
+    }
+    return fail("no_card_found", problem, partial);
+  }
+
+  // Accepted. Rotation = where the winning reads came from.
+  const winHits = hits.filter((x) => x.pan === win.pan);
+  const rotOf = (src) => { const m = /@(\d+)/.exec(src); return m ? Number(m[1]) : 0; };
+  const rotation = winHits.length ? rotOf(winHits[0].source) : fastRotation || 0;
   const atRot = texts.filter((t) => t.rotation === rotation);
   let expiry = null;
   for (const t of atRot) {
     expiry = parseExpiry(t.text, now);
     if (expiry) break;
   }
-  const withPan = atRot.filter((t) => extractPans(t.text).some((h) => h.pan === vote.pan));
-  withPan.sort((a, b) => b.confidence - a.confidence);
-  const bestVariant = (withPan[0] || atRot[0] || { variant: "stretch" }).variant;
   let name = null;
-  const order = [bestVariant, ...VARIANT_NAMES.filter((n) => n !== bestVariant)];
-  for (const vName of order.slice(0, 2)) {
-    if (name && expiry) break;
-    if (clock() - t0 > deadlineMs + 600) break;
-    const v = variants.find((x) => x.name === vName);
-    if (!v) continue;
-    const img = await rotated(v.buffer, rotation, scratch);
-    passes += 1;
-    const r = await engine.recognize(img, { mode: "sparse", charset: "text" });
-    if (!expiry) expiry = parseExpiry(r.text, now);
-    if (!name) name = pickName(r.text, expiry);
+  const lineHit = winHits.find((x) => x.lineKey);
+  if (lineHit) {
+    const [r, top, fl] = lineHit.lineKey.split(":");
+    const seen = seenLines.find((s) => s.rot === Number(r) && Math.round(s.line.top) === Number(top));
+    if (seen && !seen.line.stacked) {
+      const got = await readBelow(seen.rot, seen.line, seen.img, fl === "1");
+      expiry = expiry || got.expiry;
+      name = got.name;
+    } else if (seen && seen.line.stacked) {
+      const got = await readBelow(seen.rot, { ...seen.line, top: seen.line.bottom - seen.line.h }, seen.img, fl === "1");
+      expiry = expiry || got.expiry;
+      name = got.name;
+    }
+  }
+  if (!name || !expiry) {
+    const withPan = atRot.filter((t) => !t.line && extractPans(t.text).some((h) => h.pan === win.pan));
+    withPan.sort((a, b) => b.confidence - a.confidence);
+    const bestVariant = (withPan[0] || atRot.find((t) => !t.line) || { variant: "stretch" }).variant;
+    const vorder = [bestVariant, ...VARIANT_NAMES.filter((n) => n !== bestVariant)];
+    for (const vName of vorder.slice(0, 2)) {
+      if (name && expiry) break;
+      if (budget.left() < 200) break;
+      const v = variants.find((x) => x.name === vName);
+      if (!v) continue;
+      const img = await rotated(v.buffer, rotation, scratch);
+      passes += 1;
+      const r = await engine.recognize(img, { mode: "sparse", charset: "text", notAfter });
+      if (!expiry) expiry = parseExpiry(r.text, now);
+      if (!name) name = pickName(r.text, expiry);
+    }
   }
 
   return finish({
     ok: true,
-    pan: vote.pan,
-    brand: vote.brand,
-    last4: vote.pan.slice(-4),
+    pan: win.pan,
+    brand: win.brand,
+    last4: win.pan.slice(-4),
     expiry,
     name,
-    confidence: vote.confidence,
-    sources: vote.sources,
+    // Accepted means two different reads agreed and nothing else came close. Three or more = high;
+    // exactly two = low, and the rep confirms the last four before a charge.
+    confidence: win.sources >= 3 ? "high" : "low",
+    sources: win.sources,
     rotation,
   });
 }
@@ -900,7 +1635,8 @@ export function imageFromBody(raw, contentType) {
   const ct = String(contentType || "").toLowerCase();
   if (!raw || !raw.length) return { error: "empty_body", status: 400 };
   try {
-    if (ct.startsWith("image/") || ct === "application/octet-stream") {
+    // A PDF (a scan, a bank page) is read for the picture inside it (imageFromPdf).
+    if (ct.startsWith("image/") || ct === "application/octet-stream" || ct === "application/pdf") {
       return { buffer: Buffer.from(raw) };
     }
     if (ct.startsWith("multipart/form-data")) {
@@ -1045,10 +1781,26 @@ export async function handleOcrRequest(req, res, deps = {}) {
   }
   purge(trace.buffers);
   if (!result.ok) {
+    // Joseph, 24 Sep: when it cannot read, say what went wrong and what to do, and hand back what
+    // WAS read so the rep types only what is missing. `partial` is the last four (when several reads
+    // agree), the expiry and the name - never more of the number.
+    const partial = result.partial
+      ? { last4: result.partial.last4 || null, expiry: result.partial.expiry || null, name: result.partial.name || null }
+      : null;
+    const format = ["decode_failed", "heic_unsupported", "pdf_no_image"].includes(result.error);
     done(
-      result.error === "decode_failed" ? 415 : 422,
-      { ok: false, error: result.error, confidence: "none", ocrMs: result.ms, passes: result.passes },
-      { ...fields, outcome: result.error }
+      format ? 415 : 422,
+      {
+        ok: false,
+        error: result.error,
+        problem: result.problem || null,
+        say: result.say || sayForFailure(result.problem || result.error, partial),
+        partial,
+        confidence: "none",
+        ocrMs: result.ms,
+        passes: result.passes,
+      },
+      { ...fields, outcome: result.problem && result.problem !== result.error ? `${result.error}:${result.problem}` : result.error }
     );
     return;
   }

@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js",
+    "bench:ocr": "node test/ocr-bench.mjs"
   },
   "engines": {
     "node": ">=20"

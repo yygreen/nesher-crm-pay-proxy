@@ -51,8 +51,37 @@ export const DIGIT_CHARSET = "0123456789/ ";
 /** Name / expiry pass: upper-case letters, digits, slash, and the few marks cards print. */
 export const TEXT_CHARSET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/ .-'";
 
-/** tesseract PSM values (strings, as tesseract.js takes them). 6 = single block, 11 = sparse text. */
-export const PSM_BY_MODE = { block: "6", sparse: "11" };
+/**
+ * tesseract PSM values (strings, as tesseract.js takes them). 6 = single block,
+ * 11 = sparse text, 7 = one text line (a cropped number band), 13 = raw line
+ * (the same band with tesseract's own layout switched off - embossed digits).
+ */
+export const PSM_BY_MODE = { block: "6", sparse: "11", line: "7", raw: "13" };
+
+/**
+ * Word boxes from tesseract's TSV (level 5 rows): {text, left, top, width,
+ * height, conf, line}. The text stays inside the reader like every other OCR
+ * string; only geometry is ever used to decide where the number line is.
+ */
+export function parseTsvWords(tsv) {
+  const out = [];
+  for (const row of String(tsv || "").split(/\r?\n/)) {
+    const c = row.split("\t");
+    if (c.length < 12 || c[0] !== "5") continue;
+    const text = c.slice(11).join("\t").trim();
+    if (!text) continue;
+    out.push({
+      text,
+      left: Number(c[6]) || 0,
+      top: Number(c[7]) || 0,
+      width: Number(c[8]) || 0,
+      height: Number(c[9]) || 0,
+      conf: Number(c[10]) || 0,
+      line: `${c[2]}.${c[3]}.${c[4]}`,
+    });
+  }
+  return out;
+}
 export const CHARSET_BY_NAME = { digits: DIGIT_CHARSET, text: TEXT_CHARSET };
 
 let tesseractModule = null;
@@ -131,21 +160,30 @@ export function createEnginePool(opts = {}) {
     else idle.push(w);
   }
 
-  async function recognize(buffer, { mode = "block", charset = "digits" } = {}) {
+  async function recognize(buffer, { mode = "block", charset = "digits", words = false, notAfter } = {}) {
     const psm = PSM_BY_MODE[mode] || PSM_BY_MODE.block;
     const whitelist = CHARSET_BY_NAME[charset] || DIGIT_CHARSET;
     const w = await acquire();
+    // A pass that waited for a worker past the read's deadline is not run: the answer is already late.
+    if (notAfter && Date.now() > notAfter) {
+      release(w);
+      return { text: "", confidence: 0, words: words ? [] : undefined, skipped: true };
+    }
     try {
       await w.setParameters({
         tessedit_char_whitelist: whitelist,
         tessedit_pageseg_mode: psm,
+        // Card photos carry no dpi; without this tesseract warns on every pass.
+        user_defined_dpi: "300",
       });
       dirty.add(w);
-      const r = await w.recognize(buffer);
-      return {
+      const r = await w.recognize(buffer, {}, words ? { text: true, tsv: true } : { text: true });
+      const out = {
         text: String((r && r.data && r.data.text) || ""),
         confidence: Number((r && r.data && r.data.confidence) || 0),
       };
+      if (words) out.words = parseTsvWords(r && r.data && r.data.tsv);
+      return out;
     } finally {
       release(w);
     }
