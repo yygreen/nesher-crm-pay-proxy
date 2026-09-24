@@ -27,6 +27,8 @@
  * payee, memo, matched record, Mercury's request id. Never a token, never an account number.
  */
 
+import crypto from "node:crypto";
+import { recipientDraft } from "./mercury-gateway.js";
 import {
   bindHashOf,
   consumeTicket,
@@ -39,15 +41,52 @@ import {
 
 export const PAY_PREFIX = "/__nesher_pay/pay/";
 export const PAY_BODY_MAX = 16 * 1024;
-const TILE_RE = /^mp[a-z0-9]{6,20}$/;
+const TILE_RE = /^(?:mp|pr)[a-z0-9]{6,20}$/;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const FP_RE = /^[0-9a-f]{24}$/;
 
 export function payDoorOf(pathname) {
   const p = String(pathname || "").split("?")[0].replace(/\/+$/, "");
   if (p === "/__nesher_pay/pay/prepare") return "prepare";
   if (p === "/__nesher_pay/pay/request") return "request";
   if (p === "/__nesher_pay/pay/status") return "status";
+  if (p === "/__nesher_pay/pay/payee-hold") return "payee-hold";
+  if (p === "/__nesher_pay/pay/recipient-add") return "recipient-add";
+  if (p === "/__nesher_pay/pay/send") return "send";
   return null;
+}
+
+// ── Mr. AK Money: pasted bank details are HELD here, never on the desk ─────────────────────────
+// The desk parses what the rep pasted and sends the details here ONCE; it keeps only the reference
+// this returns, the last four, the name and the bank's name. The hold is in this process's memory
+// only (like the card hold), 30 minutes, bound to the rep who pasted it, spent by one successful add.
+export const PAYEE_HOLD_MS = 30 * 60 * 1000;
+const PAYEE_REF_RE = /^ph_[A-Za-z0-9_-]{24,40}$/;
+export function createPayeeHold({ clock = Date.now, ttlMs = PAYEE_HOLD_MS, max = 200 } = {}) {
+  const held = new Map();
+  function prune() {
+    const t = clock();
+    for (const [k, v] of held) if (v.exp <= t) { v.draft = null; held.delete(k); }
+    while (held.size > max) { const k = held.keys().next().value; held.get(k).draft = null; held.delete(k); }
+  }
+  return {
+    put(draft, rep) {
+      prune();
+      const ref = "ph_" + crypto.randomBytes(24).toString("base64url");
+      held.set(ref, { draft, rep: String(rep || ""), exp: clock() + ttlMs });
+      return { ref, expiresAt: clock() + ttlMs };
+    },
+    get(ref, rep) {
+      prune();
+      if (!PAYEE_REF_RE.test(String(ref || ""))) return { error: "ref_invalid" };
+      const h = held.get(ref);
+      if (!h) return { error: "ref_expired" };
+      if (h.rep !== String(rep || "")) return { error: "ref_other_rep" };
+      return { draft: h.draft };
+    },
+    spend(ref) { const h = held.get(ref); if (h) { h.draft = null; held.delete(ref); } },
+    size() { prune(); return held.size; },
+  };
 }
 
 function str(v, max) {
@@ -170,7 +209,7 @@ export async function matchMemo(pool, memo) {
 
 function accessLine(door, f) {
   const o = { door, rep: f.rep || null, ticket: f.ticket || null, outcome: f.outcome || null, ms: f.ms == null ? null : f.ms };
-  for (const k of ["tile", "recipient", "payee", "amount_cents", "memo", "matched", "request_id", "state"]) if (f[k] != null) o[k] = f[k];
+  for (const k of ["tile", "recipient", "payee", "amount_cents", "memo", "matched", "request_id", "state", "last4", "email", "mode", "txn", "reused", "dup_ok"]) if (f[k] != null) o[k] = f[k];
   return `money-pay ${JSON.stringify(o)}`;
 }
 
@@ -183,6 +222,7 @@ export function createMoneyPay(deps = {}) {
   const log = typeof deps.log === "function" ? deps.log : console.log;
   const gateway = deps.gateway;
   const getPool = typeof deps.getPool === "function" ? deps.getPool : () => null;
+  const holds = deps.holds || createPayeeHold({ clock });
 
   async function open(req, res, kind, bindOf) {
     const t0 = clock();
@@ -304,12 +344,101 @@ export function createMoneyPay(deps = {}) {
   }
 
   async function status(req, res) {
-    const door = await open(req, res, "paystat", (b) => (UUID_RE.test(str(b.request_id, 40)) ? str(b.request_id, 40) : ""));
+    // An approval request (request_id) or, since Mr. AK, a sent payment (txn_id). One of the two.
+    const door = await open(req, res, "paystat", (b) => {
+      const rq = str(b.request_id, 40), tx = str(b.txn_id, 40);
+      if (UUID_RE.test(rq) && !tx) return rq;
+      if (UUID_RE.test(tx) && !rq) return "txn|" + tx;
+      return "";
+    });
     if (!door) return;
     const { body, finish } = door;
-    const out = await gateway.payStatus(str(body.request_id, 40));
+    const tx = str(body.txn_id, 40);
+    const out = tx ? await gateway.payTxnStatus(tx) : await gateway.payStatus(str(body.request_id, 40));
     const b = out.body || {};
-    finish(out.status, b, { request_id: str(body.request_id, 40), state: b.state || null, outcome: b.ok ? "read" : String(b.error || "error") });
+    finish(out.status, b, { request_id: tx ? null : str(body.request_id, 40), txn: tx || null, state: b.state || null, outcome: b.ok ? "read" : String(b.error || "error") });
+  }
+
+  // ── Mr. AK: the pasted details go to the hold; the desk keeps a reference and the last four ──
+  async function payeeHold(req, res) {
+    const door = await open(req, res, "payprep", (b) => (TILE_RE.test(str(b.tile_id, 24)) && str(b.tile_id, 24).startsWith("pr") ? str(b.tile_id, 24) : ""));
+    if (!door) return;
+    const { body, finish } = door;
+    const tile = str(body.tile_id, 24);
+    if (!gateway.payCaps().recipients) return finish(404, { ok: false, error: "recipients_off" }, { tile, outcome: "recipients_off" });
+    const d = body.details && typeof body.details === "object" ? body.details : {};
+    const draft = recipientDraft({ name: d.name, routing: d.routing, account: d.account, type: d.type, business: d.business === true, emails: d.emails, address: d.address });
+    // The numbers are off the request body the moment the draft holds them.
+    if (body.details) { body.details.account = ""; body.details.routing = ""; }
+    if (!draft.ok) return finish(400, { ok: false, error: draft.error }, { tile, outcome: `draft:${draft.error}` });
+    const h = holds.put(draft, door.ticket.repId);
+    // What Mercury already has: the same bank details (reuse), or the same name with other details.
+    let same = null, twins = [];
+    try {
+      const all = await gateway.payRecipientsAll();
+      const key = (s) => String(s || "").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+      const want = gateway.payeeFingerprintOf(draft.body);
+      for (const x of all) {
+        if (x.raw.status && x.raw.status !== "active") continue;
+        if (want && x.view.fp === want) same = x.view;
+        else if (key(x.view.name) === key(draft.body.name)) twins.push(x.view);
+      }
+    } catch { /* the tile says it could not check; the add checks again */ }
+    finish(200, { ok: true, ref: h.ref, expires_at: new Date(h.expiresAt).toISOString(), draft: draft.view, existing: same, twins: twins.slice(0, 3) }, {
+      tile, payee: draft.view.name, last4: draft.view.last4, email: draft.view.emails.join(",") || null, outcome: same ? "held:exists" : twins.length ? "held:same_name" : "held",
+    });
+  }
+
+  async function recipientAdd(req, res) {
+    const door = await open(req, res, "pay", (b) => (/^ph_/.test(str(b.ref, 48)) && TILE_RE.test(str(b.tile_id, 24)) ? `add|${str(b.ref, 48)}|${str(b.tile_id, 24)}` : ""));
+    if (!door) return;
+    const { body, finish, ticket } = door;
+    const tile = str(body.tile_id, 24);
+    const got = holds.get(str(body.ref, 48), ticket.repId);
+    if (got.error) return finish(got.error === "ref_other_rep" ? 403 : 410, { ok: false, error: got.error }, { tile, outcome: got.error });
+    let gone = false;
+    res.on("close", () => { if (!res.writableFinished) gone = true; });
+    const out = await gateway.addRecipient(got.draft, { allowSameName: body.allow_same_name === true, isGone: () => gone });
+    const b = out.body || {};
+    // Spent on a clear answer either way (made, reused, or refused for a reason a retry will not
+    // change); kept on an unclear one, where the retry finds and reuses what may have been made.
+    if (b.ok || (out.status >= 400 && out.status < 500 && b.error !== "same_name_other_bank")) holds.spend(str(body.ref, 48));
+    finish(out.status, b, { tile, payee: b.recipient ? b.recipient.name : got.draft.view.name, last4: got.draft.view.last4, recipient: b.recipient ? b.recipient.id : null, reused: b.ok ? b.reused === true : null, outcome: b.ok ? (b.reused ? "reused" : "added") : String(b.error || "error") });
+  }
+
+  async function sendDoor(req, res) {
+    const door = await open(req, res, "pay", (b) => {
+      const rid = str(b.recipient_id, 40);
+      const key = str(b.idempotency_key, 80);
+      const fp = str(b.fp, 24);
+      if (!UUID_RE.test(rid) || !Number.isInteger(b.amount_cents) || !key || !FP_RE.test(fp)) return "";
+      return `send|${rid}|${b.amount_cents}|${key}|${fp}|${b.allow_dup === true ? 1 : 0}`;
+    });
+    if (!door) return;
+    const { body, finish, ticket } = door;
+    const tile = str(body.tile_id, 24);
+    const memo = str(body.memo, 140);
+    const matched = str(body.matched, 120);
+    let gone = false;
+    res.on("close", () => { if (!res.writableFinished) gone = true; });
+    const out = await gateway.sendPay({
+      recipientId: str(body.recipient_id, 40),
+      amountCents: body.amount_cents,
+      memo,
+      idempotencyKey: str(body.idempotency_key, 80),
+      fp: str(body.fp, 24),
+      allowDup: body.allow_dup === true,
+      dayCapCents: Number.isInteger(body.day_cap_cents) ? body.day_cap_cents : null,
+      note: `${tile || "-"} by ${ticket.repId}${matched ? `; for ${matched}` : ""}`,
+      isGone: () => gone,
+    });
+    const b = out.body || {};
+    finish(out.status, b, {
+      tile, recipient: str(body.recipient_id, 40), payee: b.payee ? b.payee.name : null, amount_cents: body.amount_cents, memo, matched: matched || null,
+      mode: b.mode || null, txn: b.txn ? b.txn.id : null, request_id: b.request ? b.request.id : b.existing ? b.existing.id : null,
+      state: b.txn ? b.txn.status : b.request ? b.request.status : null, dup_ok: body.allow_dup === true ? true : null,
+      outcome: b.ok ? (b.mode === "direct" ? "sent" : "requested") : String(b.error || "error"),
+    });
   }
 
   async function handle(req, res, pathname) {
@@ -322,6 +451,9 @@ export function createMoneyPay(deps = {}) {
     }
     if (door === "prepare") await prepare(req, res);
     else if (door === "request") await request(req, res);
+    else if (door === "payee-hold") await payeeHold(req, res);
+    else if (door === "recipient-add") await recipientAdd(req, res);
+    else if (door === "send") await sendDoor(req, res);
     else await status(req, res);
     return true;
   }

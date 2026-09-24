@@ -30,10 +30,11 @@
 //   savings ••5926; the Richter accounts (last four 8521 and 1588) are dropped before anything is
 //   named, and a transactions read is refused for any account id that did not pass that filter.
 // No token value is ever logged, returned or put in health: name, presence and length only.
+import crypto from "node:crypto";
 import { fetchWithTimeout } from "./http.js";
 import { normalizeToken } from "./mercury.js";
 
-export const MERCURY_GATEWAY_BUILD = "2026-09-24-money-pay";
+export const MERCURY_GATEWAY_BUILD = "2026-09-24-money-ak";
 export const MERCURY_DIRECT_ROOT = "https://api.mercury.com/api/v1";
 export const TOKEN_AR = "MERCURY_TOKEN_NESHER";
 export const TOKEN_FULL = "MERCURY_TOKEN_NESHER_FULL";
@@ -169,7 +170,108 @@ export function checkPayOperation(method, pathWithQuery) {
   }
   if (m === "GET" && /^\/request-send-money\/[^/]+$/.test(p)) return UUID_RE.test(p.slice(20)) ? { ok: true } : { ok: false, status: 400, error: "bad_id" };
   if (m === "POST" && p === `/account/${PAY_CHECKING.id}/request-send-money`) return { ok: true };
+  // Mr. AK Money (Joseph, 24 Sep): add a recipient; send an ACH from Nesher checking; read one
+  // payment of Nesher checking. Each is one exact shape; the switches (MONEY_PAY_RECIPIENTS,
+  // MONEY_PAY_MODE) are checked by the functions that use them, never here.
+  if (m === "POST" && p === "/recipients") return { ok: true };
+  if (m === "POST" && p === `/account/${PAY_CHECKING.id}/transactions`) return { ok: true };
+  const tx = p.match(/^\/account\/([^/]+)\/transaction\/([^/]+)$/);
+  if (m === "GET" && tx) {
+    if (tx[1] !== PAY_CHECKING.id) return { ok: false, status: 403, error: "account_not_nesher" };
+    return UUID_RE.test(tx[2]) ? { ok: true } : { ok: false, status: 400, error: "bad_id" };
+  }
   return { ok: false, status: 405, error: "not_in_this_ship" };
+}
+
+// ── Mr. AK Money (24 Sep 2026): pay a PERSON, add a recipient, send without an approver ─────────
+// Joseph, 24 Sep, on the open item "paying individuals": he pastes a customer's bank details and
+// says "we want to refund them $630" - "would Mr money be able to do it?". Then: "it needs to be
+// able to add recipients", and "No need to wait for approvels". So, behind two switches:
+//   MONEY_PAY_RECIPIENTS=on  - a person may be a payee (the hard lines below still hold), and the
+//                              desk may ADD a recipient (ACH, US routing only). Adding moves no money.
+//   MONEY_PAY_MODE=direct    - an ACH payee is paid with POST /account/{checking}/transactions (no
+//                              approver); the desk holds it 60 s with Undo first. A wire still goes
+//                              through request-send-money (approval), as in F7. Anything else = F7.
+// A recipient's bank details are never logged, returned or kept: the desk sees a FINGERPRINT
+// (HMAC of method|routing|account under the ticket secret) so a change of bank details between the
+// tile and the tap is refused, and a change since the desk last saw it is caught.
+
+/** ABA routing-number checksum (3-7-1). Pure. */
+export function abaOk(routing) {
+  const s = String(routing || "");
+  if (!/^\d{9}$/.test(s) || /^0{9}$/.test(s)) return false;
+  const d = s.split("").map(Number);
+  return (3 * (d[0] + d[3] + d[6]) + 7 * (d[1] + d[4] + d[7]) + (d[2] + d[5] + d[8])) % 10 === 0;
+}
+export const ACH_TYPES = Object.freeze(["personalChecking", "personalSavings", "businessChecking", "businessSavings"]);
+const EMAIL_RE = /^[^\s@<>(),;:"]{1,64}@[A-Za-z0-9.-]{1,190}\.[A-Za-z]{2,24}$/;
+
+/** "yael.sher@gmail.com" -> "y***@gmail.com". For logs and the tile. Pure. */
+export function maskEmail(e) {
+  const s = String(e || "").trim();
+  const i = s.lastIndexOf("@");
+  if (i < 1) return s ? "***" : "";
+  return s[0] + "***" + s.slice(i);
+}
+
+/** The fingerprint of a recipient's bank details. "" when there are none or no key. Pure. */
+export function payeeFingerprint(r, key) {
+  if (!r || !key) return "";
+  const e = r.electronicRoutingInfo || {};
+  const w = r.domesticWireRoutingInfo || {};
+  const i = r.internationalWireRoutingInfo || {};
+  const parts = [
+    e.accountNumber ? `ach:${e.routingNumber || ""}:${String(e.accountNumber).replace(/\s+/g, "")}` : "",
+    w.accountNumber ? `wire:${w.routingNumber || ""}:${String(w.accountNumber).replace(/\s+/g, "")}` : "",
+    (i.iban || i.swiftCode) ? `intl:${i.swiftCode || ""}:${String(i.iban || "").replace(/\s+/g, "")}` : "",
+  ].filter(Boolean);
+  if (!parts.length) return "";
+  return crypto.createHmac("sha256", String(key)).update("payee-fp.v1|" + parts.join("|")).digest("hex").slice(0, 24);
+}
+
+/**
+ * What a pasted set of bank details may become, checked before anything reaches Mercury. Pure.
+ * in: {name, routing, account, type, business, emails[], address{address1,city,region,postalCode,country}}
+ * -> {ok:true, body, view} | {ok:false, error}
+ * body is the Mercury POST /recipients body (ACH only); view is what the desk may see (never the numbers).
+ */
+export function recipientDraft(input) {
+  const x = input && typeof input === "object" ? input : {};
+  const clean = (v, n) => String(v == null ? "" : v).replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim().slice(0, n);
+  const name = clean(x.name, 80);
+  if (name.length < 2 || !/\p{L}/u.test(name)) return { ok: false, error: "name_required" };
+  if (PAY_BLOCK_NAME.test(name)) return { ok: false, error: "own_or_other_org" };
+  const routing = String(x.routing || "").replace(/\D/g, "");
+  if (!abaOk(routing)) return { ok: false, error: "routing_invalid" };
+  const account = String(x.account || "").replace(/[\s-]/g, "");
+  if (!/^\d{4,17}$/.test(account)) return { ok: false, error: "account_invalid" };
+  const l4 = account.slice(-4);
+  if (NEVER_LAST4.includes(l4)) return { ok: false, error: "richter" };
+  if (OWN_LAST4.includes(l4)) return { ok: false, error: "own_account" };
+  const business = x.business === true;
+  let type = String(x.type || "");
+  if (!ACH_TYPES.includes(type)) {
+    const savings = /saving/i.test(type);
+    type = (business ? "business" : "personal") + (savings ? "Savings" : "Checking");
+  }
+  const emails = (Array.isArray(x.emails) ? x.emails : []).map((e) => clean(e, 254).toLowerCase()).filter((e) => EMAIL_RE.test(e)).slice(0, 3);
+  let address = null;
+  const a = x.address && typeof x.address === "object" ? x.address : null;
+  if (a) {
+    const ad = { address1: clean(a.address1, 120), city: clean(a.city, 60), region: clean(a.region, 40), postalCode: clean(a.postalCode, 12), country: clean(a.country || "US", 2).toUpperCase() };
+    if (ad.address1 && ad.city && ad.region && ad.postalCode && /^[A-Z]{2}$/.test(ad.country)) {
+      if (clean(a.address2, 60)) ad.address2 = clean(a.address2, 60);
+      address = ad;
+    }
+  }
+  const eri = { accountNumber: account, routingNumber: routing, electronicAccountType: type };
+  if (address) eri.address = address;
+  const body = { name, emails, electronicRoutingInfo: eri };
+  return {
+    ok: true,
+    body,
+    view: { name, method: "ach", type, last4: l4, emails: emails.map(maskEmail), address: address ? `${address.city}, ${address.region}` : "" },
+  };
 }
 
 function recipientLast4(r) {
@@ -197,7 +299,7 @@ export function payMethodOf(r) {
  * account, no other organisation, never the Richter accounts, never our own accounts.
  * @returns {{ok:true, method:string}|{ok:false, why:string}}
  */
-export function payeeVerdict(r) {
+export function payeeVerdict(r, o = {}) {
   if (!r || typeof r !== "object" || !r.id) return { ok: false, why: "unknown" };
   if (r.status && r.status !== "active") return { ok: false, why: "inactive" };
   const words = `${r.name || ""} ${r.nickname || ""}`;
@@ -206,16 +308,17 @@ export function payeeVerdict(r) {
   if (l4 && NEVER_LAST4.includes(l4)) return { ok: false, why: "richter" };
   if (l4 && OWN_LAST4.includes(l4)) return { ok: false, why: "own_account" };
   const acctType = String((r.electronicRoutingInfo && r.electronicRoutingInfo.electronicAccountType) || "");
-  if (/^personal/i.test(acctType)) return { ok: false, why: "personal" };
-  if (r.isBusiness !== true) return { ok: false, why: "personal" };
+  // A person is a payee only when MONEY_PAY_RECIPIENTS=on (Joseph 24 Sep: refunds to customers).
+  if (o.persons !== true && /^personal/i.test(acctType)) return { ok: false, why: "personal" };
+  if (o.persons !== true && r.isBusiness !== true) return { ok: false, why: "personal" };
   const method = payMethodOf(r);
   if (!method) return { ok: false, why: "no_method" };
   return { ok: true, method };
 }
 
 /** What the desk may see of a payee: name, nickname, how it is paid, bank, last four. */
-export function payeeView(r) {
-  const v = payeeVerdict(r);
+export function payeeView(r, o = {}) {
+  const v = payeeVerdict(r, o);
   const method = v.ok ? v.method : payMethodOf(r);
   const info = method === "ach" ? r.electronicRoutingInfo : method === "domesticWire" ? r.domesticWireRoutingInfo : method === "internationalWire" ? r.internationalWireRoutingInfo : null;
   const bank = info ? (info.bankName || (info.bankDetails && info.bankDetails.bankName) || "") : "";
@@ -227,6 +330,8 @@ export function payeeView(r) {
     bank: String(bank || "").slice(0, 60),
     last4: recipientLast4(r),
     lastPaid: r.dateLastPaid || null,
+    person: r.isBusiness !== true,
+    fp: payeeFingerprint(r, o.fpKey),
   };
 }
 
@@ -383,7 +488,8 @@ export function createMercuryGateway(opts = {}) {
     if (res.status === 401 || res.status === 403 || res.status >= 500) {
       st.last_error = `http_${res.status}`;
       if (st.direct !== "ok") st.direct = "error";
-      return { failed: `http_${res.status}` };
+      // Mercury's own words ride along (a scope refusal names the scope); never a token, never a body we sent.
+      return { failed: `http_${res.status}`, words: String(text || "").replace(/\s+/g, " ").slice(0, 300) };
     }
     st.direct = "ok";
     st.last_ok_at = iso(now());
@@ -699,7 +805,9 @@ export function createMercuryGateway(opts = {}) {
     const pc = payCaps();
     return {
       build: MERCURY_GATEWAY_BUILD,
-      pay: { on: pc.on, max_cents: pc.maxCents, day_cents: pc.dayCents, account_last4: PAY_CHECKING.last4, path: "request-send-money only (approval in Mercury)" },
+      pay: { on: pc.on, max_cents: pc.maxCents, day_cents: pc.dayCents, account_last4: PAY_CHECKING.last4,
+        recipients: pc.recipients, mode: pc.mode,
+        path: pc.mode === "direct" ? "ACH payees: direct send after the desk's 60 s undo; wires: request-send-money (approval in Mercury)" : "request-send-money only (approval in Mercury)" },
       direct_root: MERCURY_DIRECT_ROOT,
       tunnel_configured: Boolean(tunnelRoot()),
       tokens: t,
@@ -721,8 +829,13 @@ export function createMercuryGateway(opts = {}) {
       on: String(env.MONEY_PAY || "").trim().toLowerCase() === "on",
       maxCents: n(env.MONEY_PAY_MAX_CENTS, PAY_MAX_CENTS_DEFAULT),
       dayCents: n(env.MONEY_PAY_DAY_CENTS, PAY_DAY_CENTS_DEFAULT),
+      // Mr. AK: both default OFF; either can be taken back by one Railway variable.
+      recipients: String(env.MONEY_PAY_RECIPIENTS || "").trim().toLowerCase() === "on",
+      mode: String(env.MONEY_PAY_MODE || "").trim().toLowerCase() === "direct" ? "direct" : "approval",
     };
   }
+  function fpKey() { return String(env.OCR_TICKET_SECRET || "").trim(); }
+  function payeeOpts() { return { persons: payCaps().recipients, fpKey: fpKey() }; }
 
   /** One pay-shaped call, direct only. {status, body} or {refused} / {unknown} / {unreachable}. */
   async function payCall(use, method, path, bodyObj) {
@@ -736,7 +849,9 @@ export function createMercuryGateway(opts = {}) {
     if (!d.status && /^http_40[13]$/.test(String(d.failed || ""))) {
       // Mercury said no with authority (scope, auth): nothing was created.
       mark(use, TOKEN_FULL, "direct", Number(d.failed.slice(5)));
-      return { status: Number(d.failed.slice(5)), body: { error: tokens[TOKEN_FULL].last_error } };
+      let said = null;
+      try { said = d.words ? JSON.parse(d.words) : null; } catch { said = d.words ? { message: d.words } : null; }
+      return { status: Number(d.failed.slice(5)), body: { error: tokens[TOKEN_FULL].last_error, mercury: said } };
     }
     if (!d.status) {
       mark(use, TOKEN_FULL, "failed", null);
@@ -764,7 +879,8 @@ export function createMercuryGateway(opts = {}) {
       e.detail = r.status ? `mercury_${r.status}` : (r.unreachable || "refused");
       throw e;
     }
-    return r.body.recipients.map((x) => ({ raw: x, verdict: payeeVerdict(x), view: payeeView(x) }));
+    const po = payeeOpts();
+    return r.body.recipients.map((x) => ({ raw: x, verdict: payeeVerdict(x, po), view: payeeView(x, po) }));
   }
 
   async function payRecipient(id) {
@@ -772,8 +888,9 @@ export function createMercuryGateway(opts = {}) {
     const r = await payCall("pay/recipient", "GET", `/recipient/${id}`);
     if (r.status === 404) return { ok: false, why: "not_found" };
     if (r.status !== 200 || !r.body || !r.body.id) return { ok: false, why: "unavailable" };
-    const v = payeeVerdict(r.body);
-    return v.ok ? { ok: true, raw: r.body, method: v.method, view: payeeView(r.body) } : { ok: false, why: v.why, view: payeeView(r.body) };
+    const po = payeeOpts();
+    const v = payeeVerdict(r.body, po);
+    return v.ok ? { ok: true, raw: r.body, method: v.method, view: payeeView(r.body, po) } : { ok: false, why: v.why, view: payeeView(r.body, po) };
   }
 
   /** Nesher checking's approval requests from the last 24 hours (all states). */
@@ -863,6 +980,150 @@ export function createMercuryGateway(opts = {}) {
     return { status: 502, body: { ok: false, error: "mercury_refused", mercury_status: r.status, mercury: mercuryWords(r.body), payee: payee.view } };
   }
 
+  // ── Mr. AK Money ─────────────────────────────────────────────────────────────
+  /**
+   * ADD A RECIPIENT (moves no money). The draft is recipientDraft()'s; the numbers in it are never
+   * logged or returned. A recipient with the same bank details already in Mercury is REUSED, never
+   * duplicated - which is also what makes a retry after an unclear answer safe (Mercury's create has
+   * no idempotency key). A recipient with the same NAME and other bank details is named back so the
+   * desk can show both; it is created only when the desk says so (o.allowSameName).
+   */
+  async function addRecipient(draft, o = {}) {
+    const caps = payCaps();
+    if (!caps.on || !caps.recipients) return { status: 404, body: { ok: false, error: "recipients_off" } };
+    if (!draft || !draft.ok || !draft.body) return { status: 400, body: { ok: false, error: "draft_invalid" } };
+    const po = payeeOpts();
+    if (!po.fpKey) return { status: 503, body: { ok: false, error: "not_configured" } };
+    const fp = payeeFingerprint(draft.body, po.fpKey);
+    let all;
+    try { all = await payRecipientsAll(); } catch (e) {
+      return { status: 503, body: { ok: false, error: "recipients_unavailable" } };
+    }
+    const live = all.filter((x) => !x.raw.status || x.raw.status === "active");
+    const same = live.find((x) => x.view.fp === fp);
+    if (same) {
+      if (!same.verdict.ok) return { status: 403, body: { ok: false, error: `payee_${same.verdict.why}`, recipient: same.view } };
+      return { status: 200, body: { ok: true, reused: true, recipient: same.view } };
+    }
+    const key = (s) => String(s || "").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+    const twins = live.filter((x) => key(x.view.name) === key(draft.body.name)).map((x) => x.view).slice(0, 3);
+    if (twins.length && o.allowSameName !== true) return { status: 409, body: { ok: false, error: "same_name_other_bank", twins } };
+    if (typeof o.isGone === "function" && o.isGone()) return { status: 499, body: { ok: false, error: "client_gone_nothing_sent" } };
+    const r = await payCall("pay/recipient-add", "POST", "/recipients", draft.body);
+    if (r.refused) return { status: r.refused.status, body: { ok: false, error: r.refused.error } };
+    if (r.unknown) return { status: 503, body: { ok: false, error: "outcome_unknown" } };
+    if (r.unreachable) return { status: 503, body: { ok: false, error: "mercury_unreachable" } };
+    if (r.status === 401 || r.status === 403) {
+      // The token may not add recipients (scope). Nothing was created. This is a NEED, said as such.
+      return { status: 502, body: { ok: false, error: "token_scope_refused", mercury_status: r.status, mercury: mercuryWords(r.body && r.body.mercury) } };
+    }
+    if (r.status >= 200 && r.status < 300 && r.body && UUID_RE.test(String(r.body.id || ""))) {
+      const v = payeeVerdict(r.body, po);
+      return { status: 200, body: { ok: true, reused: false, recipient: payeeView(r.body, po), payable: v.ok, why: v.ok ? null : v.why } };
+    }
+    if (r.status >= 200 && r.status < 300) return { status: 503, body: { ok: false, error: "outcome_unknown" } };
+    return { status: 502, body: { ok: false, error: "mercury_refused", mercury_status: r.status, mercury: mercuryWords(r.body) } };
+  }
+
+  /** Outgoing money from Nesher checking in the last 24 h: every row, and the ones the desk chat sent. */
+  async function outgoingSince(sinceMs) {
+    const start = isoDate(addDays(new Date(sinceMs), -1));
+    const end = isoDate(addDays(new Date(now()), 1));
+    const rows = await accountTransactionsDirect(PAY_CHECKING.id, { start, end, limit: 500 });
+    return rows.filter((t) => t && Number(t.amount) < 0 && Date.parse(t.createdAt || "") >= sinceMs
+      && !["failed", "cancelled", "reversed"].includes(String(t.status || "")));
+  }
+
+  /** A sent payment, as the desk may see it (never an account number). */
+  function payTxnView(t) {
+    if (!t || typeof t !== "object") return null;
+    return { id: t.id, status: t.status, amount: Math.abs(Number(t.amount)), recipientId: t.counterpartyId || null, createdAt: t.createdAt || null, postedAt: t.postedAt || null, estimatedDeliveryDate: t.estimatedDeliveryDate || null, dashboardLink: t.dashboardLink || null, reasonForFailure: t.reasonForFailure || null };
+  }
+
+  /**
+   * PAY. MONEY_PAY_MODE=direct and an ACH payee -> POST /account/{checking}/transactions (no approver;
+   * Joseph 24 Sep "No need to wait for approvels"). Anything else -> requestPay (approval, F7).
+   * Checked here whatever the desk checked: the switch, Nesher checking by id AND last four, the
+   * payee's hard lines, the bank-details fingerprint the desk approved, the amount, the 24 h total of
+   * everything the chat sent, and the 24 h same-payee-same-amount rule (a warning the desk turns into
+   * a second tap: o.allowDup).
+   */
+  async function sendPay(o = {}) {
+    const caps = payCaps();
+    if (!caps.on) return { status: 404, body: { ok: false, error: "money_pay_off" } };
+    const cents = o.amountCents;
+    if (!Number.isInteger(cents) || cents < PAY_MIN_CENTS) return { status: 400, body: { ok: false, error: "amount_invalid" } };
+    if (cents > caps.maxCents) return { status: 400, body: { ok: false, error: "over_cap", cap_cents: caps.maxCents } };
+    const memo = String(o.memo || "").replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, 140);
+    if (!memo) return { status: 400, body: { ok: false, error: "memo_required" } };
+    const key = String(o.idempotencyKey || "").trim();
+    if (!/^[A-Za-z0-9._:-]{8,80}$/.test(key)) return { status: 400, body: { ok: false, error: "idempotency_key_invalid" } };
+    let accounts;
+    try { accounts = await accountsDirect(); } catch (e) {
+      return { status: 503, body: { ok: false, error: e instanceof Fallback ? "mercury_unreachable" : "checking_not_verified" } };
+    }
+    if (!accounts.some((a) => a.id === PAY_CHECKING.id && a.last4 === PAY_CHECKING.last4)) {
+      return { status: 503, body: { ok: false, error: "checking_not_verified" } };
+    }
+    const payee = await payRecipient(o.recipientId);
+    if (!payee.ok) {
+      const code = payee.why === "unavailable" ? 503 : payee.why === "not_found" || payee.why === "bad_id" ? 404 : 403;
+      return { status: code, body: { ok: false, error: `payee_${payee.why}` } };
+    }
+    // The bank details the desk showed are the bank details that get paid - or nothing moves.
+    if (!payee.view.fp || String(o.fp || "") !== payee.view.fp) return { status: 409, body: { ok: false, error: "payee_changed", payee: payee.view } };
+    if (!(caps.mode === "direct" && payee.method === "ach")) return requestPay(o);
+    const dayCap = Number.isInteger(o.dayCapCents) && o.dayCapCents > 0 ? Math.min(o.dayCapCents, caps.dayCents) : caps.dayCents;
+    const since = now() - 24 * 3600 * 1000;
+    let out, recent;
+    try { out = await outgoingSince(since); recent = await payRequestsSince(since); } catch {
+      return { status: 503, body: { ok: false, error: "requests_unavailable" } };
+    }
+    const live = recent.filter((x) => PAY_LIVE_STATES.includes(x.status));
+    if (o.allowDup !== true) {
+      const dupT = out.find((t) => t.counterpartyId === payee.raw.id && Math.round(Number(t.amount) * 100) === -cents);
+      const dupR = live.find((x) => x.recipientId === payee.raw.id && Math.round(Number(x.amount) * 100) === cents);
+      if (dupT || dupR) return { status: 409, body: { ok: false, error: "duplicate_24h", existing: dupT ? payTxnView(dupT) : payRequestView(dupR) } };
+    }
+    const chatSent = out.filter((t) => String(t.note || "").includes(NOTE_MARK)).reduce((s, t) => s + Math.round(-Number(t.amount) * 100), 0);
+    const dayUsed = chatSent + live.reduce((s, x) => s + Math.round(Number(x.amount) * 100), 0);
+    if (dayUsed + cents > dayCap) return { status: 400, body: { ok: false, error: "over_day_cap", day_cap_cents: dayCap, day_used_cents: dayUsed } };
+    const body = {
+      recipientId: payee.raw.id,
+      amount: Number((cents / 100).toFixed(2)),
+      paymentMethod: "ach",
+      idempotencyKey: key,
+      externalMemo: externalMemoOf(memo),
+      note: (memo + NOTE_MARK + String(o.note || "").replace(/[\u0000-\u001f\u007f]/g, " ").trim()).slice(0, 240),
+    };
+    if (typeof o.isGone === "function" && o.isGone()) return { status: 499, body: { ok: false, error: "client_gone_nothing_sent" } };
+    const r = await payCall("pay/send", "POST", `/account/${PAY_CHECKING.id}/transactions`, body);
+    if (r.refused) return { status: r.refused.status, body: { ok: false, error: r.refused.error } };
+    if (r.unknown) return { status: 503, body: { ok: false, error: "outcome_unknown", payee: payee.view } };
+    if (r.unreachable) return { status: 503, body: { ok: false, error: "mercury_unreachable", payee: payee.view } };
+    if (r.status === 401 || r.status === 403) return { status: 502, body: { ok: false, error: "token_scope_refused", mercury_status: r.status, mercury: mercuryWords(r.body && r.body.mercury), payee: payee.view } };
+    const b = r.body || {};
+    if (r.status >= 200 && r.status < 300) {
+      // Mercury's own approval rules may still hold an API send: that is an approval request, said so.
+      if (b.requestId || b.status === "pendingApproval") return { status: 200, body: { ok: true, mode: "approval_forced", request: payRequestView(b), payee: payee.view } };
+      if (UUID_RE.test(String(b.id || "")) && (b.status === "pending" || b.status === "sent")) return { status: 200, body: { ok: true, mode: "direct", txn: payTxnView(b), payee: payee.view } };
+      if (UUID_RE.test(String(b.id || "")) && b.status === "blocked") return { status: 200, body: { ok: true, mode: "direct", txn: payTxnView(b), payee: payee.view, blocked: true } };
+      return { status: 503, body: { ok: false, error: "outcome_unknown", payee: payee.view } };
+    }
+    return { status: 502, body: { ok: false, error: "mercury_refused", mercury_status: r.status, mercury: mercuryWords(b), payee: payee.view } };
+  }
+
+  /** One payment of Nesher checking, by id: pending / sent / failed / cancelled / reversed / blocked. */
+  async function payTxnStatus(txnId) {
+    if (!UUID_RE.test(String(txnId || ""))) return { status: 400, body: { ok: false, error: "bad_id" } };
+    const r = await payCall("pay/txn", "GET", `/account/${PAY_CHECKING.id}/transaction/${txnId}`);
+    if (r.status === 404) return { status: 404, body: { ok: false, error: "not_found" } };
+    if (r.status !== 200 || !r.body || !r.body.id) return { status: 503, body: { ok: false, error: "mercury_unreachable" } };
+    const t = payTxnView(r.body);
+    const state = t.status === "sent" ? "paid" : t.status === "pending" ? "sending" : (t.status === "failed" || t.status === "reversed" || t.status === "blocked") ? "failed" : t.status === "cancelled" ? "cancelled" : "sending";
+    return { status: 200, body: { ok: true, state, txn: t } };
+  }
+
   /** One approval request, Nesher checking only; once approved, the payment's own state. */
   async function payStatus(requestId) {
     if (!UUID_RE.test(String(requestId || ""))) return { status: 400, body: { ok: false, error: "bad_id" } };
@@ -893,5 +1154,6 @@ export function createMercuryGateway(opts = {}) {
   }
 
   return { arRequest, arFetch, hopDirect, read, listArInvoices, probe, probeStale, health, lastServed, allowedAccountIds,
-    payCaps, payRecipientsAll, payRecipient, payRequestsSince, requestPay, payStatus };
+    payCaps, payRecipientsAll, payRecipient, payRequestsSince, requestPay, payStatus,
+    addRecipient, sendPay, payTxnStatus, payeeFingerprintOf: (r) => payeeFingerprint(r, fpKey()) };
 }

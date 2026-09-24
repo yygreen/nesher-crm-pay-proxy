@@ -92,10 +92,11 @@ describe("checkPayOperation: five exact shapes, everything else 405", () => {
   });
   it("refuses direct send, transfers, recipient writes, other accounts", () => {
     for (const [m, p] of [
-      ["POST", `/account/${CHECKING_ID}/transactions`],
+      // Mr. AK (Joseph 24 Sep): POST /recipients and POST /account/<checking>/transactions are now exact
+      // allowed shapes (test/money-ak.test.js); any OTHER account's transactions stay refused.
+      ["POST", `/account/aaaaaaaa-0000-0000-0000-000000005926/transactions`],
       ["POST", "/transfer"],
       ["POST", `/account/${CHECKING_ID}/request-transfer`],
-      ["POST", "/recipients"],
       ["POST", `/recipient/${R.prima.id}`],
       ["DELETE", `/recipient/${R.prima.id}`],
       ["POST", `/account/aaaaaaaa-0000-0000-0000-000000005926/request-send-money`],
@@ -136,7 +137,7 @@ describe("payeeVerdict: the plan's hard lines (1.5)", () => {
   });
   it("the view carries name, method, bank and last four only", () => {
     const v = payeeView(R.shloimy);
-    assert.deepEqual(Object.keys(v).sort(), ["bank", "id", "last4", "lastPaid", "method", "name", "nickname"]);
+    assert.deepEqual(Object.keys(v).sort(), ["bank", "fp", "id", "last4", "lastPaid", "method", "name", "nickname", "person"]);
     assert.equal(v.last4, "3483");
     assert.ok(!JSON.stringify(v).includes("021000021"));
   });
@@ -334,7 +335,8 @@ describe("memo, payee words", () => {
     assert.equal(payDoorOf("/__nesher_pay/pay/prepare"), "prepare");
     assert.equal(payDoorOf("/__nesher_pay/pay/request/"), "request");
     assert.equal(payDoorOf("/__nesher_pay/pay/status"), "status");
-    assert.equal(payDoorOf("/__nesher_pay/pay/send"), null);
+    assert.equal(payDoorOf("/__nesher_pay/pay/send"), "send");
+    assert.equal(payDoorOf("/__nesher_pay/pay/transfer"), null);
     assert.ok(TICKET_KINDS.includes("pay") && TICKET_KINDS.includes("payprep") && TICKET_KINDS.includes("paystat"));
   });
 });
