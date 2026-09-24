@@ -34,6 +34,34 @@ const BASE_R = {
   richter: { id: "88888888-8888-4888-8888-888888888888", status: "active", isBusiness: true, name: "Trust account", defaultPaymentMethod: "ach", electronicRoutingInfo: { accountNumber: "000000008521", routingNumber: "091311229", electronicAccountType: "businessChecking" }, emails: [] },
 };
 
+// Mercury POST /recipients as documented (docs.mercury.com/reference/createrecipient): name string,
+// emails array of strings, electronicRoutingInfo {accountNumber, routingNumber, electronicAccountType in
+// the four, address {address1, city, region, postalCode, country ISO alpha-2}}; no nulls. A body that
+// breaks any of it gets the answer Joseph saw on 24 Sep.
+const ACH_ENUM = ["businessChecking", "businessSavings", "personalChecking", "personalSavings"];
+function specErrors(b) {
+  const e = [];
+  const str = (v) => typeof v === "string" && v.trim().length > 0;
+  if (!b || typeof b !== "object") return ["body"];
+  if (!str(b.name)) e.push("name");
+  if (!Array.isArray(b.emails) || !b.emails.every((x) => typeof x === "string")) e.push("emails");
+  const r = b.electronicRoutingInfo;
+  if (!r || typeof r !== "object") e.push("electronicRoutingInfo");
+  else {
+    if (!str(r.accountNumber)) e.push("accountNumber");
+    if (!str(r.routingNumber)) e.push("routingNumber");
+    if (!ACH_ENUM.includes(r.electronicAccountType)) e.push("electronicAccountType");
+    const a = r.address;
+    if (!a || typeof a !== "object") e.push("address");
+    else {
+      for (const k of ["address1", "city", "region", "postalCode"]) if (!str(a[k])) e.push("address." + k);
+      if (!/^[A-Z]{2}$/.test(String(a.country || ""))) e.push("address.country");
+    }
+  }
+  if (JSON.stringify(b).includes("null")) e.push("null");
+  return e;
+}
+
 function mercury(opt = {}) {
   const R = JSON.parse(JSON.stringify(BASE_R));
   const s = { R, calls: [], posts: [], created: [], sends: [], requests: opt.requests || [], txns: opt.txns || [], addMode: opt.addMode || "ok", sendMode: opt.sendMode || "ok" };
@@ -47,6 +75,8 @@ function mercury(opt = {}) {
     if (p === "/recipients" && m === "POST") {
       const body = JSON.parse(init.body);
       s.posts.push({ p, body });
+      const bad = specErrors(body);
+      if (bad.length) { s.rejected = (s.rejected || 0) + 1; return new Response(JSON.stringify({ errors: { jsonParse: ["Error parsing JSON; please contact help@mercury.com."], why: bad } }), { status: 400 }); }
       if (s.addMode === "scope") return new Response(JSON.stringify({ errors: { message: "Token does not have the required scope: RecipientsWrite" } }), { status: 403 });
       if (s.addMode === "down") throw new TypeError("fetch failed");
       const id = "aaaaaaaa-0000-4000-8000-" + String(100000000000 + s.created.length).slice(-12);
@@ -88,7 +118,7 @@ function gw(s, env = {}) {
   return createMercuryGateway({ env: { ...ENV_ON, ...env }, fetchImpl: s.fetch, now: () => NOW });
 }
 const fpOf = (r) => payeeFingerprint(r, SECRET);
-const yael = () => recipientDraft({ name: "Yael Sher", routing: CFSB, account: ACCT, type: "Checking", emails: ["yael.sher@example.com"] });
+const yael = () => recipientDraft({ name: "Yael Sher", routing: CFSB, account: ACCT, type: "Checking", emails: ["yael.sher@example.com"], address: { address1: "89-16 Jamaica Ave", city: "Woodhaven", region: "NY", postalCode: "11421", country: "US" } });
 
 describe("the pure rules", () => {
   it("ABA checksum", () => {
@@ -174,7 +204,7 @@ describe("addRecipient: moves no money, reuses the same bank details, says a sco
   });
   it("same name, other bank: both are named back, nothing is created without the second say", async () => {
     const s = mercury();
-    const d = recipientDraft({ name: "Levi Cohen", routing: CFSB, account: ACCT });
+    const d = recipientDraft({ name: "Levi Cohen", routing: CFSB, account: ACCT, address: { address1: "89-16 Jamaica Ave", city: "Woodhaven", region: "NY", postalCode: "11421", country: "US" } });
     const r = await gw(s).addRecipient(d);
     assert.equal(r.status, 409);
     assert.equal(r.body.error, "same_name_other_bank");
@@ -368,7 +398,7 @@ describe("the doors: hold -> add -> send, never a number in a log line or an ans
       assert.equal(payDoorOf("/__nesher_pay/pay/payee-hold"), "payee-hold");
       // 1. hold
       let t = mintTicket({ kind: "payprep", repId: "joseph", bind: "prak000001", secret: SECRET, now: NOW });
-      let r = await post(d.url, "/__nesher_pay/pay/payee-hold", t.token, { tile_id: "prak000001", rep: "joseph", details: { name: "Yael Sher", routing: CFSB, account: ACCT, type: "Checking", emails: ["yael.sher@example.com"] } });
+      let r = await post(d.url, "/__nesher_pay/pay/payee-hold", t.token, { tile_id: "prak000001", rep: "joseph", details: { name: "Yael Sher", routing: CFSB, account: ACCT, type: "Checking", emails: ["yael.sher@example.com"], address: { address1: "89-16 Jamaica Ave", city: "Woodhaven", region: "NY", postalCode: "11421", country: "US" } } });
       assert.equal(r.status, 200);
       assert.match(r.json.ref, /^ph_/);
       assert.equal(r.json.draft.last4, "8846");
@@ -422,5 +452,39 @@ describe("the doors: hold -> add -> send, never a number in a log line or an ans
     assert.equal(h.get(ref, "sruly").error, "ref_other_rep");
     t += 30 * 60 * 1000 + 1;
     assert.equal(h.get(ref, "joseph").error, "ref_expired");
+  });
+});
+
+// Mr. AL (24 Sep): Joseph's real paste (Wise USD details, account number replaced by a fake) answered
+// {"jsonParse":["Error parsing JSON; please contact help@mercury.com."]} because the body had no address.
+describe("Mr. AL: Mercury's address is required, and checked before Mercury", () => {
+  const JOSEPH = { name: "Yael Sher", routing: CFSB, account: ACCT, type: "Checking", emails: ["yael.sher@example.com"] };
+  const BANK_ADDR = { address1: "89-16 Jamaica Ave", city: "Woodhaven", region: "NY", postalCode: "11421", country: "United States" };
+  it("the fake enforces the spec: the 24 Sep body (no address) is refused with the words Joseph saw", async () => {
+    const s = mercury();
+    const r = await s.fetch("https://api.mercury.com/api/v1/recipients", { method: "POST", body: JSON.stringify({ name: "Yael Sher", emails: ["yael.sher@example.com"], electronicRoutingInfo: { accountNumber: ACCT, routingNumber: CFSB, electronicAccountType: "personalChecking" } }) });
+    assert.equal(r.status, 400);
+    assert.match(await r.text(), /jsonParse/);
+  });
+  it("no address: address_required from the draft, and Mercury is never asked", async () => {
+    assert.equal(recipientDraft(JOSEPH).error, "address_required");
+    assert.equal(recipientDraft({ ...JOSEPH, address: { address1: "89-16 Jamaica Ave", city: "Woodhaven", region: "", postalCode: "11421" } }).error, "address_required");
+    assert.equal(recipientDraft({ ...JOSEPH, address: { ...BANK_ADDR, country: "Narnia" } }).error, "address_required");
+  });
+  it("the bank's address from the paste: country words become ISO-2 and ONE recipient is made, spec-clean", async () => {
+    const d = recipientDraft({ ...JOSEPH, address: BANK_ADDR });
+    assert.equal(d.ok, true);
+    assert.deepEqual(d.body.electronicRoutingInfo.address, { address1: "89-16 Jamaica Ave", city: "Woodhaven", region: "NY", postalCode: "11421", country: "US" });
+    assert.ok(!JSON.stringify(d.body).includes("null"));
+    const s = mercury();
+    const r = await gw(s).addRecipient(d);
+    assert.equal(r.body.ok, true);
+    assert.equal(s.rejected || 0, 0);
+    assert.equal(s.created.length, 1);
+  });
+  it("the hold door answers address_required (400) and holds nothing", async () => {
+    const d = recipientDraft({ ...JOSEPH, address: null });
+    assert.equal(d.ok, false);
+    assert.equal(d.error, "address_required");
   });
 });

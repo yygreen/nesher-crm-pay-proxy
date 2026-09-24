@@ -237,6 +237,19 @@ export function payeeFingerprint(r, key) {
   return crypto.createHmac("sha256", String(key)).update("payee-fp.v1|" + parts.join("|")).digest("hex").slice(0, 24);
 }
 
+// Country words -> ISO 3166 alpha-2 (Mercury's address.country). A two-letter code passes as itself. Pure.
+const COUNTRY_ISO2 = {
+  "united states": "US", "united states of america": "US", usa: "US", "u.s.": "US", "u.s.a.": "US", america: "US",
+  israel: "IL", canada: "CA", "united kingdom": "GB", uk: "GB", "great britain": "GB", england: "GB",
+  belgium: "BE", france: "FR", germany: "DE", netherlands: "NL", switzerland: "CH", austria: "AT",
+  australia: "AU", mexico: "MX", argentina: "AR", brazil: "BR", italy: "IT", spain: "ES", hungary: "HU",
+};
+export function countryCode(c) {
+  const t = String(c == null ? "" : c).trim().toLowerCase().replace(/\s+/g, " ");
+  if (/^[a-z]{2}$/.test(t)) return t === "uk" ? "GB" : t.toUpperCase();
+  return COUNTRY_ISO2[t] || "";
+}
+
 /**
  * What a pasted set of bank details may become, checked before anything reaches Mercury. Pure.
  * in: {name, routing, account, type, business, emails[], address{address1,city,region,postalCode,country}}
@@ -263,17 +276,15 @@ export function recipientDraft(input) {
     type = (business ? "business" : "personal") + (savings ? "Savings" : "Checking");
   }
   const emails = (Array.isArray(x.emails) ? x.emails : []).map((e) => clean(e, 254).toLowerCase()).filter((e) => EMAIL_RE.test(e)).slice(0, 3);
-  let address = null;
+  // Mr. AL (24 Sep): Mercury's electronicRoutingInfo REQUIRES address {address1, city, region,
+  // postalCode, country ISO alpha-2}; without it Mercury answered {"jsonParse":[...]} to Joseph's paste.
+  // No complete address = refused HERE, before Mercury, and the tile asks the rep for one line.
   const a = x.address && typeof x.address === "object" ? x.address : null;
-  if (a) {
-    const ad = { address1: clean(a.address1, 120), city: clean(a.city, 60), region: clean(a.region, 40), postalCode: clean(a.postalCode, 12), country: clean(a.country || "US", 2).toUpperCase() };
-    if (ad.address1 && ad.city && ad.region && ad.postalCode && /^[A-Z]{2}$/.test(ad.country)) {
-      if (clean(a.address2, 60)) ad.address2 = clean(a.address2, 60);
-      address = ad;
-    }
-  }
-  const eri = { accountNumber: account, routingNumber: routing, electronicAccountType: type };
-  if (address) eri.address = address;
+  if (!a) return { ok: false, error: "address_required" };
+  const address = { address1: clean(a.address1, 120), city: clean(a.city, 60), region: clean(a.region, 40), postalCode: clean(a.postalCode, 12), country: countryCode(a.country == null || a.country === "" ? "US" : a.country) };
+  if (!address.address1 || !address.city || !address.region || !address.postalCode || !address.country) return { ok: false, error: "address_required" };
+  if (clean(a.address2, 60)) address.address2 = clean(a.address2, 60);
+  const eri = { accountNumber: account, routingNumber: routing, electronicAccountType: type, address };
   const body = { name, emails, electronicRoutingInfo: eri };
   return {
     ok: true,
