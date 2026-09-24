@@ -27,9 +27,15 @@ function mdf(block, id) {
   const m = block.match(new RegExp(`<merchant_defined_field id="${id}">([^<]*)</merchant_defined_field>`));
   return m ? decode(m[1]).trim() : "";
 }
-function nmiDate(s) {
+/** NMI query.php stamps (YYYYMMDDhhmmss) are read as UTC - the ONE place that assumption lives
+ *  (canon s.8: to be checked against one known transaction before any day/week edge is shown). */
+export function nmiDateMs(s) {
   const m = String(s || "").match(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})$/);
-  return m ? `${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}.000Z` : null;
+  return m ? Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]) : null;
+}
+function nmiDate(s) {
+  const ms = nmiDateMs(s);
+  return ms == null ? null : new Date(ms).toISOString();
 }
 function last4(cc) {
   const v = String(cc || "").replace(/[\s-]/g, "");

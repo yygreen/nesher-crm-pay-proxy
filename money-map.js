@@ -23,16 +23,25 @@
 // It cannot move money: NMI is read through query.php (the key rides in the POST body only), Mercury
 // through mercury-gateway.js read() (GET only, Nesher accounts only), the CRM inside BEGIN READ ONLY
 // that is always rolled back. It never reads or returns a card number, a customer name or an email.
-import { queryNmiRange } from "./nmi-recovery.js";
+import { queryNmiRange, nmiDateMs, NMI_PROCESSOR_BRAND } from "./nmi-recovery.js";
+import { parseInvoiceNumber } from "./payments-sync.js";
 
 export const MONEY_MAP_BUILD = "2026-09-24-money-map";
 export const MONEY_MAP_PATH = "/money-map";
 export const MONEY_MAP_TZ = "Asia/Jerusalem";
+// Ids and brands come from the ONE table (nmi-recovery.js NMI_PROCESSOR_BRAND); here only the
+// label and the bank descriptor each merchant account's deposits carry.
+const MID_BY_BRAND = Object.fromEntries(Object.entries(NMI_PROCESSOR_BRAND).map(([mid, brand]) => [brand, mid]));
 export const MERCHANT_ACCOUNTS = Object.freeze({
-  mav7067: Object.freeze({ label: "Nesher merchant account", descriptor: /FLYNESHER/i }),
-  mav2083: Object.freeze({ label: "JRM merchant account", descriptor: /JRM HOTELS/i }),
+  [MID_BY_BRAND.nesher]: Object.freeze({ label: "Nesher merchant account", descriptor: /FLYNESHER/i }),
+  [MID_BY_BRAND.jrm]: Object.freeze({ label: "JRM merchant account", descriptor: /JRM HOTELS/i }),
 });
-const PROCESSOR_BRAND = Object.freeze({ mav7067: "nesher", mav2083: "jrm" });
+/** A booking reference, by the ONE parser (payments-sync.js parseInvoiceNumber). */
+function refOf(orderId) {
+  const p = parseInvoiceNumber(orderId);
+  if (!p) return null;
+  return p.kind === "hotel" ? { brand: "jrm", key: "req:" + p.requestId, requestId: String(p.requestId), label: "JRM-1" + p.requestId } : { brand: "nesher", code: p.code };
+}
 const MAX_RANGE_DAYS = 70;           // + the matching margins stays inside Mercury's 92-day read
 const DEPOSIT_WINDOW_MS = 8 * 86400000;
 const AWAITING_MS = 5 * 86400000;    // a batch younger than this with no deposit is "awaiting", not unmatched
@@ -129,10 +138,6 @@ function mdf(block, id) {
   const m = block.match(new RegExp(`<merchant_defined_field id="${id}">([^<]*)</merchant_defined_field>`));
   return m ? decode(m[1]).trim() : "";
 }
-function nmiMs(s) {
-  const m = String(s || "").match(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})$/);
-  return m ? Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]) : null;
-}
 
 /**
  * query.php XML -> one record per transaction with its actions. Only these fields are read:
@@ -151,7 +156,7 @@ export function parseNmiTransactions(xml) {
       type: tag(a, "action_type").toLowerCase(),
       amount: Number(tag(a, "amount")) || 0,
       success: tag(a, "success") === "1",
-      at: nmiMs(tag(a, "date")),
+      at: nmiDateMs(tag(a, "date")),
       batchId: tag(a, "batch_id") && tag(a, "batch_id") !== "0" ? tag(a, "batch_id") : null,
     }));
     const hint = mdf(b, 1).toLowerCase();
@@ -211,12 +216,11 @@ export function classifyTransaction(t) {
 }
 
 export function brandOf(t, crmBrand = null) {
-  const ref = String(t.orderId || "");
-  if (/^JRM-/i.test(ref)) return { brand: "jrm", basis: "booking reference" };
-  if (/^RES-/i.test(ref)) return { brand: "nesher", basis: "booking reference" };
+  const ref = refOf(t.orderId);
+  if (ref) return { brand: ref.brand, basis: "booking reference" };
   if (t.brandHint) return { brand: t.brandHint, basis: "brand stamped at charge time" };
   if (crmBrand) return { brand: crmBrand, basis: "matched to a CRM payment row" };
-  if (PROCESSOR_BRAND[t.processorId]) return { brand: PROCESSOR_BRAND[t.processorId], basis: MERCHANT_ACCOUNTS[t.processorId].label };
+  if (NMI_PROCESSOR_BRAND[t.processorId]) return { brand: NMI_PROCESSOR_BRAND[t.processorId], basis: MERCHANT_ACCOUNTS[t.processorId].label };
   return { brand: null, basis: "unknown" };
 }
 
@@ -427,7 +431,11 @@ export async function loadCrm(pool, period, refs) {
     const requests = reqIds.length
       ? await q(`SELECT id, status FROM core_jrmhotelrequest WHERE id = ANY($1::bigint[])`, [reqIds])
       : [];
-    return { nesherInPeriod, reservations, nesherAll, jrmInPeriod, jrmAll, offers, requests };
+    // the CRM refund table (airline refunds, money back to customers) is only COUNTED per booking for now
+    const refundRows = resIds.length
+      ? await q(`SELECT reservation_id, count(*)::int AS n FROM core_refund WHERE reservation_id = ANY($1::bigint[]) GROUP BY reservation_id`, [resIds])
+      : [];
+    return { nesherInPeriod, reservations, nesherAll, jrmInPeriod, jrmAll, offers, requests, refundRows };
   } finally {
     try { await client.query("ROLLBACK"); } catch { /* nothing was written */ }
     if (client !== pool && typeof client.release === "function") client.release();
@@ -487,7 +495,7 @@ function blankBrand() {
       authorised_not_captured: { count: 0, amount: 0 },
       by_merchant_account: {}, by_card_brand: {}, by_rep: {},
     },
-    mercury_invoices: { paid: 0, count: 0, fee_measured: 0, fee_unmeasured_on: 0 },
+    mercury_invoices: { paid: 0, count: 0, fee_inferred: 0, fee_inferred_items: [], fee_unmeasured_on: 0 },
     confirmed_total: 0,
     fees: { measured: 0, measured_on: 0, effective_rate: null, awaiting_deposit_on: 0, unsettled_on: 0, unmatched_on: 0 },
     recorded_other_rails: {},
@@ -541,8 +549,8 @@ export function buildMoneyMap({ period, nowMs, nmi, bank, invoices, crm, sources
   if (crm && txns) {
     const cardRows = [
       ...crm.nesherAll.map((p) => ({ key: "n" + p.id, brand: "nesher", booking: "res:" + p.reservation_id, amount: p.amount, method: p.method, ms: Date.parse(p.paid_at), nmi: p.nmi_txn })),
-      ...crm.jrmAll.map((p) => ({ key: "j" + p.id, brand: "jrm", booking: "req:" + p.request_id, amount: p.amount, method: p.method, ms: ilMidnightMs(String(p.payment_date).slice(0, 10)), nmi: p.nmi_txn })),
-    ].filter((r) => r.method === "card" || r.nmi);
+      ...crm.jrmAll.map((p) => ({ key: "j" + p.id, brand: "jrm", booking: "req:" + p.request_id, amount: p.amount, method: p.method, ms: ilMidnightMs(String(p.payment_date).slice(0, 10)), nmi: p.nmi_txn, nonUsd: currencyOf(p.currency) !== "USD" })),
+    ].filter((r) => (r.method === "card" || r.nmi) && !r.nonUsd);
     for (const r of cardRows) if (r.nmi && byId.has(r.nmi)) { links.set(r.key, r.nmi); txnToRow.set(r.nmi, r); }
     const openSales = txns.filter((t) => t.money.kind === "sale" && !t.money.voided && !txnToRow.has(t.id) && !/^(RES|JRM)-/i.test(String(t.orderId || "")));
     // Mutual nearest: the row's closest same-amount sale must have that row as ITS closest, and
@@ -680,21 +688,24 @@ export function buildMoneyMap({ period, nowMs, nmi, bank, invoices, crm, sources
   // ---- Mercury invoices (the invoice rail) ----
   const credits = bank ? bank.filter((r) => r.group === "other_credit") : [];
   if (invoices) {
-    const usedCredit = new Set();
-    for (const inv of invoices) {
-      if (String(inv.status) !== "Paid") continue;
-      const ms = Date.parse(inv.updatedAt || "");
-      if (!inPeriod(ms)) continue;
-      const brand = /^JRM-/i.test(String(inv.invoiceNumber || "")) ? "jrm" : "nesher";
+    // A paid invoice is paired with a bank credit ONLY when that credit is its sole candidate AND it
+    // is the credit's sole candidate (90-100% of the amount, from a day before to ten days after).
+    // Anything else is left unmeasured. Even a clean pair is "inferred", not measured: a bank credit
+    // carries no invoice number.
+    const paid = invoices.filter((inv) => String(inv.status) === "Paid" && inPeriod(Date.parse(inv.updatedAt || "")))
+      .map((inv) => ({ inv, ms: Date.parse(inv.updatedAt), amt: Number(inv.amount) || 0 }));
+    const fits = (p, x) => x.createdMs >= p.ms - 86400000 && x.createdMs <= p.ms + 10 * 86400000 && x.amount <= p.amt + CENT && x.amount >= 0.9 * p.amt;
+    for (const p of paid) {
+      const brand = refOf(p.inv.invoiceNumber)?.brand === "jrm" ? "jrm" : "nesher";
       const I = out.brands[brand].mercury_invoices;
-      const amt = Number(inv.amount) || 0;
-      I.paid += amt;
+      I.paid += p.amt;
       I.count++;
-      const c = credits
-        .filter((x) => !usedCredit.has(x.id) && x.createdMs >= ms - 86400000 && x.createdMs <= ms + 10 * 86400000 && x.amount <= amt + CENT && x.amount >= 0.9 * amt)
-        .sort((a, b) => Math.abs(amt - a.amount) - Math.abs(amt - b.amount))[0];
-      if (c) { usedCredit.add(c.id); I.fee_measured += amt - c.amount; }
-      else I.fee_unmeasured_on += amt;
+      const cands = credits.filter((x) => fits(p, x));
+      const rivals = cands.length === 1 ? paid.filter((q) => fits(q, cands[0])) : [];
+      if (cands.length === 1 && rivals.length === 1) {
+        I.fee_inferred += p.amt - cands[0].amount;
+        I.fee_inferred_items.push({ invoice: p.inv.invoiceNumber || null, invoice_amount: r2(p.amt), credit_amount: r2(cands[0].amount), label: `inferred: invoice ${r2(p.amt)} less bank credit ${r2(cands[0].amount)}` });
+      } else I.fee_unmeasured_on += p.amt;
     }
     notes.push("A Mercury invoice's paid date is the time Mercury last updated it (the API gives no separate paid-at).");
   } else notes.push("Mercury invoices could not be read (" + (sources.invoices?.error || "unknown") + ").");
@@ -713,7 +724,8 @@ export function buildMoneyMap({ period, nowMs, nmi, bank, invoices, crm, sources
       }
     }
     B.mercury_invoices.paid = r2(B.mercury_invoices.paid);
-    B.mercury_invoices.fee_measured = r2(B.mercury_invoices.fee_measured);
+    B.mercury_invoices.fee_inferred = r2(B.mercury_invoices.fee_inferred);
+    B.mercury_invoices.label = "Mercury invoice fees are inferred only from a one-to-one pairing with a bank credit; anything else is fee_unmeasured_on.";
     B.mercury_invoices.fee_unmeasured_on = r2(B.mercury_invoices.fee_unmeasured_on);
     B.confirmed_total = B.card ? r2(B.card.net + B.mercury_invoices.paid) : null;
     const F = B.fees;
@@ -774,6 +786,14 @@ export function buildMoneyMap({ period, nowMs, nmi, bank, invoices, crm, sources
       add(out.brands.nesher.recorded_other_rails, p.method || "other", p.amount);
     }
     for (const p of crm.jrmInPeriod) {
+      const cur = currencyOf(p.currency);
+      if (cur !== "USD") {
+        // never mixed with dollars: its own currency key, whatever the method
+        const R = (out.brands.jrm.recorded_other_currencies ||= {});
+        const k = (cur || "currency not stated") + " " + (p.method || "other");
+        R[k] = r2((R[k] || 0) + p.amount);
+        continue;
+      }
       if (p.method === "card" || p.method === "mercury") continue;
       add(out.brands.jrm.recorded_other_rails, p.method || "other", p.amount);
     }
@@ -794,6 +814,7 @@ function buildBookings({ crm, txns, txnToRow, rateAll, inPeriod, batches, nmiFro
   const { feeOf } = feeShares(batches);
   const resById = new Map(crm.reservations.map((r) => [String(r.id), r]));
   const resByCode = new Map(crm.reservations.map((r) => [String(r.reservation_code).toUpperCase(), r]));
+  const refundCount = new Map((crm.refundRows || []).map((r) => [String(r.reservation_id), Number(r.n) || 0]));
   const bookings = new Map();
   const get = (key, brand, ref) => {
     if (!bookings.has(key)) bookings.set(key, { key, brand, ref, rows: [], sales: [], refunds: 0, inPeriod: false });
@@ -806,21 +827,26 @@ function buildBookings({ crm, txns, txnToRow, rateAll, inPeriod, batches, nmiFro
   }
   for (const p of crm.jrmAll) {
     const bk = get("req:" + p.request_id, "jrm", "JRM-1" + p.request_id);
-    bk.rows.push({ key: "j" + p.id, amount: p.amount, method: p.method, ms: ilMidnightMs(String(p.payment_date).slice(0, 10)), offer_id: p.offer_id, currency: p.currency });
+    const cur = currencyOf(p.currency);
+    if (cur !== "USD") {
+      bk.nonUsd = bk.nonUsd || [];
+      bk.nonUsd.push({ amount: p.amount, currency: cur || "currency not stated" });
+      if (inPeriod(ilMidnightMs(String(p.payment_date).slice(0, 10)))) bk.inPeriod = true;
+      continue; // never added into dollars
+    }
+    bk.rows.push({ key: "j" + p.id, amount: p.amount, method: p.method, ms: ilMidnightMs(String(p.payment_date).slice(0, 10)), offer_id: p.offer_id, currency: cur });
   }
   for (const bk of bookings.values()) if (bk.rows.some((r) => inPeriod(r.ms))) bk.inPeriod = true;
   // processor sales that carry a booking reference but have no CRM row yet are still money in
   for (const t of txns || []) {
     const m = t.money;
     if (m.kind !== "sale" || m.voided) continue;
-    const ref = String(t.orderId || "").toUpperCase();
+    const ref = refOf(t.orderId);
     let key = null;
     let brand = null;
     let label = null;
-    const res = ref.match(/^RES-([A-Z0-9_-]+)$/);
-    const jrm = ref.match(/^JRM-1([0-9]+)(?:-O[0-9]+)?$/);
-    if (res && resByCode.has(res[1])) { const r = resByCode.get(res[1]); key = "res:" + r.id; brand = "nesher"; label = r.reservation_code; }
-    else if (jrm) { key = "req:" + jrm[1]; brand = "jrm"; label = "JRM-1" + jrm[1]; }
+    if (ref && ref.brand === "nesher" && resByCode.has(ref.code)) { const r = resByCode.get(ref.code); key = "res:" + r.id; brand = "nesher"; label = r.reservation_code; }
+    else if (ref && ref.brand === "jrm") { key = ref.key; brand = "jrm"; label = ref.label; }
     const row = txnToRow.get(t.id);
     if (row) key = row.booking;
     if (!key) continue;
@@ -873,16 +899,22 @@ function buildBookings({ crm, txns, txnToRow, rateAll, inPeriod, batches, nmiFro
       price = off ? r2(off.customer_price) : null;
     }
     const flags = [];
+    const crmRefunds = bk.brand === "nesher" ? (refundCount.get(bk.key.slice(4)) || 0) : 0;
+    if (crmRefunds) flags.push("the CRM refund table has " + crmRefunds + " record(s) on this booking - not in this contribution");
     if (price != null && received > price + 1) flags.push("received more than the booking price");
     if (cost.status === "known" && price != null && same(cost.amount, price)) flags.push("cost equals price in the CRM");
     let contribution;
-    if (cost.status !== "known") contribution = { amount: null, label: "cost unknown - " + cost.basis };
+    if (bk.nonUsd && bk.nonUsd.length) {
+      const said = bk.nonUsd.map((x) => `${r2(x.amount)} ${x.currency === "ILS" ? "ILS" : "(" + x.currency + ")"}`).join(", ");
+      flags.push("payment recorded in another currency");
+      contribution = { amount: null, label: `a payment on this booking is recorded in shekels or an unstated currency (${said}); no dollar rate on file` };
+    } else if (cost.status !== "known") contribution = { amount: null, label: "cost unknown - " + cost.basis };
     else if (estimatedOn > 0 && estimated == null) contribution = { amount: null, label: "card fee unknown: no batch fee measured yet to estimate from" };
     else {
       const amount = received - cost.amount - measured - (estimated || 0) - refunds;
       const paidInFull = price != null && received >= price - 0.01;
       const overpaid = price != null && received > price + 1;
-      const final = paidInFull && !overpaid;
+      const final = paidInFull && !overpaid && !crmRefunds;
       contribution = {
         amount: r2(amount),
         estimate: estimatedOn > 0,
@@ -994,11 +1026,9 @@ export function createMoneyMap(opts = {}) {
     if (!pool) return { data: null, meta: { ok: false, error: "not_configured" } };
     const refs = { res: [], jrm: [] };
     for (const t of nmi || []) {
-      const ref = String(t.orderId || "").toUpperCase();
-      const a = ref.match(/^RES-([A-Z0-9_-]+)$/);
-      const b = ref.match(/^JRM-1([0-9]+)(?:-O[0-9]+)?$/);
-      if (a) refs.res.push(a[1]);
-      if (b) refs.jrm.push(b[1]);
+      const ref = refOf(t.orderId);
+      if (ref && ref.brand === "nesher") refs.res.push(ref.code);
+      if (ref && ref.brand === "jrm") refs.jrm.push(ref.requestId);
     }
     try {
       const data = await loadCrm(pool, period, refs);

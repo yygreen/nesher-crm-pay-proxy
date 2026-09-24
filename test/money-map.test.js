@@ -392,6 +392,83 @@ describe("contribution per booking (plan 16.4.1: missing costs never become zero
   });
 });
 
+// ── Gabbai 24 Sep conditions 1-3 ─────────────────────────────────────────────
+describe("condition 1: a JRM payment recorded in shekels is never added into dollars", () => {
+  const jrmRows = [
+    { id: 20, amount: 1000, currency: "USD", method: "card", payment_date: "2026-09-10", offer_id: null, request_id: 400, nmi_txn: null },
+    { id: 21, amount: 3500, currency: "ILS", method: "card", payment_date: "2026-09-11", offer_id: null, request_id: 400, nmi_txn: null },
+    { id: 22, amount: 800, currency: "NIS", method: "bank", payment_date: "2026-09-12", offer_id: null, request_id: 400, nmi_txn: null },
+  ];
+  const crm = () => ({ ...emptyCrm(), jrmInPeriod: jrmRows, jrmAll: jrmRows,
+    offers: [{ id: 9, request_id: 400, currency: "USD", hotel_price: 700, markup: null, customer_price: 1000, customer_answer_status: "wants_to_book" }] });
+  it("(a) stays out of received, (b) makes contribution null with the shekel amount said, (c) has its own currency key", () => {
+    const m = map({ nmi: xml(), bankList: [], crm: crm() });
+    const b = m.bookings.items.find((i) => i.ref === "JRM-1400");
+    assert.equal(b.received_to_date, 1000);
+    assert.equal(b.received_in_period, 1000);
+    assert.equal(b.contribution.amount, null);
+    assert.match(b.contribution.label, /recorded in shekels/);
+    assert.match(b.contribution.label, /3500 ILS/);
+    assert.ok(b.flags.includes("payment recorded in another currency"));
+    assert.deepEqual(m.brands.jrm.recorded_other_rails, {});
+    assert.deepEqual(m.brands.jrm.recorded_other_currencies, { "ILS card": 3500, "ILS bank": 800 });
+  });
+  it("(d) a shekel card row is never linked to a dollar processor sale of the same number", () => {
+    const m = map({ nmi: xml(sale("SH1", 3500, "20260911100000")), bankList: [], crm: crm() });
+    const b = m.bookings.items.find((i) => i.ref === "JRM-1400");
+    assert.equal(b.processor_sales_not_in_crm, 0);
+    // the 3500 dollar sale stays a Nesher-account sale with no CRM link; it did not become JRM by a shekel row
+    assert.equal(m.brands.nesher.card.gross_sales, 3500);
+    assert.equal(m.brands.jrm.card.gross_sales, 0);
+  });
+});
+
+describe("condition 2: a Mercury invoice fee is inferred only from a one-to-one pairing", () => {
+  const inv = (n, amount) => ({ id: n, invoiceNumber: n, status: "Paid", amount, updatedAt: "2026-09-10T10:00:00Z" });
+  const credit = (id, amount, at = "2026-09-11T10:00:00Z") => bank(id, amount, at, "INCOMING WIRE", "Someone Ltd");
+  it("one invoice, one credit in the band: inferred, and said to be inferred", () => {
+    const m = map({ nmi: xml(), bankList: [credit("c1", 970)], invoices: [inv("RES-AAA111", 1000)] });
+    const I = m.brands.nesher.mercury_invoices;
+    assert.equal(I.fee_inferred, 30);
+    assert.match(I.fee_inferred_items[0].label, /^inferred: invoice 1000 less bank credit 970/);
+    assert.equal(I.fee_unmeasured_on, 0);
+    assert.equal(I.fee_measured, undefined);
+  });
+  it("two rival credits for one invoice: nothing inferred", () => {
+    const m = map({ nmi: xml(), bankList: [credit("c1", 970), credit("c2", 960)], invoices: [inv("RES-AAA111", 1000)] });
+    assert.equal(m.brands.nesher.mercury_invoices.fee_inferred, 0);
+    assert.equal(m.brands.nesher.mercury_invoices.fee_unmeasured_on, 1000);
+  });
+  it("an unrelated wire in the 90-100% band that also fits another paid invoice: nothing inferred for either", () => {
+    const m = map({ nmi: xml(), bankList: [credit("w1", 950)], invoices: [inv("RES-AAA111", 1000), inv("JRM-1500", 990)] });
+    assert.equal(m.brands.nesher.mercury_invoices.fee_inferred, 0);
+    assert.equal(m.brands.jrm.mercury_invoices.fee_inferred, 0);
+    assert.equal(m.brands.nesher.mercury_invoices.fee_unmeasured_on, 1000);
+    assert.equal(m.brands.jrm.mercury_invoices.fee_unmeasured_on, 990);
+    assert.equal(m.brands.jrm.mercury_invoices.paid, 990);
+  });
+});
+
+describe("condition 3: one copy of each rule", () => {
+  it("money-map takes the processor table, the NMI date rule and the reference parser from their homes", () => {
+    const mod = fs.readFileSync(new URL("../money-map.js", import.meta.url), "utf8");
+    assert.match(mod, /import \{ queryNmiRange, nmiDateMs, NMI_PROCESSOR_BRAND \} from "\.\/nmi-recovery\.js"/);
+    assert.match(mod, /import \{ parseInvoiceNumber \} from "\.\/payments-sync\.js"/);
+    assert.doesNotMatch(mod, /mav7067: "nesher"|Date\.UTC\(\+m\[1\]|\^JRM-1\(|\^RES-\(/);
+  });
+});
+
+describe("the CRM refund table is counted, not ignored", () => {
+  it("a booking with a CRM refund record is flagged and not final", () => {
+    const rows = [{ id: 1, amount: 1000, method: "bank", paid_at: "2026-09-10T21:00:00Z", reservation_id: 3, nmi_txn: null }];
+    const crm = { ...emptyCrm(), nesherInPeriod: rows, nesherAll: rows, refundRows: [{ reservation_id: 3, n: 1 }],
+      reservations: [{ id: 3, reservation_code: "RFD001", customer_price: 1000, supplier_cost: 900, booked_with_points: false }] };
+    const b = map({ nmi: xml(), bankList: [], crm }).bookings.items[0];
+    assert.ok(b.flags.some((x) => /CRM refund table has 1 record/.test(x)));
+    assert.equal(b.contribution.final, false);
+  });
+});
+
 // ── the CRM is read inside a read-only transaction ────────────────────────────
 describe("CRM access is read-only and names no one", () => {
   it("opens BEGIN READ ONLY, only SELECTs, always rolls back, and never selects a name", async () => {
