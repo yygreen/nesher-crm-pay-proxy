@@ -252,6 +252,44 @@ function memoKey(s) {
   return String(s || "").trim().replace(/\s+/g, " ").toLowerCase();
 }
 
+/** The internal note BEGINS with the rep's memo, then this marker (Gabbai 24 Sep C4). */
+export const NOTE_MARK = " · desk chat ";
+
+/**
+ * What goes to the supplier's bank (Mercury externalMemo). Rule 23: an Air Today payment never
+ * carries a JRM mark - "JRM Hotels", JRM-... references and the word JRM are taken out; nothing
+ * left = "Supplier payment". The full memo stays in the note, the tile and the log.
+ */
+export function externalMemoOf(memo) {
+  const out = String(memo || "")
+    .replace(/\bJRM[-\s]?Hotels?\b/gi, " ")
+    .replace(/\bJRM-[A-Z0-9-]+/gi, " ")
+    .replace(/\bJRM\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .replace(/^[\s,;:.\-–]+|[\s,;:\-–]+$/g, "")
+    .trim();
+  return out || "Supplier payment";
+}
+
+/** The rep's memo out of an echoed memo (the part before the desk-chat marker). */
+export function memoBase(echo) {
+  const s = String(echo || "");
+  const i = s.indexOf(NOTE_MARK);
+  return i >= 0 ? s.slice(0, i) : s;
+}
+
+/**
+ * Does the memo Mercury echoes on a request belong to the rep's memo? Mercury's docs do not say
+ * whether `memo` echoes externalMemo or the note, so both are accepted: equal to the memo, equal to
+ * its external form, or the note that begins with the memo and the desk-chat marker.
+ */
+export function memoMatches(echo, memo) {
+  const m = memoKey(memo);
+  if (!m || !String(echo || "").trim()) return false;
+  const e = memoKey(echo);
+  return e === m || e === memoKey(externalMemoOf(memo)) || memoKey(memoBase(echo)) === m;
+}
+
 class Fallback extends Error {
   constructor(reason) { super(reason); this.reason = reason; }
 }
@@ -794,7 +832,7 @@ export function createMercuryGateway(opts = {}) {
       return { status: 503, body: { ok: false, error: "requests_unavailable" } };
     }
     const live = recent.filter((x) => PAY_LIVE_STATES.includes(x.status));
-    const dup = live.find((x) => x.recipientId === payee.raw.id && Math.round(Number(x.amount) * 100) === cents && memoKey(x.memo) === memoKey(memo));
+    const dup = live.find((x) => x.recipientId === payee.raw.id && Math.round(Number(x.amount) * 100) === cents && memoMatches(x.memo, memo));
     if (dup) return { status: 409, body: { ok: false, error: "duplicate_24h", existing: payRequestView(dup) } };
     const dayUsed = live.reduce((s, x) => s + Math.round(Number(x.amount) * 100), 0);
     if (dayUsed + cents > caps.dayCents) return { status: 400, body: { ok: false, error: "over_day_cap", day_cap_cents: caps.dayCents, day_used_cents: dayUsed } };
@@ -803,12 +841,16 @@ export function createMercuryGateway(opts = {}) {
       amount: Number((cents / 100).toFixed(2)),
       paymentMethod: payee.method,
       idempotencyKey: key,
-      externalMemo: memo,
-      note: String(o.note || "").replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, 240),
+      externalMemo: externalMemoOf(memo),
+      // The note BEGINS with the memo, so whichever of the two Mercury echoes as `memo`, the 24 h rule
+      // and the paid-read still find it; the rest names the tile and the rep.
+      note: (memo + NOTE_MARK + String(o.note || "").replace(/[\u0000-\u001f\u007f]/g, " ").trim()).slice(0, 240),
     };
     if (payee.method === "domesticWire" || payee.method === "internationalWire") {
       body.purpose = { simple: { category: "vendor", additionalInfo: String(payee.raw.name || "supplier").slice(0, 100) } };
     }
+    // The desk gave up waiting (its request closed): stop here, before anything reaches Mercury (C3).
+    if (typeof o.isGone === "function" && o.isGone()) return { status: 499, body: { ok: false, error: "client_gone_nothing_sent" } };
     const r = await payCall("pay/request", "POST", `/account/${PAY_CHECKING.id}/request-send-money`, body);
     if (r.refused) return { status: r.refused.status, body: { ok: false, error: r.refused.error } };
     if (r.unknown) return { status: 503, body: { ok: false, error: "outcome_unknown", payee: payee.view } };
@@ -836,7 +878,7 @@ export function createMercuryGateway(opts = {}) {
         const end = isoDate(addDays(new Date(now()), 1));
         const rows = await accountTransactionsDirect(PAY_CHECKING.id, { start, end, limit: 500 });
         const cents = Math.round(q.amount * 100);
-        const hit = rows.find((t) => Math.round(Number(t.amount) * 100) === -cents && (memoKey(t.externalMemo) === memoKey(q.memo) || !q.memo));
+        const hit = rows.find((t) => Math.round(Number(t.amount) * 100) === -cents && (!q.memo || memoMatches(t.externalMemo, memoBase(q.memo)) || memoKey(t.externalMemo) === memoKey(q.memo)));
         if (hit) {
           txn = { id: hit.id, status: hit.status, postedAt: hit.postedAt || null, dashboardLink: hit.dashboardLink || null };
           if (hit.status === "sent") state = "paid";

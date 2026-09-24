@@ -12,6 +12,9 @@ import {
   payeeView,
   TOKEN_FULL,
   PAY_CHECKING,
+  externalMemoOf,
+  memoMatches,
+  NOTE_MARK,
 } from "../mercury-gateway.js";
 import { createMoneyPay, memoRefs, pickPayee, payeeScore, payDoorOf } from "../money-pay.js";
 import { mintTicket, TICKET_KINDS } from "../ocr-card.js";
@@ -41,7 +44,7 @@ function accounts(last4 = "5649") {
 
 /** Mercury fake for the pay path. Records every call; `requests` is the approval list. */
 function mercury(opt = {}) {
-  const s = { calls: [], posts: [], requests: opt.requests || [], txns: opt.txns || [], last4: opt.last4 || "5649", postMode: opt.postMode || "ok" };
+  const s = { calls: [], posts: [], requests: opt.requests || [], txns: opt.txns || [], last4: opt.last4 || "5649", postMode: opt.postMode || "ok", echo: opt.echo || "external" };
   s.fetch = async (url, init = {}) => {
     const u = new URL(String(url));
     const m = init.method || "GET";
@@ -66,7 +69,7 @@ function mercury(opt = {}) {
       s.posts.push(body);
       if (s.postMode === "down") throw new TypeError("fetch failed");
       if (s.postMode === "dup") return new Response(JSON.stringify({ errors: { message: "Duplicate transaction" } }), { status: 400 });
-      const q = { accountId: CHECKING_ID, requestId: "abcdef01-2345-4678-9abc-def012345678", recipientId: body.recipientId, memo: body.externalMemo, paymentMethod: body.paymentMethod, amount: body.amount, status: "pendingApproval", requestedByUserId: "u-1", numberOfApproversRequired: 1, requesterMayApprove: false, reviews: [], createdAt: new Date(NOW).toISOString() };
+      const q = { accountId: CHECKING_ID, requestId: "abcdef01-2345-4678-9abc-def012345678", recipientId: body.recipientId, memo: s.echo === "note" ? body.note : body.externalMemo, paymentMethod: body.paymentMethod, amount: body.amount, status: "pendingApproval", requestedByUserId: "u-1", numberOfApproversRequired: 1, requesterMayApprove: false, reviews: [], createdAt: new Date(NOW).toISOString() };
       s.requests.push(q);
       return new Response(JSON.stringify(q), { status: 200 });
     }
@@ -248,6 +251,53 @@ describe("payStatus: read from Mercury, Nesher checking only", () => {
     const s = mercury({ requests: [{ accountId: "bbbbbbbb-0000-0000-0000-000000008521", requestId: id, recipientId: R.shloimy.id, amount: 1, status: "pendingApproval", reviews: [], createdAt: new Date(NOW).toISOString() }] });
     const r = await gw(s).payStatus(id);
     assert.equal(r.status, 403);
+  });
+});
+
+describe("Gabbai 24 Sep C3/C4/C5: gone desk, either memo echo, no JRM mark at the bank", () => {
+  const base = { recipientId: R.shloimy.id, amountCents: 320000, memo: "PNR ABC123", idempotencyKey: "nesher-desk-mp0000001", note: "mp0000001 by joseph" };
+  it("the external memo carries no JRM mark; the note begins with the full memo", async () => {
+    assert.equal(externalMemoOf("JRM-11038-O2 prima deposit"), "prima deposit");
+    assert.equal(externalMemoOf("JRM Hotels deposit for Cohen"), "deposit for Cohen");
+    assert.equal(externalMemoOf("JRM-11038-O2"), "Supplier payment");
+    assert.equal(externalMemoOf("jrm"), "Supplier payment");
+    assert.equal(externalMemoOf("PNR ABC123"), "PNR ABC123");
+    const s = mercury();
+    await gw(s).requestPay({ ...base, memo: "JRM-11038-O2 prima deposit" });
+    assert.equal(s.posts[0].externalMemo, "prima deposit");
+    assert.ok(!/jrm/i.test(s.posts[0].externalMemo));
+    assert.ok(s.posts[0].note.startsWith("JRM-11038-O2 prima deposit" + NOTE_MARK));
+  });
+  it("a desk that stopped waiting gets nothing POSTed", async () => {
+    const s = mercury();
+    const r = await gw(s).requestPay({ ...base, isGone: () => true });
+    assert.equal(r.body.error, "client_gone_nothing_sent");
+    assert.equal(s.posts.length, 0);
+  });
+  for (const echo of ["external", "note"]) {
+    it(`Mercury echoes the ${echo === "note" ? "note" : "externalMemo"} as memo: duplicate, day cap and paid still hold`, async () => {
+      const s = mercury({ echo });
+      const g = gw(s, { MONEY_PAY_DAY_CENTS: "400000" });
+      let r = await g.requestPay(base);
+      assert.equal(r.status, 200);
+      r = await g.requestPay({ ...base, idempotencyKey: "nesher-desk-mp0000002" });
+      assert.equal(r.status, 409, "duplicate within 24 h");
+      assert.equal(s.posts.length, 1);
+      r = await g.requestPay({ ...base, memo: "PNR XYZ999", amountCents: 100000, idempotencyKey: "nesher-desk-mp0000003" });
+      assert.equal(r.body.error, "over_day_cap");
+      const id = s.requests[0].requestId;
+      s.requests[0].status = "approved";
+      s.txns = [{ id: "t1", amount: -3200, status: "sent", externalMemo: "PNR ABC123" }];
+      const st = await g.payStatus(id);
+      assert.equal(st.body.state, "paid");
+    });
+  }
+  it("memoMatches reads both shapes and nothing looser", () => {
+    assert.equal(memoMatches("PNR ABC123", "pnr  abc123"), true);
+    assert.equal(memoMatches("PNR ABC123" + NOTE_MARK + "mp1 by joseph", "PNR ABC123"), true);
+    assert.equal(memoMatches("prima deposit", "JRM-11038-O2 prima deposit"), true);
+    assert.equal(memoMatches("PNR ABC1234", "PNR ABC123"), false);
+    assert.equal(memoMatches("", "PNR ABC123"), false);
   });
 });
 

@@ -277,12 +277,17 @@ export function createMoneyPay(deps = {}) {
     const tile = str(body.tile_id, 24);
     const memo = str(body.memo, 140);
     const matched = str(body.matched, 120);
+    // The desk's own request closing before we answer = it stopped waiting: never POST after that.
+    let gone = false;
+    res.on("close", () => { if (!res.writableFinished) gone = true; });
     const out = await gateway.requestPay({
       recipientId: str(body.recipient_id, 40),
       amountCents: body.amount_cents,
       memo,
       idempotencyKey: str(body.idempotency_key, 80),
-      note: `Desk chat ${tile || "-"} by ${ticket.repId}${matched ? `; for ${matched}` : ""}`,
+      // The gateway puts the memo FIRST, then NOTE_MARK, then this.
+      note: `${tile || "-"} by ${ticket.repId}${matched ? `; for ${matched}` : ""}`,
+      isGone: () => gone,
     });
     const b = out.body || {};
     finish(out.status, b, {
