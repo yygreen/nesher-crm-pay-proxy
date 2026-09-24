@@ -488,3 +488,45 @@ describe("Mr. AL: Mercury's address is required, and checked before Mercury", ()
     assert.equal(d.error, "address_required");
   });
 });
+
+// Mr. AO Money (24 Sep 2026): the reps' notes on a payment tile ride in Mercury's INTERNAL note (never
+// the external memo the supplier's bank sees), masked again here; Mercury's `reversed` reads `returned`.
+describe("Mr. AO: tile notes and a returned payment", () => {
+  it("deskNote: no notes = the old note exactly; notes are appended, digits cut to the last four", async () => {
+    const { deskNote } = await import("../money-pay.js");
+    assert.equal(deskNote("mp0000001", "joseph", "", ""), "mp0000001 by joseph");
+    assert.equal(deskNote("mp0000001", "joseph", "reservation RES-1", undefined), "mp0000001 by joseph; for reservation RES-1");
+    const n = deskNote("mp0000001", "joseph", "", "Joseph: refund Sukkos 79RHW4, acct 8310006088846");
+    assert.equal(n, "mp0000001 by joseph; notes: Joseph: refund Sukkos 79RHW4, acct ••8846");
+    assert.ok(!n.includes(ACCT));
+    assert.ok(deskNote("mp1", "joseph", "", "x".repeat(500)).length <= "mp1 by joseph; notes: ".length + 160);
+  });
+  it("the send door puts the notes in Mercury's note and nowhere in the external memo", async () => {
+    const s = mercury();
+    const d = await startDoor(createMoneyPay({ gateway: gw(s), secret: SECRET, clock: () => NOW, log: () => {} }));
+    try {
+      const fp = fpOf(BASE_R.cohen);
+      const bind = `send|${BASE_R.cohen.id}|63000|nesher-desk-mpao000001|${fp}|0`;
+      const t = mintTicket({ kind: "pay", repId: "joseph", bind, secret: SECRET, now: NOW });
+      const r = await post(d.url, "/__nesher_pay/pay/send", t.token, { tile_id: "mpao000001", recipient_id: BASE_R.cohen.id, amount_cents: 63000, memo: "Refund", idempotency_key: "nesher-desk-mpao000001", fp, rep: "joseph", day_cap_cents: 2500000, rep_note: "Joseph: cancelled Sukkos trip 79RHW4" });
+      assert.equal(r.status, 200);
+      assert.equal(s.sends.length, 1);
+      assert.ok(s.sends[0].note.includes(NOTE_MARK));
+      assert.ok(s.sends[0].note.includes("notes: Joseph: cancelled Sukkos trip 79RHW4"));
+      assert.ok(!String(s.sends[0].externalMemo || "").includes("Sukkos"), "the supplier's bank never sees a note");
+      assert.equal(s.sends[0].paymentDescriptor, undefined);
+      assert.equal(s.sends[0].payment_descriptor, undefined);
+    } finally { await d.close(); }
+  });
+  it("payTxnStatus: reversed -> returned, failed stays failed", async () => {
+    const s = mercury();
+    const g = gw(s);
+    const r = await g.sendPay({ recipientId: BASE_R.cohen.id, amountCents: 63000, memo: "Refund RES-8P4R3T", idempotencyKey: "nesher-desk-mpao000002", fp: fpOf(BASE_R.cohen), note: "mpao000002 by joseph" });
+    s.txns[0].status = "reversed";
+    let st = await g.payTxnStatus(r.body.txn.id);
+    assert.equal(st.body.state, "returned");
+    s.txns[0].status = "failed";
+    st = await g.payTxnStatus(r.body.txn.id);
+    assert.equal(st.body.state, "failed");
+  });
+});

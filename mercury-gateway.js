@@ -1141,7 +1141,8 @@ export function createMercuryGateway(opts = {}) {
     if (r.status === 404) return { status: 404, body: { ok: false, error: "not_found" } };
     if (r.status !== 200 || !r.body || !r.body.id) return { status: 503, body: { ok: false, error: "mercury_unreachable" } };
     const t = payTxnView(r.body);
-    const state = t.status === "sent" ? "paid" : t.status === "pending" ? "sending" : (t.status === "failed" || t.status === "reversed" || t.status === "blocked") ? "failed" : t.status === "cancelled" ? "cancelled" : "sending";
+    // Mr. AO: `reversed` = the receiving bank sent it back - said as returned, never lumped with failed.
+    const state = t.status === "sent" ? "paid" : t.status === "pending" ? "sending" : t.status === "reversed" ? "returned" : (t.status === "failed" || t.status === "blocked") ? "failed" : t.status === "cancelled" ? "cancelled" : "sending";
     return { status: 200, body: { ok: true, state, txn: t } };
   }
 
@@ -1166,7 +1167,8 @@ export function createMercuryGateway(opts = {}) {
         if (hit) {
           txn = { id: hit.id, status: hit.status, postedAt: hit.postedAt || null, dashboardLink: hit.dashboardLink || null };
           if (hit.status === "sent") state = "paid";
-          else if (hit.status === "failed" || hit.status === "cancelled" || hit.status === "reversed") state = "failed";
+          else if (hit.status === "reversed") state = "returned";
+          else if (hit.status === "failed" || hit.status === "cancelled") state = "failed";
           else state = "sending";
         }
       } catch { /* the approval stands; the payment's own state is read next time */ }

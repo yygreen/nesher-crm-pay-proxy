@@ -28,7 +28,7 @@
  */
 
 import crypto from "node:crypto";
-import { recipientDraft } from "./mercury-gateway.js";
+import { recipientDraft, scrubDigits } from "./mercury-gateway.js";
 import {
   bindHashOf,
   consumeTicket,
@@ -38,6 +38,18 @@ import {
   ticketFromHeaders,
   verifyTicket,
 } from "./ocr-card.js";
+
+/**
+ * Mercury's INTERNAL note for a desk payment: the tile, who, the CRM match, and (Mr. AO, 24 Sep) the
+ * notes the reps wrote on the tile before it went. Never the external memo, never a descriptor - the
+ * supplier's bank sees none of it. The desk masks the notes; any 5+ digit run is cut to its last four
+ * here again, and the gateway cuts the whole note at 240.
+ */
+const CTRL_RE = new RegExp("[" + String.fromCharCode(0) + "-" + String.fromCharCode(31) + String.fromCharCode(127) + "]", "g");
+export function deskNote(tile, repId, matched, repNote) {
+  const extra = scrubDigits(String(repNote == null ? "" : repNote).replace(CTRL_RE, " ").split(" ").filter(Boolean).join(" ")).slice(0, 160);
+  return `${tile || "-"} by ${repId}${matched ? `; for ${matched}` : ""}${extra ? `; notes: ${extra}` : ""}`;
+}
 
 export const PAY_PREFIX = "/__nesher_pay/pay/";
 export const PAY_BODY_MAX = 16 * 1024;
@@ -326,7 +338,7 @@ export function createMoneyPay(deps = {}) {
       memo,
       idempotencyKey: str(body.idempotency_key, 80),
       // The gateway puts the memo FIRST, then NOTE_MARK, then this.
-      note: `${tile || "-"} by ${ticket.repId}${matched ? `; for ${matched}` : ""}`,
+      note: deskNote(tile, ticket.repId, matched, body.rep_note),
       isGone: () => gone,
     });
     const b = out.body || {};
@@ -429,7 +441,7 @@ export function createMoneyPay(deps = {}) {
       fp: str(body.fp, 24),
       allowDup: body.allow_dup === true,
       dayCapCents: Number.isInteger(body.day_cap_cents) ? body.day_cap_cents : null,
-      note: `${tile || "-"} by ${ticket.repId}${matched ? `; for ${matched}` : ""}`,
+      note: deskNote(tile, ticket.repId, matched, body.rep_note),
       isGone: () => gone,
     });
     const b = out.body || {};
