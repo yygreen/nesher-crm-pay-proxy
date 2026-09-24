@@ -778,7 +778,9 @@ async function reversalDoor(kind, req, res, deps) {
   if (out.outcomeUnknown) {
     if (arming) armings.set(arming, { at: clock(), state: "unknown" });
     _resetSaleCache();
-    return finish(503, { ok: false, error: "outcome_unknown", decline_reason_human: UNKNOWN_WORDS[kind], txn_id: txnId, amount_cents: amountCents }, { outcome: `${kind}_outcome_unknown`, amount_cents: amountCents, txn: txnId });
+    // What had already gone back BEFORE this call (Gabbai 24 Sep round 2, condition 1): the desk's
+    // read-back counts a refund as landed only above this figure and only after the arming.
+    return finish(503, { ok: false, error: "outcome_unknown", decline_reason_human: UNKNOWN_WORDS[kind], txn_id: txnId, amount_cents: amountCents, refunded_cents_before: sale.refunded_cents }, { outcome: `${kind}_outcome_unknown`, amount_cents: amountCents, txn: txnId });
   }
   if (!out.ok) {
     release();
