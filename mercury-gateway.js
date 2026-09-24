@@ -858,6 +858,8 @@ export function createMercuryGateway(opts = {}) {
     if (r.status >= 200 && r.status < 300 && r.body && r.body.requestId) {
       return { status: 200, body: { ok: true, request: payRequestView(r.body), payee: payee.view } };
     }
+    // A 2xx without a request id most likely DID create the request: never "refused" (Gabbai r2 C1).
+    if (r.status >= 200 && r.status < 300) return { status: 503, body: { ok: false, error: "outcome_unknown", payee: payee.view } };
     return { status: 502, body: { ok: false, error: "mercury_refused", mercury_status: r.status, mercury: mercuryWords(r.body), payee: payee.view } };
   }
 

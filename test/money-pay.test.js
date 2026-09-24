@@ -268,6 +268,17 @@ describe("Gabbai 24 Sep C3/C4/C5: gone desk, either memo echo, no JRM mark at th
     assert.ok(!/jrm/i.test(s.posts[0].externalMemo));
     assert.ok(s.posts[0].note.startsWith("JRM-11038-O2 prima deposit" + NOTE_MARK));
   });
+  it("a Mercury 2xx without a request id is outcome_unknown, never refused", async () => {
+    const s = mercury();
+    const inner = s.fetch;
+    s.fetch = async (url, init = {}) => {
+      if ((init.method || "GET") === "POST") { s.posts.push(JSON.parse(init.body)); return new Response("{}", { status: 200 }); }
+      return inner(url, init);
+    };
+    const r = await gw(s).requestPay(base);
+    assert.equal(r.status, 503);
+    assert.equal(r.body.error, "outcome_unknown");
+  });
   it("a desk that stopped waiting gets nothing POSTed", async () => {
     const s = mercury();
     const r = await gw(s).requestPay({ ...base, isGone: () => true });
