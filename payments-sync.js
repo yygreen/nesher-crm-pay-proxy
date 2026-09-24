@@ -385,6 +385,82 @@ export async function shadowNmiPayment({ pool, ...ev } = {}) {
   });
 }
 
+/**
+ * A REFUND OR VOID SENT FROM THE DESK CHAT (24 Sep, Joseph: "connect with my processor and make
+ * refunds"). The money went back at the processor; this records it against the CRM payment the
+ * SALE is on, through the same ledger door as every sale (postConfirmedPayment: ledger row first,
+ * exactly once per key, one transaction), as its OWN negative row. The sale's row is never edited.
+ *
+ * The sale's CRM row is found by its marker - `nmi:<saleTxn>` in core_payment.notes (the collection
+ * loop's rows and the hand-entered rows linked on 24 Sep) or in core_jrmhotelpayment.reference. No
+ * such row = the sale was never recorded in the CRM, so there is nothing to reverse there and a
+ * negative row would make the booking's paid total wrong: it is kept for review instead.
+ *
+ * key: the refund's own transaction id, or "void_<saleTxn>" for a void (a void has no new id).
+ */
+export async function recordNmiReversal({ pool, kind = "refund", saleTxn, reversalTxn, amountUsd, brand, orderId, rep, cardLast4, at } = {}) {
+  const sale = String(saleTxn || "").trim();
+  const isVoid = kind === "void";
+  const key = isVoid ? `void_${sale}` : String(reversalTxn || "").trim();
+  const amount = Number(amountUsd);
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(sale) || !/^[A-Za-z0-9_-]{1,80}$/.test(key)) return { ok: false, state: "not_recorded", errors: ["transaction_id_required"] };
+  if (!(amount > 0)) return { ok: false, state: "not_recorded", errors: ["invalid_amount"] };
+  const target = parseInvoiceNumber(orderId);
+  const b = ["nesher", "jrm"].includes(brand) ? brand : target ? (target.kind === "hotel" ? "jrm" : "nesher") : null;
+  if (!b) return { ok: false, state: "not_recorded", errors: ["brand_unknown"] };
+  const last4 = /^\d{4}$/.test(String(cardLast4 || "")) ? String(cardLast4) : "";
+  const who = String(rep || "").trim().slice(0, 40);
+  const amt = amount.toFixed(2);
+  const mark = `${isVoid ? "nmi-void" : "nmi-refund"}:${isVoid ? sale : key}`;
+  const words = `${isVoid ? "VOID" : "REFUND"} of NMI card sale txn ${sale}: -$${amt} USD${isVoid ? "" : ` (refund txn ${key})`}${last4 ? `, card ending ${last4}` : ""}${who ? `, sent by ${who} from the desk chat` : ""}.`;
+  const markRe = `(^|[[:space:]])${mark}($|[[:space:]])`;
+  const saleRe = `(^|[[:space:]])nmi:${sale}($|[[:space:]])`;
+  const write = async (client, out) => {
+    const done = await client.query(`SELECT id FROM core_payment WHERE notes ~ $1 UNION ALL SELECT id FROM core_jrmhotelpayment WHERE reference ~ $1 LIMIT 1`, [markRe]);
+    if (done.rows.length) { out.skipped.push(`${mark}: already synced`); return; }
+    const res = await client.query(`SELECT id, reservation_id, method FROM core_payment WHERE notes ~ $1 ORDER BY id LIMIT 2`, [saleRe]);
+    const hot = await client.query(`SELECT id, request_id, offer_id, method FROM core_jrmhotelpayment WHERE reference ~ $1 ORDER BY id LIMIT 2`, [saleRe]);
+    if (res.rows.length + hot.rows.length === 0) { out.errors.push("sale_not_in_crm"); return; }
+    if (res.rows.length + hot.rows.length > 1) { out.errors.push("sale_on_two_crm_rows"); return; }
+    const by = repUserId(who);
+    if (res.rows.length) {
+      const r = res.rows[0];
+      await client.query(
+        `INSERT INTO core_payment
+           (amount, method, paid_at, notes, created_at, created_by_id,
+            reservation_id, cash_location, cash_location_other,
+            points_account_id, points_qty, transfer_details, zelle_address,
+            points_cost_per_point)
+         VALUES ($1, $2, $3, $4, NOW(), $6, $5, '', '', NULL, 0, '', '', 0)`,
+        [-amount, r.method || "card", at ? new Date(at) : new Date(), `${words} ${mark}`, Number(r.reservation_id), by]
+      );
+      await client.query(
+        `UPDATE core_reservation SET amount_paid = COALESCE(amount_paid, 0) - $1, notes = COALESCE(notes,'') || $2, updated_at = NOW() WHERE id = $3`,
+        [amount, `\n${words}`, Number(r.reservation_id)]
+      );
+      out.recorded.push(`${mark}: -$${amt} -> reservation #${r.reservation_id}`);
+      return;
+    }
+    const h = hot.rows[0];
+    await client.query(
+      `INSERT INTO core_jrmhotelpayment
+         (payment_date, amount, currency, method, reference, note, created_at,
+          created_by_id, offer_id, request_id, card_last4)
+       VALUES ($1, $2, 'USD', $3, $4, $5, NOW(), $6, $7, $8, $9)`,
+      [at ? new Date(at) : new Date(), -amount, h.method || "card", `${String(orderId || "").trim() || "NMI"} ${mark}`.trim(), words, by, h.offer_id == null ? null : Number(h.offer_id), Number(h.request_id), last4]
+    );
+    await client.query(
+      `INSERT INTO core_jrmhotelnote (note, created_at, created_by_id, request_id) VALUES ($1, NOW(), $3, $2)`,
+      [words, Number(h.request_id), by]
+    );
+    out.recorded.push(`${mark}: -$${amt} -> hotel request #${h.request_id}`);
+  };
+  return postConfirmedPayment({
+    pool, invoiceNumber: String(orderId || "").trim() || `NMI-${sale}`, amountUsd: amount, transactionId: key,
+    paidAt: at || new Date().toISOString(), brand: b, path: "chat", cardLast4: last4, rep: who, kind: "refund", write,
+  });
+}
+
 /** LIVE mode exception door (never a CRM write). */
 export async function recordNmiException({ pool, reason, brand, ...ev } = {}) {
   const input = nmiInput(ev);

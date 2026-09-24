@@ -50,7 +50,8 @@ function result(error, needsReview = false) {
   return { ok: false, recorded: [], skipped: [], errors: [error], needsReview };
 }
 
-const PATHS = new Set(["guest", "webhook", "office", "open", "recovery"]);
+// "chat": a refund or void the desk chat sent (card-charge.js, 24 Sep), recorded as its own row, kind refund.
+const PATHS = new Set(["guest", "webhook", "office", "open", "recovery", "chat"]);
 function cleanPath(p) { return PATHS.has(p) ? p : null; }
 function cleanLast4(v) { const s = String(v ?? "").trim(); return /^\d{4}$/.test(s) ? s : null; }
 function cleanKind(v) { return v === 'refund' ? 'refund' : 'sale'; }
@@ -69,7 +70,7 @@ function validate({ transactionId, invoiceNumber, amountUsd, paidAt, brand }) {
 }
 
 /** Persist before attempting CRM changes. Event + payment + balance commit together. */
-export async function postConfirmedPayment({ pool, invoiceNumber, amountUsd, transactionId, paidAt, brand, write, path, cardLast4, rep }) {
+export async function postConfirmedPayment({ pool, invoiceNumber, amountUsd, transactionId, paidAt, brand, write, path, cardLast4, rep, kind }) {
   const v = validate({ transactionId, invoiceNumber, amountUsd, paidAt, brand });
   if (v.error) return result(v.error);
   const { txn, ref, cents, when } = v;
@@ -77,10 +78,10 @@ export async function postConfirmedPayment({ pool, invoiceNumber, amountUsd, tra
   await ensureTable(pool);
   const p = cleanPath(path);
   await pool.query(`INSERT INTO nesher_money_payment_posts
-    (transaction_id, invoice_number, amount_cents, brand, paid_at, first_path, paths, card_last4, rep)
-    VALUES ($1, $2, $3, $4, $5, $6, CASE WHEN $6::text IS NULL THEN '{}'::text[] ELSE ARRAY[$6::text] END, $7, $8)
+    (transaction_id, invoice_number, amount_cents, brand, paid_at, first_path, paths, card_last4, rep, kind)
+    VALUES ($1, $2, $3, $4, $5, $6, CASE WHEN $6::text IS NULL THEN '{}'::text[] ELSE ARRAY[$6::text] END, $7, $8, $9)
     ON CONFLICT (transaction_id) DO NOTHING`,
-    [txn, ref, cents, brand, when.toISOString(), p, cleanLast4(cardLast4), cleanRep(rep)]);
+    [txn, ref, cents, brand, when.toISOString(), p, cleanLast4(cardLast4), cleanRep(rep), cleanKind(kind)]);
   const client = await pool.connect();
   try {
     await client.query('BEGIN');

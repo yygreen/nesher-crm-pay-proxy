@@ -4,7 +4,14 @@
  *
  *   POST /__nesher_pay/charge {token_ref, amount_cents, currency, brand, rep, customer_name, cvv?, invoice_ref?, note?, address1?, city?, state?, zip?, country?}
  *   POST /__nesher_pay/void   {txn_id}
- *   POST /__nesher_pay/refund {txn_id, amount_cents}
+ *   POST /__nesher_pay/refund {txn_id, amount_cents, rep}
+ *   POST /__nesher_pay/sale   {rep, q}   READ ONLY: a past sale, looked up at the processor (24 Sep)
+ *
+ * Refund and void (24 Sep, Joseph: "connect with my processor and make refunds"): ANY sale on our
+ * processor in the last 180 days, not only a sale the chat charged. Before the gateway is asked the
+ * door reads the sale from the processor itself (settled or not, how much already went back), holds
+ * the amount to what is left, to REFUND_CAP_CENTS and to REFUND_DAY_CAP_CENTS, and afterwards
+ * records the reversal in the CRM as its own negative row through the collection loop's ledger.
  *
  * Every door takes the same one-time ticket as the OCR upload (ocr-card.js
  * mintTicket / verifyTicket) with its own kind, five-minute TTL, single use,
@@ -38,10 +45,14 @@
 
 import {
   BRANDS,
+  NMI_HOST,
   chargeWithToken,
   refundPayment,
   voidPayment,
 } from "./nmi-card.js";
+import { queryNmiRange, NMI_PROCESSOR_BRAND } from "./nmi-recovery.js";
+import { parseNmiTransactions, classifyTransaction } from "./money-map.js";
+import { parseInvoiceNumber } from "./payments-sync.js";
 import {
   bindHashOf,
   consumeTicket,
@@ -73,6 +84,7 @@ export function chargeFamilyPath(pathname) {
   if (p === CHARGE_PATH) return "charge";
   if (p === VOID_PATH) return "void";
   if (p === REFUND_PATH) return "refund";
+  if (p === SALE_PATH) return "sale";
   return null;
 }
 
@@ -81,6 +93,246 @@ export function refundCapCents(env = process.env) {
   const raw = String(env[REFUND_CAP_NAME] ?? "").trim();
   if (!/^\d{1,9}$/.test(raw)) return 0;
   return Number(raw);
+}
+
+/**
+ * A DAY CAP beside the per-refund cap (24 Sep): the most that may go back to cards through these
+ * doors in any 24 hours, refunds and voids together, counted from the PROCESSOR's own record (so a
+ * restart cannot reset it, and a refund done in the gateway portal counts too). Absent, empty or
+ * bad = the per-refund cap, i.e. one refund's worth a day - never "unlimited".
+ */
+export const REFUND_DAY_CAP_NAME = "REFUND_DAY_CAP_CENTS";
+export function refundDayCapCents(env = process.env) {
+  const raw = String(env[REFUND_DAY_CAP_NAME] ?? "").trim();
+  if (!/^\d{1,9}$/.test(raw)) return refundCapCents(env);
+  return Number(raw);
+}
+
+// ── A PAST SALE, READ FROM THE PROCESSOR (24 Sep, Joseph: "refund any past sale") ──────────────
+// READ ONLY: the Classic query.php, the same read the money map and the recovery sweep make, with
+// the key in the POST body only. The window is the last 180 days (the processor's own refund
+// window); a sale older than that is refunded in the gateway portal.
+export const SALE_PATH = "/__nesher_pay/sale";
+export const SALE_WINDOW_DAYS = 180;
+const DAY_MS = 86400000;
+const SALE_CACHE_MS = 20000;
+let saleCache = { at: 0, xml: null, key: "" };
+
+function mdfText(block, tagName) {
+  const m = block.match(new RegExp(`<${tagName}>([^<]*)</${tagName}>`));
+  return m ? m[1].replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&apos;/g, "'").trim() : "";
+}
+/**
+ * The two facts the money map's parser does not read: the masked card's last four, and whether the
+ * name on the sale contains the words the rep typed. The name is read here, compared, and dropped -
+ * it is never returned, stored or logged; the answer carries only a yes/no per transaction.
+ */
+export function saleExtras(xml, nameNeedle = "") {
+  const out = new Map();
+  const needle = String(nameNeedle || "").toLowerCase().replace(/[^\p{L}\s'-]/gu, " ").replace(/\s+/g, " ").trim();
+  const blocks = String(xml || "").split("<transaction>").slice(1).map((b) => b.split("</transaction>")[0]);
+  for (const b of blocks) {
+    const head = b.split("<action>")[0];
+    const id = mdfText(head, "transaction_id");
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(id)) continue;
+    const cc = mdfText(head, "cc_number").replace(/[\s-]/g, "");
+    const m = cc.match(/^\d{0,6}[Xx*•]{4,}(\d{4})$/);
+    let nameHit = false;
+    if (needle) {
+      const hay = ` ${[mdfText(head, "first_name"), mdfText(head, "last_name"), mdfText(head, "company")].join(" ").toLowerCase()} `;
+      nameHit = needle.split(" ").every((w) => w.length >= 2 && hay.includes(w));
+    }
+    out.set(id, { last4: m ? m[1] : null, nameHit });
+  }
+  return out;
+}
+
+function saleBooking(orderId) {
+  const p = parseInvoiceNumber(orderId);
+  if (!p) return null;
+  return p.kind === "hotel" ? `JRM-1${p.requestId}${p.offerId ? `-O${p.offerId}` : ""}` : `RES-${p.code}`;
+}
+function cleanRefText(v) {
+  return String(v || "").toUpperCase().replace(/[^A-Z0-9-]/g, "");
+}
+
+/**
+ * Every sale in the query answer, with what has already gone back on it. A refund in this gateway
+ * is its OWN transaction pointing at the sale (original_transaction_id); a refund action on the sale
+ * itself is counted too. `action` is what the chat may offer: "refund" (settled, money left),
+ * "void" (not settled yet - the processor refuses a refund until the batch settles, so the whole
+ * sale is voided instead), or "none" with a reason.
+ */
+export function salesFromXml(xml, { nameNeedle = "", nowMs = Date.now() } = {}) {
+  const txns = parseNmiTransactions(xml);
+  const extras = saleExtras(xml, nameNeedle);
+  const back = new Map();
+  let dayBackCents = 0;
+  for (const t of txns) {
+    const c = classifyTransaction(t);
+    for (const a of t.actions) {
+      if (!a.success) continue;
+      if ((a.type === "refund" || a.type === "credit") && a.at != null && nowMs - a.at < DAY_MS) dayBackCents += Math.round(Math.abs(a.amount) * 100);
+    }
+    if (c.voided && c.kind === "sale" && c.voidAt != null && nowMs - c.voidAt < DAY_MS) dayBackCents += Math.round(c.amount * 100);
+    if (c.kind === "refund" && t.originalId) back.set(t.originalId, (back.get(t.originalId) || 0) + Math.round(c.amount * 100));
+    if (c.kind === "sale") {
+      const own = t.actions.filter((a) => a.success && (a.type === "refund" || a.type === "credit")).reduce((s, a) => s + Math.round(Math.abs(a.amount) * 100), 0);
+      if (own) back.set(t.id, (back.get(t.id) || 0) + own);
+    }
+  }
+  const sales = [];
+  for (const t of txns) {
+    const c = classifyTransaction(t);
+    if (c.kind !== "sale") continue;
+    const amountCents = Math.round(c.amount * 100);
+    const refundedCents = Math.min(amountCents, back.get(t.id) || 0);
+    const settled = t.condition === "complete";
+    const pending = t.condition === "pendingsettlement" || t.condition === "pending";
+    let action = "none";
+    let why = null;
+    if (c.voided || t.condition === "canceled") why = "voided";
+    else if (settled && amountCents - refundedCents > 0) action = "refund";
+    else if (settled) why = "fully_refunded";
+    else if (pending && refundedCents === 0) action = "void";
+    else why = `condition_${t.condition || "unknown"}`;
+    const ex = extras.get(t.id) || { last4: null, nameHit: false };
+    sales.push({
+      txn_id: t.id,
+      merchant: NMI_PROCESSOR_BRAND[t.processorId] || null,
+      processor_id: t.processorId || null,
+      at: c.at != null ? new Date(c.at).toISOString() : null,
+      at_ms: c.at,
+      amount_cents: amountCents,
+      refunded_cents: refundedCents,
+      refundable_cents: action === "refund" ? amountCents - refundedCents : 0,
+      voidable_cents: action === "void" ? amountCents : 0,
+      settled,
+      voided: Boolean(c.voided),
+      condition: t.condition || null,
+      last4: ex.last4,
+      card_type: t.cardType || null,
+      order_id: t.orderId || null,
+      booking: saleBooking(t.orderId),
+      name_hit: ex.nameHit,
+      action,
+      why,
+    });
+  }
+  sales.sort((a, b) => (b.at_ms || 0) - (a.at_ms || 0));
+  return { sales, dayBackCents };
+}
+
+/** Filter the sales by what the rep typed. Needs ONE identifier: txn, booking, last four or a name. */
+export function matchSales(sales, q = {}) {
+  const txn = String(q.txn || "").trim();
+  const ref = cleanRefText(q.ref);
+  const last4 = /^\d{4}$/.test(String(q.last4 || "")) ? String(q.last4) : "";
+  const name = String(q.name || "").trim();
+  const from = Number.isFinite(Date.parse(q.from || "")) ? Date.parse(q.from) : null;
+  const to = Number.isFinite(Date.parse(q.to || "")) ? Date.parse(q.to) : null;
+  const saleCents = Number.isInteger(q.sale_cents) && q.sale_cents > 0 ? q.sale_cents : null;
+  if (!txn && !ref && !last4 && !name) return { error: "identifier_required", matches: [] };
+  const out = sales.filter((s) => {
+    if (txn && s.txn_id !== txn) return false;
+    if (ref) {
+      const oid = cleanRefText(s.order_id);
+      const bare = oid.replace(/^RES-/, "");
+      if (!(oid === ref || bare === ref || (ref.length >= 5 && oid.includes(ref)))) return false;
+    }
+    if (last4 && s.last4 !== last4) return false;
+    if (name && !s.name_hit) return false;
+    if (from != null && (s.at_ms == null || s.at_ms < from)) return false;
+    if (to != null && (s.at_ms == null || s.at_ms >= to)) return false;
+    if (saleCents != null && s.amount_cents !== saleCents) return false;
+    return true;
+  });
+  return { error: null, matches: out };
+}
+
+async function readSales({ deps = {}, nameNeedle = "", fresh = false } = {}) {
+  const clock = typeof deps.clock === "function" ? deps.clock : Date.now;
+  const key = String(deps.privateKey || (deps.env || process.env).NMI_PRIVATE_KEY || "").trim();
+  if (!key) return { ok: false, error: "keys_missing" };
+  const now = clock();
+  let xml = null;
+  if (!fresh && saleCache.xml && now - saleCache.at < SALE_CACHE_MS && saleCache.key === key.slice(-6)) xml = saleCache.xml;
+  if (!xml) {
+    try {
+      xml = await queryNmiRange({
+        host: (deps.env || process.env).NMI_HOST || NMI_HOST,
+        securityKey: key,
+        since: new Date(now - SALE_WINDOW_DAYS * DAY_MS),
+        until: new Date(now + 60000),
+        fetchImpl: deps.fetchImpl || fetch,
+        timeoutMs: 25000,
+      });
+    } catch (e) {
+      const msg = String(e?.message || "");
+      return { ok: false, error: /^nmi_query_[a-z_0-9]+$/.test(msg) ? msg : "nmi_query_failed" };
+    }
+    saleCache = { at: now, xml, key: key.slice(-6) };
+  }
+  const { sales, dayBackCents } = salesFromXml(xml, { nameNeedle, nowMs: now });
+  return { ok: true, sales, dayBackCents };
+}
+export function _resetSaleCache() {
+  saleCache = { at: 0, xml: null, key: "" };
+}
+function publicSale(s) {
+  const { at_ms, name_hit, ...rest } = s;
+  return rest;
+}
+
+/**
+ * POST /__nesher_pay/sale {rep, q:{txn?, ref?, last4?, name?, from?, to?, sale_cents?}}.
+ * Ticket kind "sale", bound to the rep. READ ONLY - it moves nothing. Up to five sales, newest
+ * first, each with what has already gone back and what the chat may offer.
+ */
+export async function handleSaleLookup(req, res, deps = {}) {
+  const door = await openDoor(req, res, deps, "sale", "rep");
+  if (!door) return;
+  const { body, finish } = door;
+  const q = body.q && typeof body.q === "object" && !Array.isArray(body.q) ? body.q : {};
+  const clean = {
+    txn: /^[A-Za-z0-9_-]{4,64}$/.test(str(q.txn, 64)) ? str(q.txn, 64) : "",
+    ref: str(q.ref, 32),
+    last4: /^\d{4}$/.test(str(q.last4, 4)) ? str(q.last4, 4) : "",
+    name: str(q.name, 60),
+    from: str(q.from, 40),
+    to: str(q.to, 40),
+    sale_cents: Number.isInteger(q.sale_cents) ? q.sale_cents : null,
+  };
+  if (!clean.txn && !clean.ref && !clean.last4 && !clean.name) {
+    return finish(400, { ok: false, error: "identifier_required" }, { outcome: "bad_request:identifier_required" });
+  }
+  const read = await readSales({ deps, nameNeedle: clean.name });
+  if (!read.ok) {
+    return finish(read.error === "keys_missing" ? 503 : 502, { ok: false, error: read.error }, { outcome: `lookup_failed:${read.error}` });
+  }
+  const m = matchSales(read.sales, clean);
+  return finish(
+    200,
+    {
+      ok: true,
+      window_days: SALE_WINDOW_DAYS,
+      total: m.matches.length,
+      matches: m.matches.slice(0, 5).map(publicSale),
+      caps: { refund_cap_set: refundCapCents(deps.env || process.env) > 0 },
+    },
+    { outcome: `found:${m.matches.length}` }
+  );
+}
+
+/**
+ * What the processor itself says about ONE sale right before money moves back on it, plus how
+ * much went back in the last 24 hours. Fails closed: no read, no refund.
+ */
+async function saleBeforeReversal(txnId, deps) {
+  const read = await readSales({ deps, fresh: true });
+  if (!read.ok) return { ok: false, error: read.error };
+  const sale = read.sales.find((s) => s.txn_id === txnId) || null;
+  return { ok: true, sale, dayBackCents: read.dayBackCents };
 }
 
 /** Plain words for a gateway response_code. The raw code stays in its own field. */
@@ -368,15 +620,78 @@ export async function handleChargeRequest(req, res, deps = {}) {
 }
 
 /**
- * POST /__nesher_pay/void {txn_id}. Ticket kind "void", bound to txn_id.
- * The chat's 60-second undo: voids an unsettled sale.
+ * The checks every reversal passes BEFORE the gateway is asked (24 Sep). Read from the processor
+ * itself, fresh: the sale exists in the last 180 days, is a sale, is not voided; a refund needs it
+ * SETTLED and the amount at most what is left on it; a void needs it NOT settled and takes the whole
+ * sale. Both are held to the per-refund cap and the 24-hour cap. Returns null when all pass, or the
+ * refusal to send.
+ */
+function reversalRefusal(kind, txnId, amountCents, facts, env) {
+  const cap = refundCapCents(env);
+  const dayCap = refundDayCapCents(env);
+  const say = (status, error, words, extra = {}) => ({ status, body: { ok: false, error, decline_reason_human: words, txn_id: txnId, ...extra }, outcome: `${kind}_refused:${error}` });
+  if (cap <= 0) return say(403, "refund_cap_not_set", "Refunds from the chat are switched off. Refund it in the gateway portal.", { cap_cents: 0 });
+  if (amountCents > cap) return say(403, "refund_over_cap", "That is above the chat's cap for one refund. Refund it in the gateway portal.", { cap_cents: cap });
+  if (!facts.ok) return say(502, "sale_unreadable", "Could not read the sale at the processor, so nothing was sent back. Try again in a minute.");
+  const s = facts.sale;
+  if (!s) return say(404, "sale_not_found", `No card sale with that transaction in the last ${SALE_WINDOW_DAYS} days. Refund it in the gateway portal.`);
+  if (s.voided) return say(409, "sale_voided", "That sale was already voided - nothing is left to send back.");
+  if (kind === "refund") {
+    if (!s.settled) return say(409, "not_settled", "That sale has not settled yet, so the processor will not refund it. Void it instead (the whole sale), or refund after tonight's batch.", { settled: false });
+    const left = s.amount_cents - s.refunded_cents;
+    if (left <= 0) return say(409, "fully_refunded", "That sale is already fully refunded.", { refunded_cents: s.refunded_cents });
+    if (amountCents > left) return say(409, "over_refundable", `Only $${moneyCents(left)} is left to refund on that sale.`, { refundable_cents: left });
+  } else {
+    if (s.settled) return say(409, "already_settled", "That sale has already settled - it cannot be voided. Refund it instead.", { settled: true });
+    if (s.action !== "void") return say(409, "not_voidable", "That sale cannot be voided from the chat. Check it in the gateway portal.");
+    if (amountCents !== s.amount_cents) return say(409, "void_is_whole", `A void cancels the whole sale: $${moneyCents(s.amount_cents)}.`, { amount_cents: s.amount_cents });
+  }
+  if (facts.dayBackCents + amountCents > dayCap) {
+    return say(403, "refund_over_day_cap", "That would pass the chat's refund limit for 24 hours. Refund it in the gateway portal, or wait.", { day_cap_cents: dayCap });
+  }
+  return null;
+}
+
+/**
+ * The CRM half of a reversal (24 Sep): through the collection loop's own ledger door, as a new
+ * negative row against the CRM payment the sale is on (payments-sync.js recordNmiReversal). Never
+ * fails the answer: the money already went back, so a CRM problem is REPORTED, never hidden and
+ * never allowed to look like the refund failed.
+ */
+async function recordReversal(deps, fields) {
+  const rec = typeof deps.recordReversal === "function" ? deps.recordReversal : null;
+  if (!rec) return { state: "not_recorded", reason: "no_crm_door" };
+  try {
+    const r = await rec(fields);
+    if (r && r.state === "posted") {
+      // "nmi-refund:<id>: -$15.00 -> reservation #7" -> "reservation #7" (the marker itself holds a colon).
+      const where = Array.isArray(r.recorded) && r.recorded[0] ? (String(r.recorded[0]).split("->")[1] || "").trim() : "";
+      return { state: "posted", where: where.slice(0, 80), repeated: Array.isArray(r.skipped) && r.skipped.length > 0 };
+    }
+    const reason = (r && Array.isArray(r.errors) && r.errors[0]) || (r && r.state) || "not_recorded";
+    return { state: r && r.state === "review" ? "review" : "not_recorded", reason: String(reason).slice(0, 60) };
+  } catch {
+    return { state: "not_recorded", reason: "crm_write_failed" };
+  }
+}
+
+/**
+ * POST /__nesher_pay/void {txn_id, amount_cents, rep}. Ticket kind "void", bound to txn_id.
+ * For a sale that has NOT settled: the whole sale is cancelled before it ever settles.
  */
 export async function handleVoidRequest(req, res, deps = {}) {
   const door = await openDoor(req, res, deps, "void", "txn_id");
   if (!door) return;
-  const { body, finish } = door;
+  const { body, finish, ticket } = door;
+  const env = deps.env || process.env;
   const txnId = str(body.txn_id, 64);
   if (!TXN_ID_RE.test(txnId)) return finish(400, { ok: false, error: "txn_id_invalid" }, { outcome: "bad_request:txn_id_invalid" });
+  const amountCents = body.amount_cents;
+  if (!isInt(amountCents) || amountCents < 1) return finish(400, { ok: false, error: "amount_cents_invalid" }, { outcome: "bad_request:amount_cents_invalid" });
+  const facts = await saleBeforeReversal(txnId, deps);
+  const refused = reversalRefusal("void", txnId, amountCents, facts, env);
+  if (refused) return finish(refused.status, refused.body, { outcome: refused.outcome, amount_cents: amountCents, txn: txnId });
+  const sale = facts.sale;
   let out;
   try {
     out = await voidPayment({ transactionId: txnId, fetchImpl: deps.fetchImpl, privateKey: deps.privateKey });
@@ -397,28 +712,38 @@ export async function handleVoidRequest(req, res, deps = {}) {
       { outcome: `void_failed:${out.responseCode || out.error || "unknown"}`, txn: txnId }
     );
   }
-  return finish(200, { ok: true, txn_id: txnId, void_txn_id: out.transactionId || null }, { outcome: "voided", txn: txnId });
+  _resetSaleCache();
+  const crm = await recordReversal(deps, { kind: "void", saleTxn: txnId, reversalTxn: out.transactionId || null, amountUsd: Number(moneyCents(sale.amount_cents)), brand: sale.merchant, orderId: sale.order_id, rep: ticket.repId, cardLast4: sale.last4, at: new Date().toISOString() });
+  return finish(200, { ok: true, txn_id: txnId, void_txn_id: out.transactionId || null, amount_cents: sale.amount_cents, merchant: sale.merchant, crm }, { outcome: "voided", amount_cents: sale.amount_cents, txn: txnId });
 }
 
 /**
- * POST /__nesher_pay/refund {txn_id, amount_cents}. Ticket kind "refund",
- * bound to txn_id. Capped by REFUND_CAP_CENTS (absent = 0 = refused).
+ * POST /__nesher_pay/refund {txn_id, amount_cents, rep}. Ticket kind "refund", bound to txn_id.
+ * Any settled sale on our processor in the last 180 days - a chat tile's own sale or any past one -
+ * checked against the processor first (reversalRefusal), capped per refund (REFUND_CAP_CENTS,
+ * absent = 0 = refused) and per 24 hours (REFUND_DAY_CAP_CENTS), then recorded in the CRM.
  */
 export async function handleRefundRequest(req, res, deps = {}) {
   const door = await openDoor(req, res, deps, "refund", "txn_id");
   if (!door) return;
-  const { body, finish } = door;
+  const { body, finish, ticket } = door;
+  const env = deps.env || process.env;
   const txnId = str(body.txn_id, 64);
   const amountCents = body.amount_cents;
   if (!TXN_ID_RE.test(txnId)) return finish(400, { ok: false, error: "txn_id_invalid" }, { outcome: "bad_request:txn_id_invalid" });
   if (!isInt(amountCents) || amountCents < 1) return finish(400, { ok: false, error: "amount_cents_invalid" }, { outcome: "bad_request:amount_cents_invalid" });
-  const cap = refundCapCents(deps.env || process.env);
+  // The cap first, before the processor is even read: a door that is off stays cheap and says so.
+  const cap = refundCapCents(env);
   if (cap <= 0) {
     return finish(403, { ok: false, error: "refund_cap_not_set", cap_cents: 0, decline_reason_human: "Refunds from the chat are switched off. Refund it in the gateway portal." }, { outcome: "refund_refused:cap_not_set", amount_cents: amountCents, txn: txnId });
   }
   if (amountCents > cap) {
     return finish(403, { ok: false, error: "refund_over_cap", cap_cents: cap, decline_reason_human: "That refund is above the chat's cap. Refund it in the gateway portal." }, { outcome: "refund_refused:over_cap", amount_cents: amountCents, txn: txnId });
   }
+  const facts = await saleBeforeReversal(txnId, deps);
+  const refused = reversalRefusal("refund", txnId, amountCents, facts, env);
+  if (refused) return finish(refused.status, refused.body, { outcome: refused.outcome, amount_cents: amountCents, txn: txnId });
+  const sale = facts.sale;
   let out;
   try {
     out = await refundPayment({ transactionId: txnId, amountUsd: Number(moneyCents(amountCents)), fetchImpl: deps.fetchImpl, privateKey: deps.privateKey });
@@ -440,5 +765,13 @@ export async function handleRefundRequest(req, res, deps = {}) {
       { outcome: `refund_failed:${out.responseCode || out.error || "unknown"}`, amount_cents: amountCents, txn: txnId }
     );
   }
-  return finish(200, { ok: true, txn_id: txnId, refund_txn_id: out.transactionId || null, amount_cents: amountCents }, { outcome: "refunded", amount_cents: amountCents, txn: txnId });
+  _resetSaleCache();
+  const crm = out.transactionId
+    ? await recordReversal(deps, { kind: "refund", saleTxn: txnId, reversalTxn: out.transactionId, amountUsd: Number(moneyCents(amountCents)), brand: sale.merchant, orderId: sale.order_id, rep: ticket.repId, cardLast4: sale.last4, at: new Date().toISOString() })
+    : { state: "not_recorded", reason: "no_refund_txn_id" };
+  return finish(
+    200,
+    { ok: true, txn_id: txnId, refund_txn_id: out.transactionId || null, amount_cents: amountCents, refunded_cents: sale.refunded_cents + amountCents, sale_cents: sale.amount_cents, merchant: sale.merchant, crm },
+    { outcome: "refunded", amount_cents: amountCents, txn: txnId }
+  );
 }

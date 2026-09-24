@@ -33,8 +33,10 @@ import {
   chargeFamilyPath,
   handleChargeRequest,
   handleRefundRequest,
+  handleSaleLookup,
   handleVoidRequest,
   refundCapCents,
+  refundDayCapCents,
 } from "./card-charge.js";
 import {
   nmiWebhookSecret,
@@ -111,6 +113,7 @@ import {
   recordNmiPaidInvoiceLegacy,
   shadowNmiPayment,
   recordNmiException,
+  recordNmiReversal,
   listInvoicesViaSeat,
 } from "./payments-sync.js";
 import {
@@ -1191,8 +1194,15 @@ const server = http.createServer(async (req, res) => {
         ? handleChargeRequest
         : moneyDoor === "void"
           ? handleVoidRequest
-          : handleRefundRequest;
-    await handler(req, res, { secret: ocrSecret() });
+          : moneyDoor === "sale"
+            ? handleSaleLookup
+            : handleRefundRequest;
+    // A refund or void is recorded in the CRM through the collection loop's ledger door, in live
+    // posting mode only; in shadow the legacy writers own the CRM and nothing is written here.
+    await handler(req, res, {
+      secret: ocrSecret(),
+      recordReversal: POSTING_MODE === "live" ? (f) => recordNmiReversal({ pool: getPool(), ...f }) : null,
+    });
     return;
   }
 
@@ -1523,7 +1533,7 @@ const server = http.createServer(async (req, res) => {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-09-24-money-pay",
+      build: "2026-09-24-refund-any",
       instance: INSTANCE_ID,
       snapEngage: {
         enabled: SNAPENGAGE_ENABLED,
@@ -1576,6 +1586,8 @@ const server = http.createServer(async (req, res) => {
         ready: ocrPool ? ocrPool.ready : false,
         error: ocrPool ? ocrPool.error : null,
         refundCapSet: refundCapCents() > 0,
+        refundDayCapSet: String(process.env.REFUND_DAY_CAP_CENTS || "").trim() !== "" && refundDayCapCents() > 0,
+        saleLookup: true,
         // The one-time card references this process is holding right now.
         // A count, never a reference and never a card.
         holds: cardHoldCount(),

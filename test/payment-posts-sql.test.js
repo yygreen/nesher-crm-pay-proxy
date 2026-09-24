@@ -1,7 +1,7 @@
 import { after, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { PGlite } from "@electric-sql/pglite";
-import { recordNmiPaidInvoice } from "../payments-sync.js";
+import { recordNmiPaidInvoice, recordNmiReversal } from "../payments-sync.js";
 import { retryPaymentPosts } from "../payment-posts.js";
 
 // PGlite exposes one PostgreSQL session. The pool adapter serializes checked-out
@@ -263,5 +263,54 @@ describe("confirmed NMI payment SQL integration", () => {
       await row("SELECT state, reason FROM nesher_money_payment_posts WHERE transaction_id = $1", ["nmi_bad_offer"]),
       { state: "review", reason: "hotel_offer_mismatch" },
     );
+  });
+});
+
+describe("a refund or void from the desk chat, recorded against the sale's CRM row (24 Sep)", () => {
+  const SALE = { invoiceNumber: "RES-ABC123", amountUsd: 40, transactionId: "nmi_res_1", paidAt: "2026-09-20T10:00:00.000Z", cardLast4: "4421", rep: "Hershy" };
+  it("a partial refund is its OWN negative row; the sale row is untouched; replay writes nothing twice", async () => {
+    assert.equal((await recordNmiPaidInvoice({ pool, ...SALE })).ok, true);
+    const before = await row("SELECT id, amount, notes, method FROM core_payment WHERE reservation_id = 7");
+    const r = await recordNmiReversal({ pool, kind: "refund", saleTxn: "nmi_res_1", reversalTxn: "nmi_rf_9", amountUsd: 15, brand: "nesher", orderId: "RES-ABC123", rep: "joseph", cardLast4: "4421" });
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.equal(r.state, "posted");
+    const again = await recordNmiReversal({ pool, kind: "refund", saleTxn: "nmi_res_1", reversalTxn: "nmi_rf_9", amountUsd: 15, brand: "nesher", orderId: "RES-ABC123", rep: "joseph", cardLast4: "4421" });
+    assert.equal(again.ok, true);
+    const rows = (await pool.query("SELECT id, amount, notes, method FROM core_payment WHERE reservation_id = 7 ORDER BY id")).rows;
+    assert.equal(rows.length, 2, "one sale row + one refund row, no duplicate on replay");
+    assert.deepEqual(rows[0], before, "the sale's own row is never edited");
+    assert.equal(Number(rows[1].amount), -15);
+    assert.equal(rows[1].method, "card");
+    assert.match(rows[1].notes, /REFUND of NMI card sale txn nmi_res_1: -\$15\.00 USD \(refund txn nmi_rf_9\), card ending 4421, sent by joseph from the desk chat\. nmi-refund:nmi_rf_9$/);
+    assert.equal(await scalar("SELECT amount_paid AS value FROM core_reservation WHERE id = 7"), 25);
+    assert.deepEqual(await row("SELECT state, kind, amount_cents::int AS cents, rep, first_path FROM nesher_money_payment_posts WHERE transaction_id = 'nmi_rf_9'"),
+      { state: "posted", kind: "refund", cents: 1500, rep: "joseph", first_path: "chat" });
+    // The sale's marker still finds exactly ONE row (the refund note says "nmi-refund:" and "sale txn", never " nmi:<sale>").
+    assert.equal((await pool.query("SELECT id FROM core_payment WHERE notes ~ $1", ["(^|[[:space:]])nmi:nmi_res_1($|[[:space:]])"])).rows.length, 1);
+  });
+
+  it("a sale that was never recorded in the CRM is kept for review, never a negative row on its own", async () => {
+    const r = await recordNmiReversal({ pool, kind: "refund", saleTxn: "nmi_never", reversalTxn: "nmi_rf_x", amountUsd: 1, brand: "nesher", orderId: "RES-ABC123", rep: "joseph" });
+    assert.equal(r.ok, false);
+    assert.equal(r.state, "review");
+    assert.deepEqual(await row("SELECT state, reason, kind FROM nesher_money_payment_posts WHERE transaction_id = 'nmi_rf_x'"), { state: "review", reason: "sale_not_in_crm", kind: "refund" });
+    assert.equal((await pool.query("SELECT id FROM core_payment")).rows.length, 0);
+    assert.equal(await scalar("SELECT amount_paid AS value FROM core_reservation WHERE id = 7"), 0);
+  });
+
+  it("a void of a JRM hotel sale: a negative hotel payment + a hotel note, keyed void_<sale>", async () => {
+    assert.equal((await recordNmiPaidInvoice({ pool, invoiceNumber: "JRM-142-O99", amountUsd: 80, transactionId: "nmi_hot_1", paidAt: "2026-09-24T08:00:00.000Z" })).ok, true);
+    const r = await recordNmiReversal({ pool, kind: "void", saleTxn: "nmi_hot_1", reversalTxn: null, amountUsd: 80, brand: "jrm", orderId: "JRM-142-O99", rep: "joseph", cardLast4: "0008" });
+    assert.equal(r.ok, true, JSON.stringify(r));
+    const pays = (await pool.query("SELECT amount, reference, request_id, offer_id, card_last4 FROM core_jrmhotelpayment ORDER BY id")).rows;
+    assert.equal(pays.length, 2);
+    assert.equal(Number(pays[1].amount), -80);
+    assert.match(pays[1].reference, /nmi-void:nmi_hot_1$/);
+    assert.equal(pays[1].request_id, 42);
+    assert.equal(pays[1].offer_id, 99);
+    assert.equal(pays[1].card_last4, "0008");
+    const notes = (await pool.query("SELECT note FROM core_jrmhotelnote ORDER BY id")).rows.map((x) => x.note);
+    assert.match(notes[notes.length - 1], /^VOID of NMI card sale txn nmi_hot_1: -\$80\.00 USD, card ending 0008, sent by joseph from the desk chat\.$/);
+    assert.equal((await row("SELECT kind, state FROM nesher_money_payment_posts WHERE transaction_id = 'void_nmi_hot_1'")).kind, "refund");
   });
 });

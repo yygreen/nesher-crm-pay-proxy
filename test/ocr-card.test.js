@@ -220,7 +220,7 @@ describe("tickets", () => {
     const o = mintOcrTicket({ repId: "sruly", secret: SECRET, now: NOW });
     assert.equal(verifyTicket(o.token, { secret: SECRET, now: NOW, kind: "charge", bind: ref }).error, "kind_mismatch");
     assert.throws(() => mintTicket({ kind: "charge", repId: "sruly", bind: "", secret: SECRET }), /binding/);
-    assert.throws(() => mintTicket({ kind: "sale", repId: "sruly", bind: "x", secret: SECRET }), /kind/);
+    assert.throws(() => mintTicket({ kind: "sell", repId: "sruly", bind: "x", secret: SECRET }), /kind/);
     const v = mintTicket({ kind: "void", repId: "sruly", bind: "12345", secret: SECRET, now: NOW });
     assert.equal(verifyTicket(v.token, { secret: SECRET, now: NOW, kind: "void", bind: "12345" }).ok, true);
     assert.equal(verifyTicket(v.token, { secret: SECRET, now: NOW, kind: "refund", bind: "12345" }).error, "kind_mismatch");
@@ -725,7 +725,7 @@ describe("wiring", () => {
     assert.ok(src.indexOf("isOcrPath(url.pathname)") < src.indexOf("isOpenPayPath(url.pathname)"), "reader answers before the pay pages");
     assert.ok(src.indexOf("isOcrPath(url.pathname)") < src.lastIndexOf("proxyWithInject(req, res)"), "reader answers before the proxy");
     assert.match(src, /ocr: \{\s*enabled: ocrEnabled\(\)/);
-    assert.match(src, /build: "2026-09-24-money-pay"/);
+    assert.match(src, /build: "2026-09-24-refund-any"/);
     assert.match(src, /startCardHoldSweeper\(/);
     // The replica proof lives in health: one boot id per process.
     assert.match(src, /const INSTANCE_ID = crypto\.randomBytes\(6\)\.toString\("hex"\)/);

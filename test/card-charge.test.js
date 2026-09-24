@@ -12,6 +12,11 @@ import {
   handleChargeRequest,
   handleVoidRequest,
   handleRefundRequest,
+  handleSaleLookup,
+  SALE_PATH,
+  salesFromXml,
+  matchSales,
+  _resetSaleCache,
 } from "../card-charge.js";
 import { mintTicket, mintOcrTicket, registerCardHold, redeemCardHold, CARD_HOLD_TTL_MS, _resetCardRefsForTests } from "../ocr-card.js";
 
@@ -421,34 +426,178 @@ describe("POST /__nesher_pay/charge", () => {
   });
 });
 
-describe("POST /__nesher_pay/void and /refund", () => {
-  beforeEach(() => _resetCardRefsForTests());
+// ── A fake processor record (query.php XML). Synthetic ids, names and masks only. ──
+const NOW_MS = Date.now();
+function stampOf(ms) {
+  const d = new Date(ms);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getUTCFullYear()}${p(d.getUTCMonth() + 1)}${p(d.getUTCDate())}${p(d.getUTCHours())}${p(d.getUTCMinutes())}${p(d.getUTCSeconds())}`;
+}
+function txXml(t) {
+  const acts = (t.actions || []).map((a) => `<action><amount>${a.amount}</amount><action_type>${a.type}</action_type><date>${stampOf(a.at)}</date><success>${a.success === false ? 0 : 1}</success><batch_id>${a.batch || 0}</batch_id></action>`).join("");
+  return `<transaction><transaction_id>${t.id}</transaction_id><order_id>${t.order || ""}</order_id><original_transaction_id>${t.orig || ""}</original_transaction_id><processor_id>${t.proc || "mav7067"}</processor_id><condition>${t.cond || "complete"}</condition><cc_type>${t.ccType || "visa"}</cc_type><cc_number>${t.cc || "4xxxxxxxxxxx1111"}</cc_number><first_name>${t.first || ""}</first_name><last_name>${t.last || ""}</last_name>${acts}</transaction>`;
+}
+function nmiXml(list) {
+  return `<?xml version="1.0" encoding="UTF-8"?><nm_response>${list.map(txXml).join("")}</nm_response>`;
+}
+const DAYS = (n) => NOW_MS - n * 86400000;
+// A settled $500 Nesher sale with $100 already refunded (its own refund transaction), an unsettled
+// $80 JRM sale from this morning, a voided sale, and one fully refunded sale.
+function ledger() {
+  return [
+    { id: "txn-100", order: "RES-79RHW4", proc: "mav7067", cond: "complete", cc: "4xxxxxxxxxxx4421", first: "Moshe", last: "Cohen", actions: [{ type: "sale", amount: "500.00", at: DAYS(3) }, { type: "settle", amount: "500.00", at: DAYS(3) + 3600000, batch: 7 }] },
+    { id: "txn-101", orig: "txn-100", proc: "mav7067", cond: "complete", actions: [{ type: "refund", amount: "-100.00", at: DAYS(2) }] },
+    { id: "txn-300", order: "JRM-1422-O99", proc: "mav2083", cond: "pendingsettlement", cc: "5xxxxxxxxxxx0008", first: "Dina", last: "Levi", actions: [{ type: "sale", amount: "80.00", at: NOW_MS - 3600000 }] },
+    { id: "txn-400", order: "RES-VOIDED", proc: "mav7067", cond: "canceled", actions: [{ type: "sale", amount: "40.00", at: DAYS(5) }, { type: "void", amount: "40.00", at: DAYS(5) + 60000 }] },
+    { id: "txn-500", order: "RES-FULLRF", proc: "mav7067", cond: "complete", actions: [{ type: "sale", amount: "25.00", at: DAYS(9) }] },
+    { id: "txn-501", orig: "txn-500", proc: "mav7067", cond: "complete", actions: [{ type: "refund", amount: "-25.00", at: DAYS(8) }] },
+  ];
+}
 
-  it("void: bound to txn_id, posts the documented empty body, 402 on failure", async () => {
-    const { fetchImpl, calls } = gatewayMock();
-    const s = await startDoor(handleVoidRequest, { secret: SECRET, fetchImpl, privateKey: "k" });
+function processorMock(list = ledger(), script = {}) {
+  const calls = [];
+  const fetchImpl = async (url, init = {}) => {
+    if (/\/api\/query\.php$/.test(url)) {
+      calls.push({ url, method: init.method || "GET", query: true, keyInBody: /security_key=/.test(String(init.body || "")) });
+      if (script.queryDown) return { ok: false, status: 500, text: async () => "down" };
+      return { ok: true, status: 200, text: async () => nmiXml(list) };
+    }
+    const body = init.body ? JSON.parse(init.body) : null;
+    calls.push({ url, method: init.method || "GET", body });
+    if (/\/void$/.test(url)) {
+      const r = script.void || { response: "1", id: "txn-300" };
+      return { ok: true, status: 200, text: async () => JSON.stringify(r) };
+    }
+    if (/\/refund$/.test(url)) {
+      const r = script.refund || { response: "1", id: "txn-900" };
+      return { ok: true, status: 200, text: async () => JSON.stringify(r) };
+    }
+    return { ok: false, status: 404, text: async () => "{}" };
+  };
+  const moved = () => calls.filter((c) => !c.query);
+  return { calls, moved, fetchImpl };
+}
+const CAPS_ON = { REFUND_CAP_CENTS: "100000", REFUND_DAY_CAP_CENTS: "300000" };
+
+describe("a past sale read from the processor (24 Sep)", () => {
+  beforeEach(() => _resetSaleCache());
+
+  it("salesFromXml: amounts, already refunded, settled or not, what the chat may offer", () => {
+    const { sales, dayBackCents } = salesFromXml(nmiXml(ledger()), { nowMs: NOW_MS });
+    const by = Object.fromEntries(sales.map((s) => [s.txn_id, s]));
+    assert.deepEqual(Object.keys(by).sort(), ["txn-100", "txn-300", "txn-400", "txn-500"]);
+    assert.equal(by["txn-100"].amount_cents, 50000);
+    assert.equal(by["txn-100"].refunded_cents, 10000);
+    assert.equal(by["txn-100"].refundable_cents, 40000);
+    assert.equal(by["txn-100"].action, "refund");
+    assert.equal(by["txn-100"].merchant, "nesher");
+    assert.equal(by["txn-100"].last4, "4421");
+    assert.equal(by["txn-100"].booking, "RES-79RHW4");
+    assert.equal(by["txn-300"].action, "void");
+    assert.equal(by["txn-300"].settled, false);
+    assert.equal(by["txn-300"].merchant, "jrm");
+    assert.equal(by["txn-300"].voidable_cents, 8000);
+    assert.equal(by["txn-400"].action, "none");
+    assert.equal(by["txn-400"].why, "voided");
+    assert.equal(by["txn-500"].action, "none");
+    assert.equal(by["txn-500"].why, "fully_refunded");
+    assert.equal(dayBackCents, 0, "nothing went back in the last 24 hours");
+    assert.equal(sales[0].txn_id, "txn-300", "newest first");
+  });
+
+  it("matchSales: txn, booking with or without RES-, last four, name + day; an identifier is required", () => {
+    const { sales } = salesFromXml(nmiXml(ledger()), { nowMs: NOW_MS, nameNeedle: "cohen" });
+    assert.deepEqual(matchSales(sales, { txn: "txn-100" }).matches.map((s) => s.txn_id), ["txn-100"]);
+    assert.deepEqual(matchSales(sales, { ref: "79RHW4" }).matches.map((s) => s.txn_id), ["txn-100"]);
+    assert.deepEqual(matchSales(sales, { ref: "res-79rhw4" }).matches.map((s) => s.txn_id), ["txn-100"]);
+    assert.deepEqual(matchSales(sales, { last4: "0008" }).matches.map((s) => s.txn_id), ["txn-300"]);
+    assert.deepEqual(matchSales(sales, { name: "Cohen" }).matches.map((s) => s.txn_id), ["txn-100"]);
+    const day = new Date(DAYS(3));
+    const from = new Date(Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate()) - 86400000).toISOString();
+    const to = new Date(Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate()) + 2 * 86400000).toISOString();
+    assert.deepEqual(matchSales(sales, { name: "Cohen", from, to }).matches.map((s) => s.txn_id), ["txn-100"]);
+    assert.equal(matchSales(sales, { name: "Cohen", from: new Date(DAYS(1)).toISOString() }).matches.length, 0);
+    assert.equal(matchSales(sales, { from, to }).error, "identifier_required");
+  });
+
+  it("the name is compared and dropped: never in the answer", () => {
+    const { sales } = salesFromXml(nmiXml(ledger()), { nowMs: NOW_MS, nameNeedle: "cohen" });
+    assert.equal(JSON.stringify(sales).includes("Cohen"), false);
+    assert.equal(JSON.stringify(sales).includes("Moshe"), false);
+  });
+
+  it("POST /sale: ticket kind sale bound to the rep, read only, the name never echoed, 400 with no identifier", async () => {
+    const { fetchImpl, calls, moved } = processorMock();
+    const s = await startDoor(handleSaleLookup, { secret: SECRET, fetchImpl, privateKey: "k", env: CAPS_ON });
     try {
-      let t = mintTicket({ kind: "void", repId: "sruly", bind: "txn-100", secret: SECRET });
-      let p = await post(s.url, VOID_PATH, t.token, { txn_id: "txn-999" });
-      assert.equal(p.status, 401);
-      assert.equal(p.body.error, "ticket_bind_mismatch");
-      t = mintTicket({ kind: "void", repId: "sruly", bind: "txn-100", secret: SECRET });
-      p = await post(s.url, VOID_PATH, t.token, { txn_id: "txn-100" });
+      let t = mintTicket({ kind: "sale", repId: "joseph", bind: "joseph", secret: SECRET });
+      let p = await post(s.url, SALE_PATH, t.token, { rep: "joseph", q: { name: "Cohen" } });
       assert.equal(p.status, 200, p.text);
-      assert.deepEqual(p.body, { ok: true, txn_id: "txn-100", void_txn_id: "txn-100" });
-      assert.match(calls[0].url, /\/api\/v5\/payments\/txn-100\/void$/);
-      assert.deepEqual(calls[0].body, {});
-      const charge = mintTicket({ kind: "charge", repId: "sruly", bind: "txn-100", secret: SECRET });
-      p = await post(s.url, VOID_PATH, charge.token, { txn_id: "txn-100" });
+      assert.equal(p.body.total, 1);
+      assert.equal(p.body.matches[0].txn_id, "txn-100");
+      assert.equal(p.body.matches[0].refundable_cents, 40000);
+      assert.equal(p.body.caps.refund_cap_set, true);
+      assert.equal(p.text.includes("Cohen"), false);
+      assert.equal(calls[0].keyInBody, true);
+      assert.equal(moved().length, 0, "a lookup moves nothing");
+      t = mintTicket({ kind: "sale", repId: "joseph", bind: "joseph", secret: SECRET });
+      p = await post(s.url, SALE_PATH, t.token, { rep: "sruly", q: { txn: "txn-100" } });
+      assert.equal(p.status, 401, "another rep's body is refused");
+      t = mintTicket({ kind: "sale", repId: "joseph", bind: "joseph", secret: SECRET });
+      p = await post(s.url, SALE_PATH, t.token, { rep: "joseph", q: { from: "2026-09-01" } });
+      assert.equal(p.status, 400);
+      assert.equal(p.body.error, "identifier_required");
+      const refundTicket = mintTicket({ kind: "refund", repId: "joseph", bind: "joseph", secret: SECRET });
+      p = await post(s.url, SALE_PATH, refundTicket.token, { rep: "joseph", q: { txn: "txn-100" } });
       assert.equal(p.body.error, "ticket_kind_mismatch");
     } finally {
       await s.close();
     }
-    const bad = gatewayMock({ void: { response: "3", response_code: "300", response_text: "Transaction already settled" } });
-    const s2 = await startDoor(handleVoidRequest, { secret: SECRET, fetchImpl: bad.fetchImpl, privateKey: "k" });
+  });
+});
+
+describe("POST /__nesher_pay/void and /refund", () => {
+  beforeEach(() => { _resetCardRefsForTests(); _resetSaleCache(); });
+
+  it("void: an UNSETTLED sale, whole amount, bound to txn_id, documented empty body; settled or partial refused", async () => {
+    const pm = processorMock();
+    const crm = [];
+    const s = await startDoor(handleVoidRequest, { secret: SECRET, fetchImpl: pm.fetchImpl, privateKey: "k", env: CAPS_ON, recordReversal: async (f) => { crm.push(f); return { ok: true, state: "posted", recorded: ["nmi-void:txn-300: -$80.00 -> hotel request #1422"] }; } });
     try {
-      const t = mintTicket({ kind: "void", repId: "sruly", bind: "txn-100", secret: SECRET });
-      const p = await post(s2.url, VOID_PATH, t.token, { txn_id: "txn-100" });
+      let t = mintTicket({ kind: "void", repId: "joseph", bind: "txn-300", secret: SECRET });
+      let p = await post(s.url, VOID_PATH, t.token, { txn_id: "txn-999", amount_cents: 8000 });
+      assert.equal(p.status, 401);
+      assert.equal(p.body.error, "ticket_bind_mismatch");
+      t = mintTicket({ kind: "void", repId: "joseph", bind: "txn-300", secret: SECRET });
+      p = await post(s.url, VOID_PATH, t.token, { txn_id: "txn-300", amount_cents: 5000 });
+      assert.equal(p.status, 409);
+      assert.equal(p.body.error, "void_is_whole");
+      t = mintTicket({ kind: "void", repId: "joseph", bind: "txn-100", secret: SECRET });
+      p = await post(s.url, VOID_PATH, t.token, { txn_id: "txn-100", amount_cents: 50000 });
+      assert.equal(p.status, 409);
+      assert.equal(p.body.error, "already_settled");
+      assert.equal(pm.moved().length, 0, "nothing moved on a refusal");
+      t = mintTicket({ kind: "void", repId: "joseph", bind: "txn-300", secret: SECRET });
+      p = await post(s.url, VOID_PATH, t.token, { txn_id: "txn-300", amount_cents: 8000, rep: "joseph" });
+      assert.equal(p.status, 200, p.text);
+      assert.equal(p.body.ok, true);
+      assert.equal(p.body.amount_cents, 8000);
+      assert.equal(p.body.merchant, "jrm");
+      assert.equal(p.body.crm.state, "posted");
+      assert.match(pm.moved()[0].url, /\/api\/v5\/payments\/txn-300\/void$/);
+      assert.deepEqual(pm.moved()[0].body, {});
+      assert.equal(crm[0].kind, "void");
+      assert.equal(crm[0].saleTxn, "txn-300");
+      assert.equal(crm[0].rep, "joseph", "who tapped it travels to the CRM row");
+      assert.equal(crm[0].orderId, "JRM-1422-O99");
+    } finally {
+      await s.close();
+    }
+    const bad = processorMock(ledger(), { void: { response: "3", response_code: "300", response_text: "Transaction already settled" } });
+    const s2 = await startDoor(handleVoidRequest, { secret: SECRET, fetchImpl: bad.fetchImpl, privateKey: "k", env: CAPS_ON });
+    try {
+      const t = mintTicket({ kind: "void", repId: "joseph", bind: "txn-300", secret: SECRET });
+      const p = await post(s2.url, VOID_PATH, t.token, { txn_id: "txn-300", amount_cents: 8000 });
       assert.equal(p.status, 402);
       assert.equal(p.body.error, "void_failed");
       assert.equal(p.body.decline_code, "300");
@@ -458,40 +607,104 @@ describe("POST /__nesher_pay/void and /refund", () => {
     }
   });
 
-  it("refund: refused when REFUND_CAP_CENTS is absent, refused above the cap, otherwise posts the amount", async () => {
-    const { fetchImpl, calls } = gatewayMock();
-    const s = await startDoor(handleRefundRequest, { secret: SECRET, fetchImpl, privateKey: "k", env: {} });
+  it("refund: cap absent refuses before any read; above the cap refused; then the processor's own facts rule", async () => {
+    const pm = processorMock();
+    const s = await startDoor(handleRefundRequest, { secret: SECRET, fetchImpl: pm.fetchImpl, privateKey: "k", env: {} });
     try {
-      let t = mintTicket({ kind: "refund", repId: "sruly", bind: "txn-100", secret: SECRET });
-      let p = await post(s.url, REFUND_PATH, t.token, { txn_id: "txn-100", amount_cents: 500 });
+      const t = mintTicket({ kind: "refund", repId: "joseph", bind: "txn-100", secret: SECRET });
+      const p = await post(s.url, REFUND_PATH, t.token, { txn_id: "txn-100", amount_cents: 500 });
       assert.equal(p.status, 403);
       assert.equal(p.body.error, "refund_cap_not_set");
       assert.equal(p.body.cap_cents, 0);
-      assert.equal(calls.length, 0, "no gateway call without a cap");
+      assert.equal(pm.calls.length, 0, "no processor call at all without a cap");
       assert.match(s.logs[0], /"outcome":"refund_refused:cap_not_set"/);
     } finally {
       await s.close();
     }
-    const s2 = await startDoor(handleRefundRequest, { secret: SECRET, fetchImpl, privateKey: "k", env: { REFUND_CAP_CENTS: "100000" } });
+    const crm = [];
+    const s2 = await startDoor(handleRefundRequest, { secret: SECRET, fetchImpl: pm.fetchImpl, privateKey: "k", env: CAPS_ON, recordReversal: async (f) => { crm.push(f); return { ok: true, state: "posted", recorded: ["nmi-refund:txn-900: -$12.34 -> reservation #7"] }; } });
+    const go = async (txn, cents) => post(s2.url, REFUND_PATH, mintTicket({ kind: "refund", repId: "joseph", bind: txn, secret: SECRET }).token, { txn_id: txn, amount_cents: cents, rep: "joseph" });
     try {
-      let t = mintTicket({ kind: "refund", repId: "sruly", bind: "txn-100", secret: SECRET });
-      let p = await post(s2.url, REFUND_PATH, t.token, { txn_id: "txn-100", amount_cents: 100001 });
+      let p = await go("txn-100", 100001);
       assert.equal(p.status, 403);
       assert.equal(p.body.error, "refund_over_cap");
-      assert.equal(p.body.cap_cents, 100000);
-      assert.equal(calls.length, 0);
-      t = mintTicket({ kind: "refund", repId: "sruly", bind: "txn-100", secret: SECRET });
-      p = await post(s2.url, REFUND_PATH, t.token, { txn_id: "txn-100", amount_cents: 1234 });
+      p = await go("txn-100", 40001);
+      assert.equal(p.status, 409);
+      assert.equal(p.body.error, "over_refundable", "$500 sale, $100 already back: $400.01 is refused");
+      assert.equal(p.body.refundable_cents, 40000);
+      p = await go("txn-300", 1000);
+      assert.equal(p.status, 409);
+      assert.equal(p.body.error, "not_settled");
+      assert.match(p.body.decline_reason_human, /Void it instead/);
+      p = await go("txn-400", 1000);
+      assert.equal(p.body.error, "sale_voided");
+      p = await go("txn-500", 100);
+      assert.equal(p.body.error, "fully_refunded");
+      p = await go("txn-777", 100);
+      assert.equal(p.status, 404);
+      assert.equal(p.body.error, "sale_not_found");
+      assert.equal(pm.moved().length, 0, "every refusal above moved nothing");
+      p = await go("txn-100", 1234);
       assert.equal(p.status, 200, p.text);
-      assert.deepEqual(p.body, { ok: true, txn_id: "txn-100", refund_txn_id: "txn-200", amount_cents: 1234 });
-      assert.match(calls[0].url, /\/api\/v5\/payments\/txn-100\/refund$/);
-      assert.deepEqual(calls[0].body, { amount: 12.34 });
-      t = mintTicket({ kind: "refund", repId: "sruly", bind: "txn-100", secret: SECRET });
-      p = await post(s2.url, REFUND_PATH, t.token, { txn_id: "txn-100", amount_cents: 0 });
+      assert.equal(p.body.ok, true);
+      assert.equal(p.body.refund_txn_id, "txn-900");
+      assert.equal(p.body.amount_cents, 1234);
+      assert.equal(p.body.refunded_cents, 11234);
+      assert.equal(p.body.merchant, "nesher");
+      assert.equal(p.body.crm.state, "posted");
+      assert.match(pm.moved()[0].url, /\/api\/v5\/payments\/txn-100\/refund$/);
+      assert.deepEqual(pm.moved()[0].body, { amount: 12.34 });
+      assert.deepEqual({ kind: crm[0].kind, saleTxn: crm[0].saleTxn, reversalTxn: crm[0].reversalTxn, amountUsd: crm[0].amountUsd, rep: crm[0].rep, orderId: crm[0].orderId, cardLast4: crm[0].cardLast4 },
+        { kind: "refund", saleTxn: "txn-100", reversalTxn: "txn-900", amountUsd: 12.34, rep: "joseph", orderId: "RES-79RHW4", cardLast4: "4421" });
+      p = await go("txn-100", 0);
       assert.equal(p.status, 400);
       assert.equal(p.body.error, "amount_cents_invalid");
     } finally {
       await s2.close();
+    }
+  });
+
+  it("refund: the 24-hour cap counts what the processor says went back today, portal refunds included", async () => {
+    const list = ledger();
+    list.push({ id: "txn-600", order: "RES-OTHER1", proc: "mav7067", cond: "complete", actions: [{ type: "sale", amount: "2950.00", at: DAYS(20) }] });
+    list.push({ id: "txn-601", orig: "txn-600", proc: "mav7067", cond: "complete", actions: [{ type: "refund", amount: "-2950.00", at: NOW_MS - 7200000 }] });
+    const pm = processorMock(list);
+    const s = await startDoor(handleRefundRequest, { secret: SECRET, fetchImpl: pm.fetchImpl, privateKey: "k", env: CAPS_ON });
+    try {
+      let p = await post(s.url, REFUND_PATH, mintTicket({ kind: "refund", repId: "joseph", bind: "txn-100", secret: SECRET }).token, { txn_id: "txn-100", amount_cents: 5001 });
+      assert.equal(p.status, 403);
+      assert.equal(p.body.error, "refund_over_day_cap", "$2,950 back today + $50.01 passes $3,000");
+      p = await post(s.url, REFUND_PATH, mintTicket({ kind: "refund", repId: "joseph", bind: "txn-100", secret: SECRET }).token, { txn_id: "txn-100", amount_cents: 5000 });
+      assert.equal(p.status, 200, p.text);
+      assert.equal(p.body.crm.state, "not_recorded", "no CRM door wired in this test: said, never hidden");
+    } finally {
+      await s.close();
+    }
+  });
+
+  it("refund: a processor that cannot be read means nothing is sent back (fail closed)", async () => {
+    const pm = processorMock(ledger(), { queryDown: true });
+    const s = await startDoor(handleRefundRequest, { secret: SECRET, fetchImpl: pm.fetchImpl, privateKey: "k", env: CAPS_ON });
+    try {
+      const p = await post(s.url, REFUND_PATH, mintTicket({ kind: "refund", repId: "joseph", bind: "txn-100", secret: SECRET }).token, { txn_id: "txn-100", amount_cents: 100 });
+      assert.equal(p.status, 502);
+      assert.equal(p.body.error, "sale_unreadable");
+      assert.equal(pm.moved().length, 0);
+    } finally {
+      await s.close();
+    }
+  });
+
+  it("refund: a CRM failure after the money went back is reported, never shown as a failed refund", async () => {
+    const pm = processorMock();
+    const s = await startDoor(handleRefundRequest, { secret: SECRET, fetchImpl: pm.fetchImpl, privateKey: "k", env: CAPS_ON, recordReversal: async () => { throw new Error("db down"); } });
+    try {
+      const p = await post(s.url, REFUND_PATH, mintTicket({ kind: "refund", repId: "joseph", bind: "txn-100", secret: SECRET }).token, { txn_id: "txn-100", amount_cents: 100 });
+      assert.equal(p.status, 200);
+      assert.equal(p.body.ok, true);
+      assert.deepEqual(p.body.crm, { state: "not_recorded", reason: "crm_write_failed" });
+    } finally {
+      await s.close();
     }
   });
 });
