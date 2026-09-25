@@ -289,19 +289,20 @@ export async function loopReview({ pool, limit = 20, now = new Date() }) {
   let ledger;
   try {
     ledger = await pool.query(`SELECT p.transaction_id, p.invoice_number, p.amount_cents, p.currency, p.brand, p.state, p.reason, p.kind,
-        p.created_at, p.updated_at FROM nesher_money_payment_posts p
+        p.paid_at, p.created_at, p.updated_at FROM nesher_money_payment_posts p
       WHERE ((p.state = 'review' OR (p.state = 'shadow' AND p.would_action = 'review')) AND (p.kind = 'refund' OR NOT ${SALE_IN_CRM}))
          OR (p.state = 'pending' AND p.created_at < $1::timestamptz)
       ORDER BY p.created_at DESC`, [new Date(now.getTime() - 30 * 60000).toISOString()]);
   } catch {
     marker = false;
-    ledger = await pool.query(`SELECT transaction_id, invoice_number, amount_cents, currency, brand, state, reason, kind, created_at, updated_at
+    ledger = await pool.query(`SELECT transaction_id, invoice_number, amount_cents, currency, brand, state, reason, kind, paid_at, created_at, updated_at
       FROM nesher_money_payment_posts
       WHERE state = 'review' OR (state = 'shadow' AND would_action = 'review') OR (state = 'pending' AND created_at < $1::timestamptz)
       ORDER BY created_at DESC`, [new Date(now.getTime() - 30 * 60000).toISOString()]);
   }
   for (const r of ledger.rows || []) {
-    rows.push({ at: new Date(r.created_at).toISOString(), brand: r.brand === "jrm" || r.brand === "nesher" ? r.brand : null,
+    // at = when the money moved (the sale), not when the ledger first saw it
+    rows.push({ at: new Date(r.paid_at || r.created_at).toISOString(), brand: r.brand === "jrm" || r.brand === "nesher" ? r.brand : null,
       amount_cents: Number(r.amount_cents), currency: "USD", booking: bookingOf(r.invoice_number),
       reason: r.state === "pending" ? "crm_write_pending" : r.state === "shadow" ? `before_live_${String(r.reason || "review").slice(0, 40)}` : String(r.reason || "review").slice(0, 60),
       words: wordsFor(r.reason, r.state) });
