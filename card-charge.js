@@ -366,8 +366,8 @@ async function saleBeforeReversal(txnId, deps) {
 const DECLINE_WORDS = [
   [/^100$/, "Approved.", "אושר."],
   [/^200$/, "The card was declined by the bank.", "הבנק דחה את הכרטיס."],
-  [/^201$/, "The bank said do not honor this card.", "הבנק הורה לא לכבד את הכרטיס."],
-  [/^202$/, "Insufficient funds.", "אין מספיק יתרה בכרטיס."],
+  [/^201$/, "The bank said do not honor this card.", "הבנק סירב לעסקה (Do not honor)."],
+  [/^202$/, "Insufficient funds.", "אין כיסוי מספיק בכרטיס."],
   [/^203$/, "The card is over its limit.", "הכרטיס חורג מהמסגרת שלו."],
   [/^204$/, "This kind of transaction is not allowed on the card.", "סוג העסקה הזה לא מותר בכרטיס."],
   [/^220$/, "The card details were not accepted.", "פרטי הכרטיס לא התקבלו."],
@@ -378,16 +378,16 @@ const DECLINE_WORDS = [
   [/^225$/, "The security code is wrong.", "קוד האבטחה שגוי."],
   [/^226$/, "The PIN is wrong.", "הקוד הסודי שגוי."],
   [/^240$/, "The bank asks the cardholder to call them.", "הבנק מבקש שבעל הכרטיס יתקשר אליו."],
-  [/^25[0-3]$/, "The issuer flagged this card. Do not retry.", "המנפיק סימן את הכרטיס. אל תנסה שוב."],
+  [/^25[0-3]$/, "The issuer flagged this card. Do not retry.", "המנפיק חסם את הכרטיס. אל תנסה שוב."],
   [/^26[0-4]$/, "Declined. The cardholder should call the bank.", "נדחה. בעל הכרטיס צריך להתקשר לבנק."],
   [/^300$/, "The gateway rejected the transaction.", "מערכת הסליקה דחתה את העסקה."],
-  [/^400$/, "Processor error. Try again in a minute.", "תקלה אצל המעבד. נסה שוב בעוד דקה."],
-  [/^410$/, "The processor refused the merchant account's setup.", "המעבד דחה את הגדרות חשבון הסוחר."],
-  [/^411$/, "The merchant account is inactive at the processor.", "חשבון הסוחר לא פעיל אצל המעבד."],
-  [/^420$/, "Could not reach the processor. Try again.", "לא הצלחנו להגיע למעבד. נסה שוב."],
+  [/^400$/, "Processor error. Try again in a minute.", "תקלה אצל חברת הסליקה. נסה שוב בעוד דקה."],
+  [/^410$/, "The processor refused the merchant account's setup.", "יש תקלה בהגדרות חשבון הסוחר אצל חברת הסליקה."],
+  [/^411$/, "The merchant account is inactive at the processor.", "חשבון הסוחר לא פעיל אצל חברת הסליקה."],
+  [/^420$/, "Could not reach the processor. Try again.", "לא הצלחנו להגיע לחברת הסליקה. נסה שוב."],
   [/^421$/, "Could not reach the card issuer. Try again.", "לא הצלחנו להגיע למנפיק הכרטיס. נסה שוב."],
-  [/^430$/, "The processor saw this as a duplicate.", "המעבד זיהה את זה ככפילות."],
-  [/^44[01]$/, "The transaction details were rejected by the processor.", "המעבד דחה את פרטי העסקה."],
+  [/^430$/, "The processor saw this as a duplicate.", "חברת הסליקה זיהתה את זה ככפילות."],
+  [/^44[01]$/, "The transaction details were rejected by the processor.", "חברת הסליקה דחתה את פרטי העסקה."],
   [/^460$/, "This card type is not supported here.", "סוג הכרטיס הזה לא נתמך כאן."],
   [/^461$/, "This card type is not supported here.", "סוג הכרטיס הזה לא נתמך כאן."],
 ];
@@ -397,7 +397,7 @@ export const KEYS_MISSING_WORDS = {
   reason: "Card processing is not set up on the payment server.",
   next: "Nothing was charged. Charge it in the gateway portal; the payment server is missing its processor key.",
   reasonHe: "סליקת כרטיסים לא מוגדרת בשרת התשלומים.",
-  nextHe: "לא חויב כלום. חייב בפורטל של המעבד; בשרת התשלומים חסר מפתח הסליקה.",
+  nextHe: "לא חויב כלום. חייב בפורטל הסליקה; בשרת התשלומים חסר מפתח הסליקה.",
 };
 
 export function declineHuman(code, fallbackText, o = {}) {
@@ -407,8 +407,8 @@ export function declineHuman(code, fallbackText, o = {}) {
   const t = String(fallbackText || "").trim();
   if (/declin/i.test(t)) return he ? "הכרטיס נדחה." : "The card was declined.";
   if (/expired/i.test(t)) return he ? "תוקף הכרטיס פג." : "The card has expired.";
-  if (/insufficient/i.test(t)) return he ? "אין מספיק יתרה בכרטיס." : "Insufficient funds.";
-  if (/duplicate/i.test(t)) return he ? "המעבד זיהה את זה ככפילות." : "The processor saw this as a duplicate.";
+  if (/insufficient/i.test(t)) return he ? "אין כיסוי מספיק בכרטיס." : "Insufficient funds.";
+  if (/duplicate/i.test(t)) return he ? "חברת הסליקה זיהתה את זה ככפילות." : "The processor saw this as a duplicate.";
   // Mr. AT (25 Sep, the Kaufman charge): a v5 request the gateway refused carries no code and made no
   // transaction - the bank never saw it. Say that, with the gateway's own words when it gave any.
   if (o.refused) return he
@@ -453,10 +453,10 @@ function declineNextHe(c, o) {
   if (/^(20[01]|24\d|26\d)$/.test(c)) return o.kept ? "בקש מהלקוח להתקשר לבנק ולאשר את החיוב, ואז לחץ חייב שוב תוך 5 דקות - או כרטיס אחר." : "בקש מהלקוח להתקשר לבנק ולאשר את החיוב, ואז שלח את הכרטיס שוב - או כרטיס אחר.";
   if (/^(204|223|25\d|46[01])$/.test(c)) return "השתמש בכרטיס אחר.";
   if (/^22[12]$/.test(c)) return "בדוק את מספר הכרטיס ושלח אותו שוב.";
-  if (/^41[01]$/.test(c)) return "לא חויב כלום - חשבון הסוחר צריך תיקון אצל Pinpoint (המעבד), ועד אז שום כרטיס לא יעבור בו. שלח ללקוח קישור להעברה בנקאית במקום.";
-  if (/^430$/.test(c)) return "בדוק אצל המעבד אם החיוב הראשון עבר לפני שמנסים שוב.";
-  if (/^(300|4[0-4]\d)$/.test(c)) return o.kept ? "לא חויב כלום. נסה שוב פעם אחת בעוד דקה; אם זה חוזר, חייב בפורטל של המעבד." : "לא חויב כלום. שלח את הכרטיס שוב בעוד דקה; אם זה חוזר, חייב בפורטל של המעבד.";
-  if (o.refused) return "לא חויב כלום. אם זה בגלל הסכום, שלח ללקוח קישור להעברה בנקאית; את מסגרת הכרטיסים של החשבון מעלה רק Pinpoint (המעבד)." + (o.kept ? " הכרטיס מוחזק עוד 5 דקות." : "");
+  if (/^41[01]$/.test(c)) return "לא חויב כלום - חשבון הסוחר צריך תיקון אצל Pinpoint (חברת הסליקה), ועד אז שום כרטיס לא יעבור בו. שלח ללקוח קישור להעברה בנקאית במקום.";
+  if (/^430$/.test(c)) return "בדוק אצל חברת הסליקה אם החיוב הראשון עבר לפני שמנסים שוב.";
+  if (/^(300|4[0-4]\d)$/.test(c)) return o.kept ? "לא חויב כלום. נסה שוב פעם אחת בעוד דקה; אם זה חוזר, חייב בפורטל הסליקה." : "לא חויב כלום. שלח את הכרטיס שוב בעוד דקה; אם זה חוזר, חייב בפורטל הסליקה.";
+  if (o.refused) return "לא חויב כלום. אם זה בגלל הסכום, שלח ללקוח קישור להעברה בנקאית; את מסגרת הכרטיסים של החשבון מעלה רק Pinpoint (חברת הסליקה)." + (o.kept ? " הכרטיס מוחזק עוד 5 דקות." : "");
   return o.kept ? "לחץ חייב שוב תוך 5 דקות, או כרטיס אחר." : "שלח את הכרטיס שוב, או כרטיס אחר.";
 }
 

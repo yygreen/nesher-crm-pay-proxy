@@ -118,9 +118,15 @@ describe("card-charge basics", () => {
     for (const code of codes) {
       const he = declineHuman(code, null, { lang: "he" });
       assert.match(he, /[א-ת]/, `Hebrew for ${code}`);
-      assert.doesNotMatch(he, /\d|[A-Za-z]/, `no digits or English for ${code}: ${he}`);
+      // (Gabbai C7: 201 keeps the bank's own words in brackets - "Do not honor" - the one Latin phrase allowed.)
+      assert.doesNotMatch(he.replace(" (Do not honor)", ""), /\d|[A-Za-z]/, `no digits or English for ${code}: ${he}`);
+      assert.doesNotMatch(he, /המעבד/, `"חברת הסליקה", never "המעבד" (Gabbai C7): ${he}`);
       assert.notEqual(he, declineHuman(code), `not the English for ${code}`);
     }
+    assert.equal(declineHuman("201", null, { lang: "he" }), "הבנק סירב לעסקה (Do not honor).");
+    assert.equal(declineHuman("202", null, { lang: "he" }), "אין כיסוי מספיק בכרטיס.");
+    assert.equal(declineHuman("251", null, { lang: "he" }), "המנפיק חסם את הכרטיס. אל תנסה שוב.");
+    assert.equal(declineHuman("410", null, { lang: "he" }), "יש תקלה בהגדרות חשבון הסוחר אצל חברת הסליקה.");
     assert.equal(declineHuman("999", "DECLINED BY ISSUER", { lang: "he" }), "הכרטיס נדחה.");
     assert.equal(declineHuman(null, "", { lang: "he" }), "הכרטיס לא חויב.");
     assert.match(declineHuman(null, "", { refused: true, said: "Amount exceeds limit", lang: "he" }), /^מערכת הסליקה דחתה את החיוב עצמו - הוא לא הגיע לבנק\. היא כתבה: "Amount exceeds limit"\.$/);
@@ -139,6 +145,7 @@ describe("card-charge basics", () => {
           assert.doesNotMatch(en, dead, `${code} kept=${kept} refused=${refused}: ${en}`);
           assert.doesNotMatch(he, dead, `${code} kept=${kept} refused=${refused}: ${he}`);
           assert.match(he, /[א-ת]/, `Hebrew next for ${code}`);
+          assert.doesNotMatch(he, /המעבד/, `"חברת הסליקה", never "המעבד" (Gabbai C7): ${he}`);
         }
       }
       assert.doesNotMatch(declineHuman(code), dead, `reason ${code}`);
@@ -423,7 +430,7 @@ describe("POST /__nesher_pay/charge", () => {
       assert.equal(p.body.ok, false);
       assert.equal(p.body.decline_reason_human, "Insufficient funds.");
       // Audit E11 (#62): the same pair in Hebrew rides beside the English.
-      assert.equal(p.body.decline_reason_he, "אין מספיק יתרה בכרטיס.");
+      assert.equal(p.body.decline_reason_he, "אין כיסוי מספיק בכרטיס.");
       assert.match(p.body.decline_next_he, /סכום קטן יותר/);
       assert.equal(p.body.decline_code, "202");
       assert.equal(p.body.decline_text, "DECLINED: INSUFFICIENT FUNDS");
