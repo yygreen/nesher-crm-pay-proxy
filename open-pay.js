@@ -982,7 +982,7 @@ ${officeFields}              if(address1) payload.address1=address1;
                   if(address) address.hidden=true;
                   if(wrap) wrap.hidden=true;
                   if(avs) avs.hidden=true;
-                  var said=${JSON.stringify(OFFICE_DONE_WORDS)};
+                  var said=${JSON.stringify(office ? OFFICE_DONE_WORDS : { none: OFFICE_DONE_WORDS.none })};
                   var bk=(x.j&&typeof x.j.booking==="string")?x.j.booking.replace(/[^A-Za-z0-9-]/g,"").slice(0,40):"";
                   var line=(said[x.j&&x.j.crm]||said.none).replace("{booking}",bk||"the booking");
                   if(form){form.innerHTML="";var p=document.createElement("p");p.className="hint";p.textContent=line;form.appendChild(p);}

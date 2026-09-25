@@ -235,36 +235,46 @@ export async function listPaymentPostExceptions({ pool, limit = 100 }) {
 
 // ── what waits on a person (audit #27, 25 Sep) ─────────────────────────────
 // Plain words per reason: what happened + what to do. Never a card digit, never a customer name.
-const REVIEW_WORDS = {
-  no_crm_reference: "A card payment came in with no booking on it. Find the booking and enter it there.",
-  manual_payment_requires_review: "A card payment matches a payment already typed on the booking. Check it is not the same money before entering anything.",
-  sale_voided: "A card sale was voided at the processor. Check the booking does not show it as paid.",
-  sale_voided_before_posting: "A card sale was voided before it reached the CRM. Nothing to enter; check the booking shows it unpaid.",
-  reversal_requires_review: "Money went back to a card outside the desk chat. Take it off the booking it belongs to.",
-  refund_outside_chat: "A refund was sent in the processor's portal for a sale the CRM does not show as recorded. Take it off the booking it belongs to.",
-  reversal_retry_requires_review: "A refund or void could not be written to the CRM. Take it off the booking by hand.",
-  sale_not_in_crm: "A refund or void is for a sale the CRM never recorded. Check the booking and adjust it by hand.",
-  sale_on_two_crm_rows: "A refund or void matches two payment rows. Take it off the right one by hand.",
-  crm_write_keeps_failing: "The CRM kept refusing this card payment. Enter it on the booking by hand.",
-  hand_row_after_auto_post: "A card payment the CRM recorded automatically was also typed in by hand. Delete the hand-typed copy.",
-  mercury_same_amount_clash: "A Mercury pay-link payment matches a payment already typed on the booking. Check it is not the same money before entering anything.",
-  flight_link_not_wired: "A flight pay link was paid. Enter the payment on the flight request.",
-  brand_mismatch: "A card payment ran on the wrong company's merchant. Check which booking it belongs to.",
-  invoice_amount_mismatch: "A pay link was paid a different amount than it asked for. Check the booking and enter what came in.",
-  invoice_transaction_conflict: "A pay link was paid twice. Check the booking and refund the extra charge if it is one.",
-  legacy_transaction_conflict: "A card payment is already on another booking. Check which one is right.",
-  hotel_offer_mismatch: "A card payment names a hotel offer from another request. Check which request it belongs to.",
-  pending: "A card payment is still being written to the CRM. If it is still here in an hour, enter it by hand.",
-  shadow: "A card payment from before the automatic recording has no booking in the CRM. Check whether it was typed in by hand; if not, enter it.",
-};
-function wordsFor(reason, state) {
+// Gabbai 25 Sep D2: every line that tells a person to enter, take off or delete something says to CHECK
+// first - the loop cannot see what staff already did by hand. Pinned by a table scan in the tests.
+export const REVIEW_WORDS = Object.freeze({
+  no_crm_reference: "A card payment came in with no booking on it. Find its booking and enter it there, if it is not already there.",
+  booking_not_found: "A card payment names a booking the CRM cannot find. Find the right booking and enter it there, if it is not already there.",
+  request_not_found: "A card payment names a hotel request the CRM cannot find. Find the right request and enter it there, if it is not already there.",
+  manual_payment_requires_review: "A card payment matches a payment already typed on the booking. If it is the same money, nothing to enter; if it is not, enter it.",
+  sale_voided: "A card sale was voided at the processor, so no money came in. If the booking shows it as paid, take it off.",
+  sale_voided_before_posting: "A card sale was voided before it reached the CRM, so no money came in. Nothing to enter; if the booking shows it as paid, take it off.",
+  refund_voided: "A refund was started and then voided at the processor, so no money moved. Nothing to change.",
+  reversal_requires_review: "Money went back to a card outside the desk chat. If the booking still shows that money as paid, take it off.",
+  refund_outside_chat: "A refund was sent in the processor's portal for a sale the CRM did not record automatically. If the booking still shows the full amount, take the refund off it.",
+  reversal_retry_requires_review: "A refund or void could not be written to the CRM. If the booking does not show it yet, take it off by hand.",
+  sale_not_in_crm: "A refund or void is for a sale the CRM did not record automatically. If the booking shows that sale, adjust it by hand.",
+  sale_on_two_crm_rows: "A refund or void matches two payment rows. Check which one it belongs to, and if it is not already off, take it off that one only.",
+  crm_write_keeps_failing: "The CRM kept refusing this card payment. If the booking does not show it, enter it by hand.",
+  hand_row_after_auto_post: "A card payment the CRM recorded automatically also has a hand-typed payment of the same amount. If it is the same money, delete the hand-typed copy.",
+  flight_link_not_wired: "A flight pay link was paid. If the flight request does not show it, enter it there.",
+  brand_mismatch: "A card payment ran on the other company's merchant. Check which booking it belongs to, and enter it there if it is not already there.",
+  invoice_amount_mismatch: "A pay link was paid a different amount than it asked for. If the booking does not show what came in, enter it.",
+  invoice_transaction_conflict: "A pay link shows two card payments. Check the booking; if the second one is a duplicate charge, it needs a refund.",
+  legacy_transaction_conflict: "This card payment is already recorded on another booking. Do not enter it twice; check which booking is right.",
+  hotel_offer_mismatch: "A card payment names a hotel offer from another request. Check which request it belongs to, and enter it there if it is not already there.",
+  transaction_conflict: "The same card transaction came in with different facts. Check the booking before entering anything.",
+  review: "A card payment could not be recorded in the CRM by itself. Check the booking, and enter it if it is not already there.",
+  crm_write_pending: "A card payment is still being written to the CRM automatically. Do not enter it by hand while it shows here.",
+  before_live: "A card payment from before the automatic recording has no booking in the CRM. Check whether it was typed in by hand; if not, enter it.",
+});
+// Gabbai 25 Sep D1: loop-review `reason` is a code from a closed set, never ledger free text.
+export function reasonCode(reason) {
   const r = String(reason || "");
-  if (state === "pending") return REVIEW_WORDS.pending;
-  if (state === "shadow" && (r === "no_crm_reference" || !r)) return REVIEW_WORDS.shadow;
-  if (REVIEW_WORDS[r]) return REVIEW_WORDS[r];
-  if (/reservations match code/.test(r)) return "A card payment names a booking the CRM cannot find. Find the booking and enter it there.";
-  if (/not found/.test(r)) return "A card payment names a hotel request the CRM cannot find. Find the request and enter it there.";
-  return "A card payment could not be recorded in the CRM by itself. Check the booking and enter it by hand.";
+  if (/reservations match code/.test(r)) return "booking_not_found";
+  if (/not found/.test(r)) return "request_not_found";
+  if (Object.prototype.hasOwnProperty.call(REVIEW_WORDS, r)) return r;
+  return "review";
+}
+function wordsFor(code, state) {
+  if (state === "pending") return REVIEW_WORDS.crm_write_pending;
+  if (state === "shadow" && (code === "no_crm_reference" || code === "review")) return REVIEW_WORDS.before_live;
+  return REVIEW_WORDS[code] || REVIEW_WORDS.review;
 }
 function bookingOf(ref) {
   const s = String(ref || "").trim().toUpperCase();
@@ -304,8 +314,8 @@ export async function loopReview({ pool, limit = 20, now = new Date() }) {
     // at = when the money moved (the sale), not when the ledger first saw it
     rows.push({ at: new Date(r.paid_at || r.created_at).toISOString(), brand: r.brand === "jrm" || r.brand === "nesher" ? r.brand : null,
       amount_cents: Number(r.amount_cents), currency: "USD", booking: bookingOf(r.invoice_number),
-      reason: r.state === "pending" ? "crm_write_pending" : r.state === "shadow" ? `before_live_${String(r.reason || "review").slice(0, 40)}` : String(r.reason || "review").slice(0, 60),
-      words: wordsFor(r.reason, r.state) });
+      reason: r.state === "pending" ? "crm_write_pending" : r.state === "shadow" ? `before_live_${reasonCode(r.reason)}` : reasonCode(r.reason),
+      words: wordsFor(reasonCode(r.reason), r.state) });
   }
   if (marker) {
     try {

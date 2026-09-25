@@ -136,14 +136,13 @@ async function recordHotelPayment(pool, inv, target, out, channel = "mercury", {
   const manual = await pool.query(
     `SELECT id FROM core_jrmhotelpayment
      WHERE request_id = $1 AND ABS(amount - $2) < 0.01
-       ${strict || channel === "mercury" ? "AND COALESCE(reference, '') !~ '(mercury|nmi):[A-Za-z0-9_-]+'" : ""} LIMIT 1`,
+       ${strict ? "AND COALESCE(reference, '') !~ '(mercury|nmi):[A-Za-z0-9_-]+'" : ""} LIMIT 1`,
     [target.requestId, amount]
   );
   if (manual.rows.length) {
     out.skipped.push(
       `${inv.invoiceNumber}: same-amount payment already on request #${target.requestId} (manual?) — not duplicated`
     );
-    if (channel === "mercury" && Array.isArray(out.clashes)) out.clashes.push(inv);
     return;
   }
   // Offer sanity: only attach offer_id when it belongs to this request
@@ -224,20 +223,19 @@ async function recordReservationPayment(pool, inv, target, out, channel = "mercu
     } else out.skipped.push(`${inv.invoiceNumber}: already synced`);
     return;
   }
-  // Audit #76 (25 Sep): the Mercury path's "manual?" check used to match the collection loop's OWN
-  // card row (nmi:<txn>), so a customer paying half by card and the equal other half by pay link had
-  // the second half silently dropped. A row carrying a machine marker is not a hand entry.
+  // The Mercury path's same-amount check COUNTS machine-marker rows (nmi:, mercury:) as already there:
+  // that is what makes "mark the Mercury invoice PAID, never cancel" safe - the invoice the office marks
+  // PAID after a card payment is not posted a second time (Gabbai 25 Sep B1; audit #76 stays open).
   const manual = await pool.query(
     `SELECT id FROM core_payment
      WHERE reservation_id = $1 AND ABS(amount - $2) < 0.01
-       ${strict || channel === "mercury" ? "AND COALESCE(notes, '') !~ '(mercury|nmi):[A-Za-z0-9_-]+'" : ""} LIMIT 1`,
+       ${strict ? "AND COALESCE(notes, '') !~ '(mercury|nmi):[A-Za-z0-9_-]+'" : ""} LIMIT 1`,
     [reservationId, amount]
   );
   if (manual.rows.length) {
     out.skipped.push(
       `${inv.invoiceNumber}: same-amount payment already on reservation #${reservationId} (manual?) — not duplicated`
     );
-    if (channel === "mercury" && Array.isArray(out.clashes)) out.clashes.push(inv);
     return;
   }
   const client = inTransaction ? pool : await pool.connect();
@@ -366,18 +364,23 @@ export async function recordNmiPaidInvoice({
   return out;
 }
 
-const NOTE_REASON_WORDS = {
-  manual_payment_requires_review: "a payment of the same amount is already typed on this booking",
-  invoice_transaction_conflict: "the pay link was already paid by another card transaction",
-  invoice_amount_mismatch: "the amount differs from what the pay link asked for",
-  legacy_transaction_conflict: "the same card transaction is already on another booking",
-  hotel_offer_mismatch: "the hotel offer belongs to another request",
-};
+// Gabbai 25 Sep D2: the note's instruction CHECKS first, and money already on another booking is never
+// "entered" again. Pinned by the table scan in test/money-loop.test.js.
+export const NOTE_REASON_WORDS = Object.freeze({
+  manual_payment_requires_review: "received and NOT recorded automatically: a payment of the same amount is already typed on this booking. If that is this card payment, nothing to enter; if it is not, enter it.",
+  invoice_transaction_conflict: "received and NOT recorded automatically: the pay link was already paid by another card transaction. Check the booking; if this is a duplicate charge, it needs a refund.",
+  invoice_amount_mismatch: "received and NOT recorded automatically: the amount differs from what the pay link asked for. If the booking does not show what came in, enter it.",
+  legacy_transaction_conflict: "is already recorded on another booking in the CRM, so it was NOT added here. Do not enter it twice; check which booking is right.",
+  hotel_offer_mismatch: "received and NOT recorded automatically: the hotel offer belongs to another request. Check which request it belongs to, and enter it there if it is not already there.",
+  other: "received and NOT recorded automatically: the CRM could not match it by itself. If the booking does not show it, enter it.",
+});
+export function reviewNoteText(amountUsd, txn, reason) {
+  const said = NOTE_REASON_WORDS[String(reason || "")] || NOTE_REASON_WORDS.other;
+  return `Card payment $${Number(amountUsd).toFixed(2)} USD (NMI txn ${txn}) ${said}`;
+}
 /** The staff note for a live sale the loop could not record. Only when the booking is found. */
 async function writeReviewNote(pool, { target, inv }, reason) {
-  const why = NOTE_REASON_WORDS[String(reason || "")] || "the CRM could not match it by itself";
-  const amt = Number(inv.amount).toFixed(2);
-  const note = `Card payment $${amt} USD (NMI txn ${inv.id}) received and NOT recorded: ${why}. Check and enter it if it is not already here.`;
+  const note = reviewNoteText(inv.amount, inv.id, reason);
   if (target.kind === "hotel") {
     const req = await pool.query(`SELECT id FROM core_jrmhotelrequest WHERE id = $1`, [target.requestId]);
     if (!req.rows.length) return false;
@@ -572,7 +575,8 @@ export async function recordSweepReversal({ pool, ...ev } = {}) {
   return recordNmiException({ pool, ...ev,
     invoiceNumber: sale?.invoice_number || (orig ? `NMI-${orig}` : ev.invoiceNumber),
     brand: sale?.brand || ev.brand,
-    reason: orig && !ev.refundVoided ? "refund_outside_chat" : "reversal_requires_review" });
+    // Gabbai 25 Sep D2: a refund voided at the processor moved no money - its own reason, "nothing to change".
+    reason: ev.refundVoided ? "refund_voided" : orig ? "refund_outside_chat" : "reversal_requires_review" });
 }
 
 /** LIVE mode exception door (never a CRM write). */
@@ -628,7 +632,6 @@ export async function syncPaidInvoices({ token, pool, fetchImpl, listInvoices })
   );
   out.checked = paid.length;
 
-  const clashes = [];
   for (const inv of paid) {
     try {
       if (!(Number(inv.amount) > 0)) {
@@ -644,24 +647,14 @@ export async function syncPaidInvoices({ token, pool, fetchImpl, listInvoices })
         }
         continue;
       }
-      const sink = { ...out, clashes };
       if (target.kind === "hotel") {
-        await recordHotelPayment(pool, inv, target, sink);
+        await recordHotelPayment(pool, inv, target, out);
       } else {
-        await recordReservationPayment(pool, inv, target, sink);
+        await recordReservationPayment(pool, inv, target, out);
       }
     } catch (e) {
       out.errors.push(`${inv.invoiceNumber}: ${e.message}`);
     }
-  }
-  // Audit #76: a real same-amount clash is a person's call, not a silent skip. Only for a payment made
-  // in the last 3 days, so the historical invoices staff typed in long ago never flood the list.
-  for (const inv of clashes) {
-    try {
-      if (Date.now() - paidAtOf(inv).getTime() > 3 * 86400000) continue;
-      const t = parseInvoiceNumber(inv.invoiceNumber);
-      await keepMercuryForReview(pool, inv, t && t.kind === "hotel" ? "jrm" : "nesher", "mercury_same_amount_clash");
-    } catch { /* the skip line above already reports it */ }
   }
   return out;
 }

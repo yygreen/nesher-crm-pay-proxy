@@ -2005,15 +2005,6 @@ let nmiRecoveryBusy = false;
 let nmiRecoveryGoodAt = null;
 let nmiRecoveryErrorAt = null;
 
-// Audit #145: a pay link held as "confirming" (the gateway answer was lost) is marked paid once the
-// sweep has the processor's approved sale for it: same order id, same amount, exactly one such link.
-async function settleConfirmingLink(ev) {
-  const rows = await findInvoicesByOrderId(ev.invoiceNumber);
-  const hits = (rows || []).filter((r) => r.payload && r.payload.confirming === true && !String(r.payload.transactionId || "")
-    && Math.abs(Number(r.payload.amountUsd) - Number(ev.amountUsd)) < 0.005);
-  if (hits.length !== 1) return { ok: false, skipped: hits.length ? "ambiguous" : "none" };
-  return markInvoicePaid(hits[0].id, { paidAt: ev.paidAt, transactionId: ev.transactionId });
-}
 async function runNmiRecoverySweep(days) {
   if (nmiRecoveryBusy) return;
   nmiRecoveryBusy = true;
@@ -2021,7 +2012,6 @@ async function runNmiRecoverySweep(days) {
     const doors = moneyDoors("recovery");
     const out = await runNmiRecovery({
       reverse: doors.reverseFromSweep,
-      settled: POSTING_MODE === "live" ? settleConfirmingLink : undefined,
       host: process.env.NMI_HOST || "https://pinpointpayments.transactiongateway.com",
       securityKey: process.env.NMI_PRIVATE_KEY || "",
       days,

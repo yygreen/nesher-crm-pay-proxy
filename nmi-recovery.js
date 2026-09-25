@@ -143,7 +143,7 @@ export function recoveryDecision(e) {
  * One sweep. `observe(ev)` (shadow) or `post(ev)` / `except(ev)` (live) are
  * injected by the server. Returns counts only.
  */
-export async function runNmiRecovery({ host, securityKey, days = 3, now = new Date(), fetchImpl, mode = "shadow", observe, post, except, reverse, settled }) {
+export async function runNmiRecovery({ host, securityKey, days = 3, now = new Date(), fetchImpl, mode = "shadow", observe, post, except, reverse }) {
   const until = new Date(now.getTime());
   const since = new Date(now.getTime() - Math.max(1, Math.min(60, Number(days) || 3)) * 86400000);
   const xml = await queryNmiRange({ host, securityKey, since, until, fetchImpl });
@@ -197,8 +197,6 @@ export async function runNmiRecovery({ host, securityKey, days = 3, now = new Da
         if (decision.action === "post" && r?.ok) {
           out.posted++;
           if (r.recorded?.length) out.fresh.posted++;
-          // Audit #145: a pay link stuck on "confirming" is cleared once its sale is in the CRM.
-          if (typeof settled === "function") { try { await settled(ev); } catch { /* the link stays as it was */ } }
         } else if (r?.durable || r?.needsReview) {
           out.exceptions++;
           if (r?.inserted || r?.newlyReviewed) out.fresh.exceptions++;

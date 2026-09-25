@@ -123,7 +123,7 @@ describe("money-hop route", () => {
     } finally { await t.close(); }
   });
 
-  it("forwards only the seven GETs (plan 17.4 added /invoices, F6 /money-map); anything else is 405 not_forwardable and never becomes a job", async () => {
+  it("forwards only the listed GETs (plan 17.4 added /invoices, F6 /money-map, AQ /crm-search, 25 Sep /loop-review); anything else is 405 not_forwardable and never becomes a job", async () => {
     const t = await rig();
     try {
       assert.deepEqual(MONEY_HOP_FORWARDABLE, ["/health", "/balances", "/transactions", "/caps", "/state", "/invoices", "/money-map", "/crm-search", "/loop-review"]);

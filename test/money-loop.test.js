@@ -1,5 +1,6 @@
-// The collection loop after the Mr Money audit of 25 Sep (loop findings #26 #28 #73 #74 #75 #76 #140
-// #141 #142 #144 #145, the loop-review list for #27, and the security scrub #44). Written RED FIRST
+// The collection loop after the Mr Money audit of 25 Sep (loop findings #26 #28 #73 #74 #75 #140 #141
+// #142 #144, the loop-review list for #27, and the security scrub #44; #76 and #145 were taken back out
+// on the Gabbai's 25 Sep verdict (B1, D4) and stay open). Written RED FIRST
 // against live 0e14f81 (build 2026-09-25-paddle-reader), from the auditor's own reproductions
 // (audit-mr-money/loop/pp/audit/loop-audit.test.js). FAKE data only: an in-memory PGlite CRM and a fake
 // NMI query.php. No network, no real CRM, no gateway call.
@@ -13,12 +14,14 @@ import {
   recordSweepReversal,
   shadowNmiPayment,
   syncPaidInvoices,
+  NOTE_REASON_WORDS,
+  reviewNoteText,
 } from "../payments-sync.js";
-import { retryPaymentPosts, listPaymentPostExceptions, loopReview, MAX_POST_ATTEMPTS } from "../payment-posts.js";
+import { retryPaymentPosts, listPaymentPostExceptions, loopReview, MAX_POST_ATTEMPTS, REVIEW_WORDS, reasonCode } from "../payment-posts.js";
 import { runNmiRecovery, sweepDays, parseNmiQueryXml } from "../nmi-recovery.js";
 import { applyNmiSaleSuccess, parseNmiWebhook } from "../nmi-webhook.js";
 import { scrubDigits } from "../mercury-gateway.js";
-import { officeCrmState, OFFICE_DONE_WORDS } from "../open-pay.js";
+import { officeCrmState, OFFICE_DONE_WORDS, renderOpenPayHtml, renderOfficePayHtml } from "../open-pay.js";
 
 class PGlitePool {
   constructor(db) { this.db = db; this.waiters = []; this.busy = false; }
@@ -252,18 +255,26 @@ describe("#75 a live sale that goes to review", () => {
   });
 });
 
-describe("#76 card first, then the same amount through a Mercury pay link", () => {
-  it("records both halves", async () => {
-    await recordNmiPaidInvoice({ pool, invoiceNumber: "RES-ABC123", amountUsd: 750, transactionId: "t-s8", paidAt: new Date(NOW - 86400e3).toISOString(), path: "guest" });
-    const out = await syncPaidInvoices({ pool, listInvoices: async () => [{ id: "merc-inv-1", invoiceNumber: "RES-ABC123", status: "Paid", amount: 750, creditCardEnabled: false, achDebitEnabled: true }] });
-    assert.equal(out.recorded.length, 1, JSON.stringify(out));
-    assert.equal(await paid(7), 1500);
-  });
-  it("a recent real same-amount clash with a hand row goes to review, not a silent skip", async () => {
-    await handRow(750, 7);
-    const out = await syncPaidInvoices({ pool, listInvoices: async () => [{ id: "merc-inv-9", invoiceNumber: "RES-ABC123", status: "Paid", amount: 750, paidAt: new Date().toISOString() }] });
-    assert.equal(out.recorded.length, 0);
-    assert.equal((await one("SELECT state, reason FROM nesher_money_payment_posts WHERE transaction_id = 'mercury_merc-inv-9'")).reason, "mercury_same_amount_clash");
+describe("B1 (Gabbai 25 Sep): the office follows the note and marks the Mercury invoice PAID after a card payment", () => {
+  // The Gabbai's probe (scratchpad/gabbai-probe/double.mjs) as a test: red on d2cb975 (audit #76 had loosened
+  // the Mercury path's same-amount check), green once #76 is reverted. #76 stays open (s.8).
+  it("the same money is written ONCE, for a reservation and for a hotel request", async () => {
+    await pool.query(`CREATE TABLE nesher_pay_invoices (id TEXT PRIMARY KEY, payload JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), expires_at TIMESTAMPTZ NOT NULL)`);
+    await pool.query(`INSERT INTO nesher_pay_invoices (id, payload, expires_at) VALUES ('abcd2345', $1::jsonb, NOW() + INTERVAL '30 days')`,
+      [JSON.stringify({ invoiceNumber: "RES-ABC123", mercuryUrl: "https://app.mercury.com/pay/x", amountUsd: 750, transactionId: "t-card", paidAt: new Date().toISOString() })]);
+    await pool.query(`INSERT INTO nesher_pay_invoices (id, payload, expires_at) VALUES ('efgh6789', $1::jsonb, NOW() + INTERVAL '30 days')`,
+      [JSON.stringify({ invoiceNumber: "JRM-142-O99", mercuryUrl: "https://app.mercury.com/pay/y", amountUsd: 400, transactionId: "t-card-h", paidAt: new Date().toISOString() })]);
+    assert.equal((await recordNmiPaidInvoice({ pool, invoiceNumber: "RES-ABC123", amountUsd: 750, transactionId: "t-card", paidAt: new Date().toISOString(), path: "guest" })).ok, true);
+    assert.equal((await recordNmiPaidInvoice({ pool, invoiceNumber: "JRM-142-O99", amountUsd: 400, transactionId: "t-card-h", paidAt: new Date().toISOString(), path: "guest" })).ok, true);
+    assert.match((await one("SELECT notes FROM core_reservation WHERE id = 7")).notes, /Mark the Mercury invoice PAID/);
+    const out = await syncPaidInvoices({ pool, listInvoices: async () => [
+      { id: "merc-inv-1", invoiceNumber: "RES-ABC123", status: "Paid", amount: 750, paidAt: new Date().toISOString() },
+      { id: "merc-inv-2", invoiceNumber: "JRM-142-O99", status: "Paid", amount: 400, paidAt: new Date().toISOString() },
+    ] });
+    assert.equal(out.recorded.length, 0, JSON.stringify(out));
+    assert.equal(await paid(7), 750, "one real payment of $750");
+    assert.equal((await all("SELECT id FROM core_payment WHERE reservation_id = 7")).length, 1);
+    assert.equal((await all("SELECT id FROM core_jrmhotelpayment WHERE request_id = 42")).length, 1);
   });
   it("#144 a paid FLY- flight link is kept for review", async () => {
     await syncPaidInvoices({ pool, listInvoices: async () => [{ id: "merc-fly-1", invoiceNumber: "FLY-1055-R7", status: "Paid", amount: 300, paidAt: new Date().toISOString() }] });
@@ -317,11 +328,42 @@ describe("#142 the sweep's counters and look-back", () => {
   });
 });
 
-describe("#145 a pay link stuck on confirming", () => {
-  it("is cleared when the sweep records its sale", async () => {
-    const settled = [];
-    await sweep([{ id: "t-c1", order: "RES-ABC123", actions: [{ type: "sale", amount: "90.00", at: NOW }] }], { settled: async (ev) => { settled.push(ev.transactionId + ":" + ev.amountUsd + ":" + ev.invoiceNumber); } });
-    assert.deepEqual(settled, ["t-c1:90:RES-ABC123"]);
+describe("Gabbai 25 Sep D1/D2: codes and words", () => {
+  it("every loop-review reason is a code from a closed set, including the ledger's free-text reasons", async () => {
+    for (const [txn, reason] of [["t-r1", "RES-ZZZ999: 0 reservations match code ZZZ999 — not recorded"], ["t-r2", "JRM-1999: hotel request #999 not found"], ["t-r3", "something new and odd"], ["t-r4", "legacy_transaction_conflict"]]) {
+      await recordNmiException({ pool, invoiceNumber: "RES-ABC123", amountUsd: 12, transactionId: txn, paidAt: new Date(NOW).toISOString(), brand: "nesher", reason, path: "recovery" });
+    }
+    await shadowNmiPayment({ pool, invoiceNumber: "OPEN-1", amountUsd: 5, transactionId: "t-r5", paidAt: new Date(NOW).toISOString(), brand: "nesher", path: "open", decision: { action: "exception", reason: "no_crm_reference" } });
+    const r = await loopReview({ pool, now: new Date() });
+    assert.equal(r.count, 5);
+    for (const i of r.items) assert.match(i.reason, /^[a-z_]{1,60}$/, i.reason);
+    assert.deepEqual(r.items.map((i) => i.reason).sort(), ["before_live_no_crm_reference", "booking_not_found", "legacy_transaction_conflict", "request_not_found", "review"]);
+    assert.equal(reasonCode("RES-X: 2 reservations match code X — not recorded"), "booking_not_found");
+  });
+  it("every line that tells a person to enter, take off, delete or adjust says to check first", () => {
+    const acts = /\b(enter|take (it|the refund|that money)? ?off|delete|adjust)\b/i;
+    const checks = /\bif\b|Do not enter/i;
+    const lines = [...Object.entries(REVIEW_WORDS), ...Object.entries(NOTE_REASON_WORDS).map(([k, v]) => ["note:" + k, reviewNoteText(10, "t", k)])];
+    for (const [k, v] of lines) if (acts.test(v)) assert.match(v, checks, k);
+    assert.match(REVIEW_WORDS.refund_voided, /no money moved/);
+    assert.match(REVIEW_WORDS.legacy_transaction_conflict, /already recorded on another booking\. Do not enter it twice/);
+    assert.match(reviewNoteText(10, "t", "legacy_transaction_conflict"), /already recorded on another booking.*Do not enter it twice/);
+  });
+  it("a refund voided at the processor is its own reason: no money moved", async () => {
+    await sweep([{ id: "t-rv", order: "", orig: "t-sale-x", cond: "canceled", actions: [{ type: "refund", amount: "-20.00", at: NOW - 3600e3 }, { type: "void", amount: "-20.00", at: NOW - 60e3 }] }]);
+    assert.equal((await one("SELECT reason FROM nesher_money_payment_posts WHERE transaction_id = 't-rv'")).reason, "refund_voided");
+  });
+});
+
+describe("Gabbai 25 Sep C2: the public pay page carries no office words", () => {
+  it("the /pay/open source never says NOT recorded or in the CRM; the office page does", () => {
+    for (const brandId of ["nesher", "jrm"]) {
+      const html = renderOpenPayHtml({ collectPublicKey: "k", brandId });
+      assert.doesNotMatch(html, /NOT recorded/);
+      assert.doesNotMatch(html, /in the CRM/);
+      assert.match(html, /Card payment received\. Thank you\./);
+    }
+    assert.match(renderOfficePayHtml({ collectPublicKey: "k" }), /NOT recorded in the CRM automatically/);
   });
 });
 
