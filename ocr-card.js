@@ -1812,7 +1812,11 @@ async function recognizeCardOnce(input, opts) {
       expiry = expiry || got.expiry;
       name = got.name;
     }
-    const last4 = partialLast4();
+    // Gabbai C1 (25 Sep): on a card whose number cut was faint, a refusal gives no "ends in" and no expiry -
+    // they would come from the same reads the faint-cut guard has just refused. The name may stay.
+    const faintCard = faintFirst || Boolean(best && [0, 1].some((fl) => faintKeys.has(`${best.rot}:${Math.round(best.line.top)}:${fl}`)));
+    const last4 = faintCard ? null : partialLast4();
+    if (faintCard) expiry = null;
     const partial = last4 || expiry || name ? { last4, expiry, name } : null;
     let problem = "unclear";
     const whole = regionStats({ data: built.gray, width: built.width, height: built.height });
