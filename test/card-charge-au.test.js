@@ -55,7 +55,7 @@ describe("Mr. AU - the chat sale's own time limit (audit C2)", () => {
     const door = await startDoor({ fetchImpl: gw.fetchImpl, saleTimeoutMs: 60 });
     try {
       const t0 = Date.now();
-      const p = await charge(door, { token_ref: newRef(), amount_cents: 1566700, currency: "USD", brand: "nesher", rep: "joseph", customer_name: "Shloma Kaufman", arming: "mcaaaa1111" });
+      const p = await charge(door, { token_ref: newRef(), amount_cents: 1566700, currency: "USD", brand: "nesher", rep: "joseph", customer_name: "Testa Guestman", arming: "mcaaaa1111" });
       const ms = Date.now() - t0;
       assert.equal(p.status, 503, JSON.stringify(p.body));
       assert.equal(p.body.error, "outcome_unknown");
@@ -118,10 +118,10 @@ describe("Mr. AU - one card and amount while unresolved, and the 30-minute dupli
     const gw = gateway(() => { throw new Error("socket hang up"); });
     const door = await startDoor({ fetchImpl: gw.fetchImpl });
     try {
-      const a = await charge(door, { token_ref: newRef(), amount_cents: 1566700, currency: "USD", brand: "nesher", rep: "joseph", customer_name: "Kaufman", arming: "mctileaaaa", last4: "1486" });
+      const a = await charge(door, { token_ref: newRef(), amount_cents: 1566700, currency: "USD", brand: "nesher", rep: "joseph", customer_name: "Guestman", arming: "mctileaaaa", last4: "1486" });
       assert.equal(a.status, 503);
       const refB = newRef();
-      const b = await charge(door, { token_ref: refB, amount_cents: 1566700, currency: "USD", brand: "nesher", rep: "joseph", customer_name: "Kaufman", arming: "mctilebbbb", last4: "1486" });
+      const b = await charge(door, { token_ref: refB, amount_cents: 1566700, currency: "USD", brand: "nesher", rep: "joseph", customer_name: "Guestman", arming: "mctilebbbb", last4: "1486" });
       assert.equal(b.status, 409, JSON.stringify(b.body));
       assert.equal(b.body.error, "card_unresolved");
       assert.equal(gw.calls.length, 1, "no second sale");
@@ -153,18 +153,18 @@ describe("Mr. AU - the booking reaches the processor (audit H3)", () => {
   beforeEach(() => { _resetCardRefsForTests(); _resetArmingsForTests(); });
 
   for (const [brand, ref, want] of [
-    ["nesher", "RES-8SU7MW", "RES-8SU7MW"],
+    ["nesher", "RES-ZZ9TST", "RES-ZZ9TST"],
     ["jrm", "JRM-11325", "JRM-11325"],
     ["jrm", "JRM-189-O50", "JRM-189-O50"],
     ["nesher", "JRM-11325", null],
-    ["jrm", "RES-8SU7MW", null],
-    ["nesher", "8SU7MW; DROP", null],
+    ["jrm", "RES-ZZ9TST", null],
+    ["nesher", "ZZ9TST; DROP", null],
   ]) {
     it(`${brand} + invoice_ref ${JSON.stringify(ref)} -> order id ${want || "the random CARD ref"}`, async () => {
       const gw = gateway(() => approve("txn-9"));
       const door = await startDoor({ fetchImpl: gw.fetchImpl });
       try {
-        const p = await charge(door, { token_ref: newRef(), amount_cents: 10000, currency: "USD", brand, rep: "joseph", customer_name: "Kaufman", invoice_ref: ref });
+        const p = await charge(door, { token_ref: newRef(), amount_cents: 10000, currency: "USD", brand, rep: "joseph", customer_name: "Guestman", invoice_ref: ref });
         assert.equal(p.status, 200);
         const id = gw.calls[0].order_details.id;
         if (want) {
