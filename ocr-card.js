@@ -1125,10 +1125,52 @@ export const LC_MIN_AGREE = 3;
 export const LC_MIN_AGREE_SEEN = 2;
 /** The ladder is skipped when less than this is left of the read's time (it costs about a second). */
 export const LC_MIN_BUDGET_MS = 1500;
-/** A cut whose 5th..95th percentile spread is under this is faint (white on white measured 18-49, printed cards 70+). */
-export const LC_FAINT_RANGE = 60;
+/** A cut whose 5th..95th percentile spread is under this is faint (white cards measured 12-62; printed cards 71+, one dim 31, one pencil 41). */
+export const LC_FAINT_RANGE = 70;
 /** Time a card whose first cut is faint keeps back from the ordinary stages for the ladder. */
 export const LC_RESERVE_MS = 1700;
+/**
+ * Which reader a vote came from: PaddleOCR (its line reads and the ladder's), tesseract (whole-card and
+ * line passes), or the glyph matcher (its own and the ladder's). A digit-by-digit vote is built from
+ * the others, so it is no family of its own.
+ */
+export function readerFamily(source) {
+  const src = String(source || "");
+  if (/^(vote|lcvote):/.test(src)) return null;
+  if (/^(glyph:|lc:glyph)/.test(src)) return "glyph";
+  if (/^(paddle:|lc:)/.test(src)) return "paddle";
+  return "tesseract";
+}
+
+/**
+ * THE FAINT-CUT GUARD (25 Sep). On a faint number line (white on white, dim light) one reader can be
+ * wrong the same way twice: its plain and its CLAHE copy of one cut, or two tesseract preparations,
+ * agree on a number with two or three wrong digits that still passes Luhn. Measured on the ten
+ * held-out white cards: the reader live on 25 Sep accepted 3 wrong numbers, two of them "high".
+ * So a number read on a faint cut counts only when
+ *   - two DIFFERENT readers (readerFamily) agree on it, or
+ *   - the low-contrast ladder, run on that same cut, says the same number from at least
+ *     LC_VERIFY_AGREE preparations and no other number from as many.
+ * `hits` = the counted reads, `faintKeys` = the faint cuts, `ladderReads` = EVERY ladder read (counted or not).
+ */
+export function faintGuardOk(pan, hits, faintKeys, ladderReads = []) {
+  const mine = (hits || []).filter((x) => x.pan === pan);
+  const keys = new Set(mine.map((x) => x.lineKey).filter((k) => k && faintKeys && faintKeys.has(k)));
+  if (!keys.size) return true;
+  if (new Set(mine.map((x) => readerFamily(x.source)).filter(Boolean)).size >= 2) return true;
+  const byPan = new Map();
+  for (const x of ladderReads || []) {
+    if (!keys.has(x.lineKey) || /^lcvote:/.test(String(x.source))) continue;
+    if (!byPan.has(x.pan)) byPan.set(x.pan, new Set());
+    byPan.get(x.pan).add(x.source);
+  }
+  const same = byPan.has(pan) ? byPan.get(pan).size : 0;
+  const other = Math.max(0, ...[...byPan.entries()].filter(([p]) => p !== pan).map(([, v]) => v.size));
+  return same >= LC_VERIFY_AGREE && other < LC_VERIFY_AGREE;
+}
+
+/** Ladder preparations that must say the same number to confirm a one-reader number on a faint cut. */
+export const LC_VERIFY_AGREE = 2;
 /** At most this many cut lines of one card go up the ladder. */
 export const LC_MAX_LINES = 2;
 /** The preparations the glyph matcher also reads (it knows the embossing fonts). */
@@ -1404,7 +1446,9 @@ async function recognizeCardOnce(input, opts) {
   }
   const { variants } = built;
 
-  const accepted = (v) => v && v.confidence === "high";
+  const faintKeys = new Set(); // the cuts whose number line was faint (see faintGuardOk)
+  const ladderReads = []; // every Luhn-valid ladder read, counted or not (the faint-cut guard's evidence)
+  const accepted = (v) => v && v.confidence === "high" && faintGuardOk(v.pan, hits, faintKeys, ladderReads);
   const vote = () => voteCandidates(hits);
 
   // Stage 1: the fast whole-card passes (unchanged from 23 Sep), one rotation at a time.
@@ -1474,6 +1518,7 @@ async function recognizeCardOnce(input, opts) {
       for (const hit of extractPans(g.text)) here.push({ ...hit, source: `lc:glyph-${glyphPreps[gi] ? glyphPreps[gi].name : gi}@${rot}${flip ? "f" : ""}`, lineKey: lk, h: line.h, lc: true });
     }
     for (const hit of consensusPans(grouped)) here.push({ ...hit, source: `lcvote:${lk}`, lineKey: lk, h: line.h, lc: true });
+    ladderReads.push(...here);
     const add = lowContrastVerdict(here, hits, lastGroups);
     if (opts.debug) opts.debug({ stage: "lc_vote", reads: here.length, counted: add.length });
     hits.push(...add);
@@ -1482,13 +1527,16 @@ async function recognizeCardOnce(input, opts) {
     const band = await cutLine(img, line, { flip }, scratch);
     if (!band) return;
     const preps = await linePreps(band, scratch, which);
-    // A faint first cut (white on white, dim light: little spread between its dark and light): once the
-    // upright rescue is done, LC_RESERVE_MS of the read's time is held back for the low-contrast last resort. The ladder itself runs
-    // only in the last resort, after every ordinary stage and rotation failed - so a card that reads
-    // today keeps its path.
+    const cutRange = bandRange(band);
+    const cutFaint = cutRange < LC_FAINT_RANGE;
+    if (opts.debug) opts.debug({ stage: "cutrange", top: Math.round(line.top), flip, range: cutRange });
+    if (cutFaint) faintKeys.add(`${rot}:${Math.round(line.top)}:${flip ? 1 : 0}`);
+    // Every cut records whether it is faint (white on white, dim light: little spread between its dark
+    // and light) - the faint-cut guard reads it. A faint FIRST cut also holds LC_RESERVE_MS of the read's
+    // time back, once the upright rescue is done, for the low-contrast last resort.
     if (!faintSeen && !lastResort && (line.digits || 0) >= 4) {
       faintSeen = true;
-      faintFirst = bandRange(band) < LC_FAINT_RANGE;
+      faintFirst = cutFaint;
       if (opts.debug) opts.debug({ stage: "band", top: Math.round(line.top), faint: faintFirst });
     }
     const ladderOk = () => lastResort && !line.parts && !flip && lcRuns < LC_MAX_LINES && !accepted(vote()) && (line.digits || 0) >= 4 && budget.left() > LC_MIN_BUDGET_MS;
@@ -1589,6 +1637,12 @@ async function recognizeCardOnce(input, opts) {
     }
     // In the last resort only: a cut the low-contrast view found, and the reads above did not settle.
     if (ladderOk()) await readLowContrast(band, line, rot, flip);
+    // A faint cut where one reader alone agreed on a number: the ladder on this cut confirms or refuses it.
+    const v = vote();
+    if (cutFaint && v && v.confidence === "high" && !accepted(v) && !line.parts && lcRuns < LC_MAX_LINES + 1 && budget.left() > LC_MIN_BUDGET_MS &&
+        hits.some((x) => x.pan === v.pan && x.lineKey === key)) {
+      await readLowContrast(band, line, rot, flip);
+    }
   };
   const rescue = async (rot, { lowContrast = false } = {}) => {
     if (budget.left() < 900) return;
@@ -1832,7 +1886,7 @@ async function recognizeCardOnce(input, opts) {
     // Accepted means two different reads agreed and nothing else came close. Three or more = high;
     // exactly two = low, and the rep confirms the last four before a charge. A number that fewer than
     // two ORDINARY reads saw (the low-contrast ladder carried it) is always low.
-    confidence: new Set(winHits.filter((x) => !x.lc).map((x) => x.source)).size < 2 ? "low" : win.sources >= 3 ? "high" : "low",
+    confidence: new Set(winHits.filter((x) => !x.lc).map((x) => x.source)).size < 2 || winHits.some((x) => x.lineKey && faintKeys.has(x.lineKey)) ? "low" : win.sources >= 3 ? "high" : "low",
     sources: win.sources,
     rotation,
   });
