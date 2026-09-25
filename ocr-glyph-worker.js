@@ -18,17 +18,27 @@
 import { Worker, isMainThread, parentPort } from "node:worker_threads";
 import { fileURLToPath } from "node:url";
 import { readLineGlyphs, findRows } from "./ocr-glyphs.js";
+import { paddleReadLine } from "./ocr-paddle.js";
 
 function zero(list) {
   for (const a of list) if (a && typeof a.fill === "function") a.fill(0);
 }
 
 if (!isMainThread && parentPort) {
-  parentPort.on("message", (msg) => {
+  parentPort.on("message", async (msg) => {
     const held = [];
     let reply;
     try {
-      if (msg.kind === "lines") {
+      if (msg.kind === "paddle") {
+        // PaddleOCR's line recogniser (ocr-paddle.js), one cut line at a time.
+        const out = [];
+        for (const job of msg.jobs) {
+          const band = { data: new Uint8Array(job.buffer), width: job.width, height: job.height };
+          held.push(band.data);
+          out.push(await paddleReadLine(band));
+        }
+        reply = { id: msg.id, ok: true, out };
+      } else if (msg.kind === "lines") {
         const out = [];
         for (const job of msg.jobs) {
           const band = { data: new Uint8Array(job.buffer), width: job.width, height: job.height };
@@ -137,6 +147,11 @@ export function glyphWorker() {
     lines(bands, { digitPx, timeoutMs } = {}) {
       const jobs = bands.map((b) => ({ buffer: copyOf(b.data), width: b.width, height: b.height, minGlyphs: b.minGlyphs }));
       return call({ kind: "lines", digitPx, jobs }, jobs.map((j) => j.buffer), timeoutMs);
+    },
+    /** bands -> [{text, conf}] from PaddleOCR, in the same order. */
+    paddle(bands, { timeoutMs } = {}) {
+      const jobs = bands.map((b) => ({ buffer: copyOf(b.data), width: b.width, height: b.height }));
+      return call({ kind: "paddle", jobs }, jobs.map((j) => j.buffer), timeoutMs);
     },
     rows(gray, { timeoutMs } = {}) {
       const buffer = copyOf(gray.data);

@@ -30,6 +30,7 @@ import {
 } from "./ocr-card.js";
 import { sharedEnginePool } from "./ocr-engine.js";
 import { loadTemplates as loadGlyphTemplates } from "./ocr-glyphs.js";
+import { paddleAvailable } from "./ocr-paddle.js";
 import {
   chargeFamilyPath,
   handleChargeRequest,
@@ -1545,7 +1546,7 @@ const server = http.createServer(async (req, res) => {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-09-25-card-reader",
+      build: "2026-09-25-paddle-reader",
       instance: INSTANCE_ID,
       snapEngage: {
         enabled: SNAPENGAGE_ENABLED,
@@ -1606,6 +1607,8 @@ const server = http.createServer(async (req, res) => {
         holds: cardHoldCount(),
         // Card fonts the glyph matcher knows (14). 0 = ocr-glyphs.json missing from the image: the matcher is off.
         glyphFonts: loadGlyphTemplates().length,
+        // PaddleOCR line model + dictionary present in the image (the primary line reader, 25 Sep).
+        paddle: paddleAvailable(),
       },
     });
     return;

@@ -103,7 +103,10 @@ describe("synthetic card set (real tesseract.js)", () => {
     orig.log(summary);
     assert.equal(wrongHigh.length, 0, `never wrong with high confidence: ${JSON.stringify(wrongHigh)}`);
     assert.ok(cleanExact / clean.length >= 0.95, `clean exact ${cleanExact}/${clean.length}`);
-    assert.ok(p95 < 3000, `p95 ${p95}ms under the 3 s target (measured on this machine)`);
+    // Joseph, 24 Sep: a read may take "under about 8 s" (the 13.6 target of 3 s predates the line rescue
+    // and PaddleOCR). npm test runs files in parallel on one CPU, so this is a ceiling, not a benchmark:
+    // the real figures come from node test/ocr-bench.mjs on an idle machine.
+    assert.ok(p95 < 8000, `p95 ${p95}ms under the 8 s target (measured on this machine)`);
   });
 
   it("nothing logged during the suite carries a card number", () => {

@@ -789,6 +789,8 @@ export const LINE_DIGIT_PX = 40;
 /** A glyph-matcher reading votes only when every glyph in it was a clear match (calibrated on the hard set). */
 export const GLYPH_MIN_MARGIN = 0.04;
 export const GLYPH_MIN_SCORE = 0.35;
+/** A PaddleOCR line reading votes only above this mean character probability. */
+export const PADDLE_MIN_CONF = 0.6;
 const LOCATE_SIDE = 1100;
 
 /** CLAHE tile that fits the picture (libvips refuses a window larger than the image: 'hist_local: window too large'). */
@@ -847,6 +849,21 @@ export function regionStats(img, box) {
   if (!n) return { mean: 0, sat: 0, sharp: 0 };
   const mu = lap / n;
   return { mean: sum / n, sat: sat / n, sharp: lap2 / n - mu * mu };
+}
+
+/**
+ * PaddleOCR reads letters too: inside a group that is mostly digits, the look-alikes are digits
+ * (O/o/D/Q -> 0, I/l/|/i/! -> 1, Z -> 2, S/s -> 5, G/b -> 6, T -> 7, B -> 8, g/q -> 9). A token that
+ * is mostly letters ("VALID", a name) is left alone.
+ */
+const LOOKALIKE = { O: "0", o: "0", D: "0", Q: "0", I: "1", l: "1", "|": "1", i: "1", "!": "1", Z: "2", z: "2", S: "5", s: "5", G: "6", b: "6", T: "7", B: "8", g: "9", q: "9" };
+export function digitsFromLookalikes(text) {
+  return String(text || "").split(/\r?\n/).map((line) => line.split(/(\s+|-)/).map((tok) => {
+    const d = (tok.match(/[0-9]/g) || []).length;
+    const letters = tok.replace(/[0-9\s-]/g, "");
+    if (d < 2 || d < letters.length) return tok;
+    return tok.replace(/[^0-9\s-]/g, (c) => LOOKALIKE[c] || c);
+  }).join("")).join("\n");
 }
 
 /** Debug output only: the printed group lengths ("4-4-4-4"), never a digit. */
@@ -990,7 +1007,9 @@ async function locateLines(engine, img, scratch, budget, { textPass = false, not
   // row of small print (legal text, a phone number) never pushes the number line out.
   // A row that touches the edge of the photo is cut off - it is tried last.
   const edge = (L) => (L.top <= 2 || L.bottom >= img.height - 2 ? 0.2 : 1);
-  const rank = (L) => Math.min(L.stacked ? 16 : L.digits, 19) * Math.pow(L.h, 1.5) * edge(L);
+  // A box taller than one row swallowed a neighbour: its tight "core" cut is tried first (Joseph's card).
+  const tight = (L) => (L.core ? 1.05 : L.bottom - L.top > 1.3 * L.h ? 0.9 : 1);
+  const rank = (L) => Math.min(L.stacked ? 16 : L.digits, 19) * Math.pow(L.h, 1.5) * edge(L) * tight(L);
   out.sort((a, b) => rank(b) - rank(a));
   return { lines: out, passes };
 }
@@ -1223,6 +1242,37 @@ async function recognizeCardOnce(input, opts) {
       glyphReads.push(...local.map((g) => ({ ...g, prep: "c" + g.prep })));
       glyphReads.push(...softened.map((g) => ({ ...g, prep: "b" + g.prep })));
     }
+    // PaddleOCR on the same cut: the plain and the local-contrast copies (both ways up come from the
+    // caller's flip). For a number on two lines, each line alone, the two readings joined.
+    {
+      const lk = `${rot}:${Math.round(line.top)}:${flip ? 1 : 0}`;
+      let reads = [];
+      if (line.parts) {
+        const pbs = [];
+        for (const part of (flip ? [...line.parts].reverse() : line.parts)) {
+          const pb = await cutLine(img, part, { flip }, scratch);
+          if (pb) pbs.push(pb);
+        }
+        if (pbs.length === 2) {
+          const [a, b] = await glyphWorker().paddle(pbs, { timeoutMs: Math.max(250, budget.left()) }).catch(() => [null, null]);
+          if (a && b) reads.push({ v: "p2", text: a.text + " " + b.text, conf: Math.min(a.conf, b.conf) });
+        }
+      } else {
+        const [a, b] = await glyphWorker().paddle([band, clahe], { timeoutMs: Math.max(250, budget.left()) }).catch(() => [null, null]);
+        if (a) reads.push({ v: "p", ...a });
+        if (b) reads.push({ v: "pc", ...b });
+      }
+      for (const r of reads) {
+        passes += 1;
+        const text = digitsFromLookalikes(r.text);
+        if (opts.debug) opts.debug({ stage: "paddle", v: r.v, shape: digitShape(text), conf: +r.conf.toFixed(3) });
+        texts.push({ source: `paddle:${r.v}@${rot}`, rotation: rot, variant: r.v, text, confidence: r.conf * 100, line: true });
+        if (r.conf < PADDLE_MIN_CONF) continue;
+        noteLast(text);
+        for (const gr of groupedReads(text)) lineReads.push({ ...gr, lineKey: lk });
+        for (const hit of extractPans(text)) hits.push({ ...hit, source: `paddle:${r.v}@${rot}${flip ? "f" : ""}`, lineKey: lk, h: line.h });
+      }
+    }
     for (const g of glyphReads) {
       if (g.minScore >= GLYPH_MIN_SCORE) noteLast(g.text);
       if (opts.debug) opts.debug({ stage: "glyph", prep: g.prep, font: g.font, shape: digitShape(g.text), mean: +g.meanScore.toFixed(3), minS: +g.minScore.toFixed(3), minM: +g.minMargin.toFixed(3) });
@@ -1288,7 +1338,7 @@ async function recognizeCardOnce(input, opts) {
         }
       }
     };
-    const rankOf = (L) => Math.min(L.stacked ? 16 : L.digits, 19) * Math.pow(L.h, 1.5) * (inside(L) ? 1 : 0.2);
+    const rankOf = (L) => Math.min(L.stacked ? 16 : L.digits, 19) * Math.pow(L.h, 1.5) * (inside(L) ? 1 : 0.2) * (L.core ? 1.05 : L.bottom - L.top > 1.3 * L.h ? 0.9 : 1);
     let lines = await locate(false);
     let textDone = false;
     // No row inside the photo that already looks like most of a number: find rows the other way
@@ -1362,8 +1412,27 @@ async function recognizeCardOnce(input, opts) {
   const readBelow = async (rot, line, img, flip) => {
     let expiry = null;
     let name = null;
+    let paddleName = null;
     const band = await cutLine(img, { ...line, angle: line.angle }, { below: true, flip }, scratch);
     if (!band) return { expiry, name };
+    // PaddleOCR first: the strip is cut into overlapping one-line slices (expiry, then the name).
+    {
+      const sharpB = await loadSharp();
+      const sliceH = Math.max(16, Math.round(LINE_DIGIT_PX * 1.7));
+      const slices = [];
+      for (let y = 0; y + 12 < band.height && slices.length < 5; y += Math.round(sliceH * 0.6)) {
+        const hgt = Math.min(sliceH, band.height - y);
+        slices.push(await rawGray(sharpB(band.data, { raw: { width: band.width, height: band.height, channels: 1 } }).extract({ left: 0, top: y, width: band.width, height: hgt }).toColourspace("b-w"), scratch));
+      }
+      const reads = slices.length && budget.left() > 400
+        ? await glyphWorker().paddle(slices, { timeoutMs: Math.max(250, budget.left()) }).catch(() => [])
+        : [];
+      const lines = reads.filter((r) => r && r.conf >= 0.5).map((r) => r.text.toUpperCase());
+      const joined = lines.join("\n");
+      if (!expiry) expiry = parseExpiry(joined, now);
+      // Paddle's name is only a fallback: on the hard set tesseract's text pass named the holder better.
+      paddleName = pickName(joined, expiry);
+    }
     const preps = await linePreps(band, scratch, ["n", "i"]);
     for (const p of preps) {
       if (expiry && name) break;
@@ -1373,7 +1442,7 @@ async function recognizeCardOnce(input, opts) {
       if (!expiry) expiry = parseExpiry(r.text, now);
       if (!name) name = pickName(r.text, expiry);
     }
-    return { expiry, name };
+    return { expiry, name: name || paddleName };
   };
 
   if (!win || !accepted(win)) {

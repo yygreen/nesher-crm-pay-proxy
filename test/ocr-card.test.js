@@ -792,7 +792,7 @@ describe("wiring", () => {
     assert.ok(src.indexOf("isOcrPath(url.pathname)") < src.indexOf("isOpenPayPath(url.pathname)"), "reader answers before the pay pages");
     assert.ok(src.indexOf("isOcrPath(url.pathname)") < src.lastIndexOf("proxyWithInject(req, res)"), "reader answers before the proxy");
     assert.match(src, /ocr: \{\s*enabled: ocrEnabled\(\)/);
-    assert.match(src, /build: "2026-09-25-card-reader"/);
+    assert.match(src, /build: "2026-09-25-paddle-reader"/);
     assert.match(src, /startCardHoldSweeper\(/);
     // The replica proof lives in health: one boot id per process.
     assert.match(src, /const INSTANCE_ID = crypto\.randomBytes\(6\)\.toString\("hex"\)/);
@@ -859,5 +859,18 @@ describe("Gabbai 25 Sep conditions: PDF bounds, debug fence, glyph worker", () =
     assert.ok(all.includes('"stage":"hits"'));
     assert.equal(all.includes(PAN), false, "no whole number in any debug event");
     assert.match(all, /1486\/16/);
+  });
+});
+
+describe("PaddleOCR line reader (ocr-paddle.js)", () => {
+  it("reads a rendered test-number line, off the main thread, and the model ships with the repo", async () => {
+    const { paddleAvailable } = await import("../ocr-paddle.js");
+    const { glyphWorker } = await import("../ocr-glyph-worker.js");
+    assert.equal(paddleAvailable(), true, "models/paddle present");
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="900" height="64"><rect width="900" height="64" fill="#fff"/><text x="12" y="48" font-family="Arial" font-size="44" fill="#111">4111 1111 1111 1111</text></svg>`;
+    const r = await sharp(Buffer.from(svg)).grayscale().raw().toBuffer({ resolveWithObject: true });
+    const [out] = await glyphWorker().paddle([{ data: r.data, width: r.info.width, height: r.info.height }], { timeoutMs: 20000 });
+    assert.equal(out.text.replace(/[^0-9]/g, ""), "4111111111111111");
+    assert.ok(out.conf >= 0.6, "above the voting threshold PADDLE_MIN_CONF");
   });
 });
