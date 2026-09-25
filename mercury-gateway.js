@@ -274,7 +274,11 @@ export function recipientDraft(input) {
   const clean = (v, n) => String(v == null ? "" : v).replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim().slice(0, n);
   const name = clean(stripDecoration(x.name), 80);
   if (name.length < 2 || !/\p{L}/u.test(name) || !/^[\p{L}\p{Nd}]/u.test(name)) return { ok: false, error: "name_required" };
-  if (/[\d$₪]/.test(name)) return { ok: false, error: "name_invalid", decline_reason_human: "The recipient name has numbers or signs in it - nothing was added. Type just the account holder's name." };
+  // Gabbai 25 Sep B1: a business's legal name may carry digits ("Y33 Hotel Ltd", "3M Company"); a person's may not.
+  // Every name is refused with a currency sign or the rep's instruction / an amount glued on ("Yael Sher - please
+  // refund $630", "Yael Sher refund 630").
+  const INSTR_TAIL = /\s[-–—]\s+(?:please|pls|refund|pay|send)\b|\b(?:please|pls|refund|reimburse|pay|send|wire|transfer)\b[^\n]*\d|\d[\d,.]*\s?(?:usd|dollars?|nis|ils|shekels?)\b/i;
+  if (/[$₪]/.test(name) || INSTR_TAIL.test(name) || (x.business !== true && /\d/.test(name))) return { ok: false, error: "name_invalid", decline_reason_human: "The recipient name has numbers or signs in it - nothing was added. Type just the account holder's name." };
   if (PAY_BLOCK_NAME.test(name)) return { ok: false, error: "own_or_other_org" };
   const routing = String(x.routing || "").replace(/\D/g, "");
   if (!abaOk(routing)) return { ok: false, error: "routing_invalid" };
@@ -402,6 +406,7 @@ export const NOTE_MARK = " · desk chat ";
  * left = "Supplier payment". The full memo stays in the note, the tile and the log.
  */
 export function externalMemoOf(memo, fallback) {
+  // Audit #109: the supplier's bank never gets a full account number from a memo - a 5+ digit run keeps its last four.
   const out = String(memo || "")
     .replace(/\bJRM[-\s]?Hotels?\b/gi, " ")
     .replace(/\bJRM-[A-Z0-9-]+/gi, " ")
@@ -409,7 +414,7 @@ export function externalMemoOf(memo, fallback) {
     .replace(/\s+/g, " ")
     .replace(/^[\s,;:.\-–]+|[\s,;:\-–]+$/g, "")
     .trim();
-  return out || String(fallback || "Supplier payment");
+  return scrubDigits(out) || String(fallback || "Supplier payment");
 }
 
 /** The rep's memo out of an echoed memo (the part before the desk-chat marker). */
@@ -431,7 +436,8 @@ export function noteTileId(s) {
   const i = raw.indexOf(NOTE_MARK);
   const desk = i >= 0 ? raw.slice(i + NOTE_MARK.length) : raw;
   const m = desk.match(/^(\S+)\s+by\s+/);
-  return m ? m[1] : "";
+  // Gabbai 25 Sep C7: only a real desk tile id - deskNote writes "-" when tile_id is empty, and "-" is nobody's tile.
+  return m && /^(?:mp|pr)[a-z0-9]{6,20}$/.test(m[1]) ? m[1] : "";
 }
 
 /**

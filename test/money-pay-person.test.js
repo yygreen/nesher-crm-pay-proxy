@@ -13,6 +13,8 @@ import {
   payeeFingerprint,
   payeeVerdict,
   maskEmail,
+  externalMemoOf,
+  noteTileId,
   TOKEN_FULL,
   NOTE_MARK,
 } from "../mercury-gateway.js";
@@ -148,7 +150,26 @@ describe("the pure rules", () => {
     assert.equal(recipientDraft({ name: "", routing: CFSB, account: ACCT }).error, "name_required");
     assert.equal(recipientDraft({ name: "Yael", routing: CFSB, account: "12" }).error, "account_invalid");
   });
-  it("Mr. AV (25 Sep): WhatsApp/markdown decoration is stripped off the name and street before Mercury sees it", () => {
+  it("25 Sep audit + Gabbai B1: a business keeps digits in its legal name; a person does not; an instruction tail never passes", () => {
+    const base = { name: "Yael Sher", routing: CFSB, account: ACCT, type: "Checking", emails: ["yael.sher@example.com"], address: { address1: "89-16 Jamaica Ave", city: "Woodhaven", region: "NY", postalCode: "11421", country: "US" } };
+    for (const nm of ["Y33 Hotel Ltd", "Hotel 1868 LLC", "7 Seas Travel Inc", "3M Company"]) {
+      const d = recipientDraft({ ...base, name: nm, business: true });
+      assert.equal(d.ok, true, nm + " " + JSON.stringify(d));
+      assert.equal(d.body.name, nm);
+    }
+    for (const nm of ["Yael Sher - please refund $630", "Yael Sher refund 630", "Acme LLC 630 dollars"]) {
+      const d = recipientDraft({ ...base, name: nm, business: true });
+      assert.equal(d.ok, false, nm); assert.equal(d.error, "name_invalid", nm);
+    }
+    assert.equal(recipientDraft({ ...base, name: "Yael 2 Sher" }).error, "name_invalid");
+  });
+  it("25 Sep audit #109 + Gabbai C7: the external memo and the log keep only the last four; only a real tile id is a tile", () => {
+    assert.equal(externalMemoOf("PNR ABC123 account 000123456789"), "PNR ABC123 account ••6789");
+    assert.equal(noteTileId("mpabc12345 by joseph"), "mpabc12345");
+    assert.equal(noteTileId("- by joseph"), "");
+    assert.equal(noteTileId("anything by joseph"), "");
+  });
+  it("25 Sep audit: WhatsApp/markdown decoration is stripped off the name and street before Mercury sees it", () => {
     const base = { name: "Yael Sher", routing: CFSB, account: ACCT, type: "Checking", emails: ["yael.sher@example.com"], address: { address1: "89-16 Jamaica Ave", city: "Woodhaven", region: "NY", postalCode: "11421", country: "US" } };
     let d = recipientDraft({ ...base, name: "* Yael Sher" });
     assert.equal(d.ok, true, JSON.stringify(d));

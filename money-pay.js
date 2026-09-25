@@ -229,6 +229,8 @@ export async function matchMemo(pool, memo) {
 function accessLine(door, f) {
   const o = { door, rep: f.rep || null, ticket: f.ticket || null, outcome: f.outcome || null, ms: f.ms == null ? null : f.ms };
   for (const k of ["tile", "recipient", "payee", "amount_cents", "memo", "matched", "request_id", "state", "last4", "email", "mode", "txn", "reused", "dup_ok"]) if (f[k] != null) o[k] = f[k];
+  // Audit #109: a memo in the log keeps only the last four of any 5+ digit run.
+  if (typeof o.memo === "string") o.memo = scrubDigits(o.memo);
   return `money-pay ${JSON.stringify(o)}`;
 }
 
