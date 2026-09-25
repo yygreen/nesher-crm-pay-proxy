@@ -19,7 +19,7 @@ import { buildHardSet } from "./ocr-hard-fixtures.js";
 
 export const LOOP_CEILING_MS = 100;
 const NOW = new Date(Date.UTC(2026, 8, 24, 12));
-const HEAVY = ["tilt", "glare", "pattern", "screen-moire", "dark-metal"];
+const HEAVY = ["tilt", "glare", "pattern", "screen-moire", "dark-metal", "white-on-white"];
 
 describe("the card reader never freezes the proxy", () => {
   const quiet = { warn: console.warn, error: console.error };

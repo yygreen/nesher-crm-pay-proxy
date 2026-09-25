@@ -199,7 +199,15 @@ describe("white-on-white, dim light (real engine)", () => {
       });
       if (ran) ladderRan += 1;
       for (const b of trace.buffers) assert.ok(b.every((x) => x === 0), `${s.id}: buffer zeroed`);
-      if (!r.ok) continue;
+      if (!r.ok) {
+        // Gabbai C1 (25 Sep): a refusal never re-prints what the guard refused - the "ends in" and the expiry
+        // are the card's own or absent (held-out white h4 was refused but told a wrong last four).
+        const p = r.partial || {};
+        assert.ok(!p.last4 || p.last4 === s.pan.slice(-4), `${s.id}: refusal says a last four that is not the card's`);
+        assert.ok(!p.expiry || p.expiry === s.expiry, `${s.id}: refusal says an expiry that is not the card's`);
+        assert.ok(!/ends [0-9]{4}/.test(String(r.say || "")) || String(r.say).includes(s.pan.slice(-4)), `${s.id}: refusal sentence names a wrong last four`);
+        continue;
+      }
       assert.equal(r.pan, s.pan, `${s.id}: a wrong number was accepted`);
       exact += 1;
       const mine = winners.filter((w) => w.startsWith(s.pan.slice(-4) + "/"));
