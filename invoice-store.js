@@ -307,6 +307,60 @@ export async function markInvoicePaid(idOrToken, extra = {}, poolImpl) {
 }
 
 /**
+ * AUDIT #145 (25 Sep, leftover lane): a guest link held as "confirming" (the gateway answer was lost, the
+ * claim kept) is settled once the recovery sweep has POSTED its sale to the CRM - so the guest stops seeing
+ * "We are confirming this payment. Please contact us" for money that came in. Gabbai r1 D4 guards:
+ *   - the sale's transaction id is on NO link for this order id yet (after the canon R1 step the office mints a
+ *     new link; the old stuck link must never be stamped with the new link's sale);
+ *   - the sale falls inside the link's OWN attempt: at or after its claim (paidAt, stamped BEFORE the sale was
+ *     sent, nmi-card.js) less 60 s of clock skew, and no later than 2 minutes after it went confirming
+ *     (confirmingSince is stamped AFTER the answer was lost, so the real sale is before it; NMI dates are UTC,
+ *     measured 24 Sep);
+ *   - the same amount, and EXACTLY ONE such link (two = ambiguous, both left alone).
+ * The write is a compare-and-swap on the same claim, still confirming, still without a transaction id, and the
+ * transaction id on no other link. Only transactionId is stamped (plus confirmedBy/confirmedAt); the claim time
+ * stays the paid time. Never a gateway call, never a CRM write.
+ */
+export async function settleConfirmingLink({ invoiceNumber, amountUsd, transactionId, paidAt } = {}, poolImpl) {
+  const ref = String(invoiceNumber || "").trim();
+  const txn = String(transactionId || "").trim();
+  const amount = Number(amountUsd);
+  const saleMs = Date.parse(String(paidAt || ""));
+  if (!ref || !/^[A-Za-z0-9_-]{1,64}$/.test(txn) || !(amount > 0) || !Number.isFinite(saleMs)) return { ok: false, skipped: "bad_input" };
+  const rows = await findInvoicesByOrderId(ref, poolImpl);
+  if (rows.some((r) => String(r.payload?.transactionId || "") === txn)) return { ok: false, skipped: "txn_on_link" };
+  const hits = rows.filter((r) => {
+    const p = r.payload || {};
+    if (p.confirming !== true || String(p.transactionId || "") !== "" || !isShortPayCode(r.id)) return false;
+    if (Math.abs(Number(p.amountUsd) - amount) >= 0.005) return false;
+    const claimMs = Date.parse(String(p.paidAt || ""));
+    const sinceMs = Date.parse(String(p.confirmingSince || ""));
+    if (!Number.isFinite(claimMs) || !Number.isFinite(sinceMs)) return false;
+    return saleMs >= claimMs - 60 * 1000 && saleMs <= sinceMs + 2 * 60 * 1000;
+  });
+  if (hits.length !== 1) return { ok: false, skipped: hits.length ? "ambiguous" : "none" };
+  try {
+    const pool = storePool(poolImpl);
+    const r = await pool.query(
+      `UPDATE nesher_pay_invoices
+          SET payload = (payload - 'confirming' - 'confirmingSince') || $3::jsonb
+        WHERE id = $1
+          AND payload->>'confirming' = 'true'
+          AND COALESCE(payload->>'transactionId', '') = ''
+          AND payload->>'paidAt' = $2
+          AND NOT EXISTS (SELECT 1 FROM nesher_pay_invoices o WHERE o.payload->>'transactionId' = $4)
+        RETURNING id`,
+      [String(hits[0].id).toLowerCase(), String(hits[0].payload.paidAt),
+        JSON.stringify({ transactionId: txn, confirmedBy: "sweep", confirmedAt: new Date().toISOString() }), txn]
+    );
+    return r.rows.length ? { ok: true, link: "..." + String(hits[0].id).slice(-3) } : { ok: false, skipped: "changed" };
+  } catch {
+    console.warn("settleConfirmingLink failed");
+    return { ok: false, skipped: "store_error" };
+  }
+}
+
+/**
  * Short codes for one CRM invoice number, newest first.
  * Used by the NMI webhook to find the guest /pay row without the URL code.
  */

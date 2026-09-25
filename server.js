@@ -78,6 +78,7 @@ import {
   claimNmiNote,
   markInvoiceConfirming,
   listConfirmingLinks,
+  settleConfirmingLink,
 } from "./invoice-store.js";
 import { injectPayButtons, injectPaidBadges } from "./inject.js";
 import { stripStripeUi } from "./strip-stripe.js";
@@ -2029,6 +2030,9 @@ async function runNmiRecoverySweep(days) {
     const doors = moneyDoors("recovery");
     const out = await runNmiRecovery({
       reverse: doors.reverseFromSweep,
+      // Audit #145: a guest link stuck on "confirming" is settled once its sale is posted - live mode only, so
+      // unsetting MONEY_POSTING_MODE stops it with the rest of the loop's own writes.
+      settled: POSTING_MODE === "live" ? (ev) => settleConfirmingLink(ev) : undefined,
       host: process.env.NMI_HOST || "https://pinpointpayments.transactiongateway.com",
       securityKey: process.env.NMI_PRIVATE_KEY || "",
       days,
