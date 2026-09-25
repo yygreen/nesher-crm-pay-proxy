@@ -254,7 +254,7 @@ export const REVIEW_WORDS = Object.freeze({
   hand_row_after_auto_post: "A card payment the CRM recorded automatically also has a hand-typed payment of the same amount. If it is the same money, delete the hand-typed copy.",
   flight_link_not_wired: "A flight pay link was paid. If the flight request does not show it, enter it there.",
   mercury_same_amount_on_booking: "A Mercury invoice shows paid, the same amount as a payment already on the booking. If it is the same money, nothing to enter; if not, enter it.",
-  mercury_paid_after_card_link: "A Mercury invoice shows paid after a card payment on its pay link; it may only be marked PAID. If money came in by bank, enter it; if not, nothing to enter.",
+  mercury_paid_after_card_link: "A Mercury invoice shows paid on a booking that already has a card payment; it may only have been marked PAID. Bank money in? Enter it; if not, nothing to enter.",
   brand_mismatch: "A card payment ran on the other company's merchant. Check which booking it belongs to, and enter it there if it is not already there.",
   invoice_amount_mismatch: "A pay link was paid a different amount than it asked for. If the booking does not show what came in, enter it.",
   invoice_transaction_conflict: "A pay link shows two card payments. Check the booking; if the second one is a duplicate charge, it needs a refund.",

@@ -63,7 +63,8 @@ describe("#150 a Mercury invoice is dated by the payment the CRM recorded for it
     assert.equal(m10.brands.nesher.mercury_invoices.paid, 500);
     assert.equal(m09.brands.nesher.mercury_invoices.paid, 4018.5, "RES-NEWRUL is not on 9 Aug any more");
     assert.ok(inBookings(m10, "NEWRUL"));
-    assert.ok(m10.notes.some((n) => /dated by the payment the CRM recorded for it/.test(n)));
+    assert.ok(m10.notes.some((n) => /dated by the day on the payment the CRM recorded for it, or on its review row/.test(n)));
+    assert.ok(!m10.notes.some((n) => /wait for a person/.test(n)), "no ledger-dated invoice here");
   });
 
   it("RES-A3L4RS (written before the fix, paid_at 9 Aug) lands on the SAME day in the Mercury section and the booking list", async () => {
@@ -82,6 +83,17 @@ describe("#150 a Mercury invoice is dated by the payment the CRM recorded for it
     assert.deepEqual(m10.brands.nesher.recorded_other_rails, { bank: 120 });
     const m09 = await mapFor("2026-08-09");
     assert.equal(m09.brands.nesher.recorded_other_rails.other, undefined, "the 4018.50 Mercury row is not counted twice");
+  });
+
+  it("R2: an invoice dated by its ledger review row is counted apart - it waits for a person and is NOT in the CRM", () => {
+    const period = day("2026-08-11");
+    const crm = { nesherInPeriod: [], reservations: [], nesherAll: [], jrmInPeriod: [], jrmAll: [], offers: [], requests: [], refundRows: [],
+      mercuryPaid: [{ invoice_id: "inv-held", paid_at: "2026-08-11T08:00:00Z", source: "ledger" }] };
+    const m = buildMoneyMap({ period, nowMs: NOW, nmi: parseNmiTransactions("<nm_response></nm_response>"), bank: [],
+      invoices: [{ id: "inv-held", invoiceNumber: "RES-A3L4RS", status: "Paid", amount: 300, updatedAt: "2026-08-01T10:00:00Z" }], crm,
+      sources: { nmi: { ok: true }, mercury: { ok: true }, invoices: { ok: true }, crm: { ok: true } } });
+    assert.equal(m.brands.nesher.mercury_invoices.paid, 300);
+    assert.ok(m.notes.some((n) => /1 paid invoice\(s\) wait for a person and are not in the CRM; dated by when our sync first saw them paid/.test(n)), m.notes.join(" | "));
   });
 
   it("an invoice with no CRM record keeps the day it was sent, and the notes say so; an unreadable CRM says so too", () => {

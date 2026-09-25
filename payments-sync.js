@@ -393,7 +393,7 @@ export const NOTE_REASON_WORDS = Object.freeze({
   hotel_offer_mismatch: "received and NOT recorded automatically: the hotel offer belongs to another request. Check which request it belongs to, and enter it there if it is not already there.",
   // audit #76 + P3 (a Mercury invoice, not a card): holdMercuryForPerson, after "Mercury invoice <ref> shows $X USD paid."
   mercury_same_amount_on_booking: "NOT recorded automatically: a payment of the same amount is already on this booking. If that is the same money, nothing to enter; if it is a second payment, enter it.",
-  mercury_paid_after_card_link: "NOT recorded automatically: a pay link for this booking was already paid by card, so the invoice may only have been marked PAID for that card payment. If money really came in by bank, enter it; if not, nothing to enter.",
+  mercury_paid_after_card_link: "NOT recorded automatically: this booking already has a card payment, so the invoice may only have been marked PAID for it. If money came in by bank, enter it; if not, nothing to enter.",
   other: "received and NOT recorded automatically: the CRM could not match it by itself. If the booking does not show it, enter it.",
 });
 export function reviewNoteText(amountUsd, txn, reason) {
@@ -711,7 +711,11 @@ async function keepMercuryForReview(pool, inv, brand, reason) {
 async function holdMercuryForPerson(pool, inv, target, bookingId, out) {
   const amount = Number(inv.amount);
   const links = await payLinksFor(pool, inv.invoiceNumber);
-  const carded = links.some((p) => String(p.transactionId || "") !== "" || String(p.paidAt || "") !== "");
+  // Gabbai leftover r2 R1: the #74 "Mark the Mercury invoice PAID" note is written on EVERY card door (pay link, desk,
+  // office, sweep), so the guard keys on the booking: a card-paid / card-claimed link on the number, OR any card row
+  // (anchored nmi: marker) on the booking. This only moves post -> hold; the #74 silent rule below is unchanged.
+  const carded = links.some((p) => String(p.transactionId || "") !== "" || String(p.paidAt || "") !== "")
+    || await bookingHasCardRow(pool, target, bookingId);
   const same = await sameAmountRows(pool, target, bookingId, amount);
   if (!carded && !same.length) return false;
   const silent = same.length === 1 && Boolean(same[0].nmi_txn) && links.length === 1
@@ -720,7 +724,7 @@ async function holdMercuryForPerson(pool, inv, target, bookingId, out) {
   const where = target.kind === "hotel" ? `request #${target.requestId}` : `reservation #${bookingId}`;
   out.skipped.push(same.length
     ? `${inv.invoiceNumber}: same-amount payment already on ${where} (manual?) — not duplicated`
-    : `${inv.invoiceNumber}: a pay link for this number was paid by card — not posted`);
+    : `${inv.invoiceNumber}: this booking already has a card payment — not posted`);
   if (!silent) {
     try {
       const kept = await keepMercuryForReview(pool, inv, target.kind === "hotel" ? "jrm" : "nesher", reason);
@@ -740,6 +744,14 @@ async function payLinksFor(pool, invoiceNumber) {
   if (!t.rows?.[0]?.ok) return [];
   const r = await pool.query(`SELECT payload FROM nesher_pay_invoices WHERE lower(payload->>'invoiceNumber') = lower($1)`, [ref]);
   return (r.rows || []).map((x) => (x && x.payload && typeof x.payload === "object" ? x.payload : {}));
+}
+
+/** Does the booking carry any card payment row the loop or the office wrote (anchored nmi:<txn> marker)? Reads only. */
+async function bookingHasCardRow(pool, target, bookingId) {
+  const r = target.kind === "hotel"
+    ? await pool.query(`SELECT 1 AS hit FROM core_jrmhotelpayment WHERE request_id = $1 AND COALESCE(reference, '') ~ '(^|[[:space:]])nmi:[A-Za-z0-9_-]+($|[[:space:]])' LIMIT 1`, [bookingId])
+    : await pool.query(`SELECT 1 AS hit FROM core_payment WHERE reservation_id = $1 AND COALESCE(notes, '') ~ '(^|[[:space:]])nmi:[A-Za-z0-9_-]+($|[[:space:]])' LIMIT 1`, [bookingId]);
+  return Boolean(r.rows && r.rows.length);
 }
 
 /** Same-amount CRM payment rows on the booking (any marker), with the card marker when there is one. Reads only. */

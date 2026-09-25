@@ -721,7 +721,8 @@ export function buildMoneyMap({ period, nowMs, nmi, bank, invoices, crm, sources
     }
     const paidMs = (inv) => (paidDay.has(String(inv.id)) ? paidDay.get(String(inv.id)).ms : Date.parse(inv.updatedAt || ""));
     const paid = invoices.filter((inv) => String(inv.status) === "Paid" && inPeriod(paidMs(inv)))
-      .map((inv) => ({ inv, ms: paidMs(inv), amt: Number(inv.amount) || 0, bySent: !paidDay.has(String(inv.id)) }));
+      .map((inv) => ({ inv, ms: paidMs(inv), amt: Number(inv.amount) || 0, bySent: !paidDay.has(String(inv.id)),
+        byLedger: paidDay.has(String(inv.id)) && paidDay.get(String(inv.id)).source === "ledger" }));
     const fits = (p, x) => x.createdMs >= p.ms - 86400000 && x.createdMs <= p.ms + 10 * 86400000 && x.amount <= p.amt + CENT && x.amount >= 0.9 * p.amt;
     for (const p of paid) {
       const brand = refOf(p.inv.invoiceNumber)?.brand === "jrm" ? "jrm" : "nesher";
@@ -737,8 +738,10 @@ export function buildMoneyMap({ period, nowMs, nmi, bank, invoices, crm, sources
     }
     const bySent = paid.filter((p) => p.bySent).length;
     if (!dateBySync) notes.push("A Mercury invoice's paid date is the time Mercury last updated it (the API gives no separate paid-at).");
-    else notes.push(crm
-      ? "A Mercury invoice is dated by the payment the CRM recorded for it (our sync first saw it paid); Mercury itself gives no paid date."
+    const byLedger = paid.filter((p) => p.byLedger).length;
+    if (dateBySync) notes.push(crm
+      ? "A Mercury invoice is dated by the day on the payment the CRM recorded for it, or on its review row while it waits for a person; Mercury itself gives no paid date."
+        + (byLedger ? ` ${byLedger} paid invoice(s) wait for a person and are not in the CRM; dated by when our sync first saw them paid.` : "")
         + (bySent ? ` ${bySent} paid invoice(s) with no CRM record are dated by when they were sent.` : "")
       : "A Mercury invoice is dated by when it was sent: the CRM could not be read, and Mercury itself gives no paid date.");
   } else notes.push("Mercury invoices could not be read (" + (sources.invoices?.error || "unknown") + ").");
