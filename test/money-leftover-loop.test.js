@@ -13,6 +13,7 @@ import { after, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { PGlite } from "@electric-sql/pglite";
 import {
+  reviewNoteText,
   recordNmiPaidInvoice,
   recordNmiException,
   recordSweepReversal,
@@ -105,7 +106,7 @@ describe("#76 a same-amount Mercury payment after a card payment is never droppe
     assert.equal(Number(row.amount_cents), 50000);
     const notes = await resNotes(8);
     assert.equal(count(notes, "NOT recorded automatically"), 1, "one note on the booking");
-    assert.match(notes, /Mercury pay-link payment \$500\.00 USD \(invoice RES-TWOHLF\)/);
+    assert.match(notes, /Mercury invoice RES-TWOHLF shows \$500\.00 USD paid\. NOT recorded automatically: a payment of the same amount/);
     const lr = await loopReview({ pool, now: new Date() });
     const item = lr.items.find((i) => i.reason === "mercury_same_amount_on_booking");
     assert.ok(item, "on the loop-review list");
@@ -162,8 +163,6 @@ describe("#76 a same-amount Mercury payment after a card payment is never droppe
   it("B1 stays closed: ONE link paid by card, the office marks its Mercury invoice PAID -> silent skip, nothing kept, written once", async () => {
     await link("abcd2345", { invoiceNumber: "RES-ABC123", mercuryUrl: "https://app.mercury.com/pay/x", amountUsd: 750, transactionId: "t-card", paidAt: iso(T0) }, iso(T0 - 3600e3));
     await link("efgh6789", { invoiceNumber: "JRM-142-O99", mercuryUrl: "https://app.mercury.com/pay/y", amountUsd: 400, transactionId: "t-card-h", paidAt: iso(T0) }, iso(T0 - 3600e3));
-    // a never-paid link for the same money made BEFORE the card payment (superseded) does not change that
-    await link("olde2345", { invoiceNumber: "RES-ABC123", mercuryUrl: "https://app.mercury.com/pay/x", amountUsd: 750 }, iso(T0 - 7200e3));
     assert.equal((await recordNmiPaidInvoice({ pool, invoiceNumber: "RES-ABC123", amountUsd: 750, transactionId: "t-card", paidAt: iso(T0), path: "guest" })).ok, true);
     assert.equal((await recordNmiPaidInvoice({ pool, invoiceNumber: "JRM-142-O99", amountUsd: 400, transactionId: "t-card-h", paidAt: iso(T0), path: "guest" })).ok, true);
     const out = await sync([merc("merc-inv-1", "RES-ABC123", 750), merc("merc-inv-2", "JRM-142-O99", 400)]);
@@ -184,12 +183,95 @@ describe("#76 a same-amount Mercury payment after a card payment is never droppe
     assert.equal(await ledger("mercury_m-inv-7"), undefined);
   });
 
+  // ── Gabbai leftover verdict (25 Sep ~13:40 IL): probes P1 / P3 and conditions 1-4 ──
+  it("P1: two equal-half links on the one shared Mercury invoice, the guest cards the NEWER one and pays the other half by bank -> kept, not silent", async () => {
+    await link("link1aaa", { invoiceNumber: "RES-TWOHLF", amountUsd: 500, mercuryUrl: "https://app.mercury.com/pay/m1" }, iso(T0 - 7200e3));
+    await link("link2bbb", { invoiceNumber: "RES-TWOHLF", amountUsd: 500, mercuryUrl: "https://app.mercury.com/pay/m1", transactionId: "t-half-2", paidAt: iso(T0) }, iso(T0 - 7140e3));
+    assert.equal((await recordNmiPaidInvoice({ pool, invoiceNumber: "RES-TWOHLF", amountUsd: 500, transactionId: "t-half-2", paidAt: iso(T0), path: "guest" })).ok, true);
+    const out = await sync([merc("m-inv-p1", "RES-TWOHLF", 500)]);
+    assert.equal(out.recorded.length, 0);
+    assert.equal((await ledger("mercury_m-inv-p1")).reason, "mercury_same_amount_on_booking");
+    assert.equal(count(await resNotes(8), "NOT recorded automatically"), 1);
+    assert.equal(await paid(8), 500);
+  });
+
+  it("P3: $500 carded on link D, a $1,000 balance link rewrites the shared invoice, the office marks it PAID -> never posted, kept, one note", async () => {
+    await link("depo2345", { invoiceNumber: "RES-TWOHLF", amountUsd: 500, mercuryUrl: "https://app.mercury.com/pay/m1", transactionId: "t-dep-1", paidAt: iso(T0) }, iso(T0 - 7200e3));
+    await link("bala2345", { invoiceNumber: "RES-TWOHLF", amountUsd: 1000, mercuryUrl: "https://app.mercury.com/pay/m1" }, iso(T0 + 600e3));
+    assert.equal((await recordNmiPaidInvoice({ pool, invoiceNumber: "RES-TWOHLF", amountUsd: 500, transactionId: "t-dep-1", paidAt: iso(T0), path: "guest" })).ok, true);
+    const out = await sync([merc("m-inv-p3", "RES-TWOHLF", 1000)]);
+    assert.equal(out.recorded.length, 0, "money that may never have come in is never posted");
+    assert.match(out.skipped[0], /a pay link for this number was paid by card/);
+    const row = await ledger("mercury_m-inv-p3");
+    assert.equal(row.reason, "mercury_paid_after_card_link");
+    assert.equal(Number(row.amount_cents), 100000);
+    const notes = await resNotes(8);
+    assert.equal(count(notes, "NOT recorded automatically"), 1);
+    assert.match(notes, /Mercury invoice RES-TWOHLF shows \$1000\.00 USD paid\. NOT recorded automatically: a pay link for this booking was already paid by card/);
+    assert.equal(await paid(8), 500);
+    const lr = await loopReview({ pool, now: new Date() });
+    assert.ok(lr.items.some((i) => i.reason === "mercury_paid_after_card_link" && i.booking === "RES-TWOHLF"));
+  });
+
+  it("a never-paid older link on the same number (the old 'superseded' clause) no longer makes it silent -> kept for a person", async () => {
+    await link("olde2345", { invoiceNumber: "RES-ABC123", mercuryUrl: "https://app.mercury.com/pay/x", amountUsd: 750 }, iso(T0 - 7200e3));
+    await link("abcd2345", { invoiceNumber: "RES-ABC123", mercuryUrl: "https://app.mercury.com/pay/x", amountUsd: 750, transactionId: "t-card", paidAt: iso(T0) }, iso(T0 - 3600e3));
+    assert.equal((await recordNmiPaidInvoice({ pool, invoiceNumber: "RES-ABC123", amountUsd: 750, transactionId: "t-card", paidAt: iso(T0), path: "guest" })).ok, true);
+    const out = await sync([merc("merc-inv-o", "RES-ABC123", 750)]);
+    assert.equal(out.recorded.length, 0);
+    assert.equal((await ledger("mercury_merc-inv-o")).reason, "mercury_same_amount_on_booking");
+    assert.equal(await paid(7), 750);
+  });
+
+  it("after a card payment on the number, a later bank payment on ANOTHER Mercury invoice is kept for a person, never posted (the safe side)", async () => {
+    await link("abcd2345", { invoiceNumber: "RES-ABC123", mercuryUrl: "https://app.mercury.com/pay/x", amountUsd: 300, transactionId: "t-dep-2", paidAt: iso(T0) }, iso(T0 - 3600e3));
+    assert.equal((await recordNmiPaidInvoice({ pool, invoiceNumber: "RES-ABC123", amountUsd: 300, transactionId: "t-dep-2", paidAt: iso(T0), path: "guest" })).ok, true);
+    const out = await sync([merc("m-inv-m2", "RES-ABC123", 450)]);
+    assert.equal(out.recorded.length, 0);
+    assert.equal((await ledger("mercury_m-inv-m2")).reason, "mercury_paid_after_card_link");
+    assert.equal(await paid(7), 300);
+  });
+
+  it("#75's card note is written through the one note door, byte-identical to 855d016", async () => {
+    await handRow(250, 7);
+    const r = await recordNmiPaidInvoice({ pool, invoiceNumber: "RES-ABC123", amountUsd: 250, transactionId: "t-s9", paidAt: iso(T0), path: "webhook" });
+    assert.equal(r.ok, false);
+    const LIVE_855D016 = "Card payment $250.00 USD (NMI txn t-s9) received and NOT recorded automatically: a payment of the same amount is already typed on this booking. If that is this card payment, nothing to enter; if it is not, enter it.";
+    assert.equal(reviewNoteText(250, "t-s9", "manual_payment_requires_review"), LIVE_855D016);
+    assert.equal(await resNotes(7), "\n" + LIVE_855D016);
+  });
+
+  it("one paid-time rule: a Mercury invoice sent 9 Aug and first seen paid now is dated now (CRM row and ledger), never by updatedAt; the card path keeps its own time", async () => {
+    const before = Date.now();
+    const out = await sync([{ id: "m-inv-t1", invoiceNumber: "RES-ABC123", status: "Paid", amount: 77, createdAt: "2026-08-09T20:00:00Z", updatedAt: "2026-08-09T20:00:00Z" },
+      { id: "m-inv-t2", invoiceNumber: "JRM-142-O99", status: "Paid", amount: 66, createdAt: "2026-08-09T20:00:00Z", updatedAt: "2026-08-09T20:00:00Z" }]);
+    assert.equal(out.recorded.length, 2);
+    const at = new Date((await one("SELECT paid_at FROM core_payment WHERE notes LIKE '%mercury:m-inv-t1%'")).paid_at).getTime();
+    assert.ok(at >= before - 1000 && at <= Date.now() + 1000, "first sight, not 9 Aug");
+    const hd = new Date((await one("SELECT payment_date FROM core_jrmhotelpayment WHERE reference LIKE '%mercury:m-inv-t2%'")).payment_date).getTime();
+    assert.ok(hd >= before - 1000, "the hotel row too");
+    await handRow(88, 8);
+    await link("tt112345", { invoiceNumber: "RES-TWOHLF", amountUsd: 88, mercuryUrl: "https://app.mercury.com/pay/q" }, iso(T0));
+    await sync([{ id: "m-inv-t3", invoiceNumber: "RES-TWOHLF", status: "Paid", amount: 88, createdAt: "2026-08-09T20:00:00Z", updatedAt: "2026-08-09T20:00:00Z" }]);
+    const lrow = await one("SELECT paid_at FROM nesher_money_payment_posts WHERE transaction_id = 'mercury_m-inv-t3'");
+    assert.ok(new Date(lrow.paid_at).getTime() >= before - 1000, "the ledger review row is dated by first sight too");
+    const card = await recordNmiPaidInvoice({ pool, invoiceNumber: "RES-ABC123", amountUsd: 12.34, transactionId: "t-card-time", paidAt: "2026-09-01T08:00:00.000Z", path: "chat" });
+    assert.equal(card.ok, true);
+    assert.equal(new Date((await one("SELECT paid_at FROM core_payment WHERE notes LIKE '%nmi:t-card-time%'")).paid_at).toISOString(), "2026-09-01T08:00:00.000Z");
+  });
+
   it("the words check first (Gabbai D2) and name no card digits", () => {
     const w = REVIEW_WORDS.mercury_same_amount_on_booking;
-    assert.match(w, /If it is the same money, nothing to enter/);
-    assert.match(w, /if it is a second payment, enter it/);
+    assert.match(w, /If it is the same money, nothing to enter; if not, enter it\./);
     assert.match(NOTE_REASON_WORDS.mercury_same_amount_on_booking, /If that is the same money, nothing to enter; if it is a second payment, enter it\./);
     assert.doesNotMatch(w + NOTE_REASON_WORDS.mercury_same_amount_on_booking, /\d/);
+    const p3 = REVIEW_WORDS.mercury_paid_after_card_link + NOTE_REASON_WORDS.mercury_paid_after_card_link;
+    assert.match(REVIEW_WORDS.mercury_paid_after_card_link, /If money came in by bank, enter it; if not, nothing to enter\./);
+    // the phone's 07:00 line cuts each item's words at 160 characters (lib/money-map.js loopSentence): a cut
+    // check-first clause would read as an order, so every line on the list must fit whole
+    for (const [k, v] of Object.entries(REVIEW_WORDS)) assert.ok(v.length <= 160, k + " is " + v.length + " characters");
+    assert.match(NOTE_REASON_WORDS.mercury_paid_after_card_link, /If money really came in by bank, enter it; if not, nothing to enter\./);
+    assert.doesNotMatch(p3, /\d/);
   });
 });
 
@@ -284,6 +366,15 @@ describe("#145 a pay link stuck on 'confirming' is settled once the sweep record
     assert.equal(rev.posted, 0);
     assert.equal(rev.linksSettled, 0);
     assert.equal((await payload("conf2345")).confirming, true);
+  });
+
+  it("C5: a link whose claim-to-confirming span is over 5 minutes is left alone (window_too_wide), even with the sale inside it", async () => {
+    await stuck("wide2345", { claim: T0, since: T0 + 10 * 60e3 });
+    const r = await store.settleConfirmingLink({ invoiceNumber: "RES-ABC123", amountUsd: 55.55, transactionId: "t-wide", paidAt: iso(T0 + 30e3) }, pool);
+    assert.deepEqual(r, { ok: false, skipped: "window_too_wide" });
+    const out = await sweep([{ id: "t-wide", order: "RES-ABC123", actions: [{ type: "sale", amount: "55.55", at: T0 + 30e3 }] }]);
+    assert.equal(out.linksSettled, 0);
+    assert.equal((await payload("wide2345")).confirming, true);
   });
 
   it("the store door alone: a link that is no longer confirming, or already has a txn, is never touched", async () => {

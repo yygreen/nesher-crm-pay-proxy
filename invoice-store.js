@@ -329,6 +329,7 @@ export async function settleConfirmingLink({ invoiceNumber, amountUsd, transacti
   if (!ref || !/^[A-Za-z0-9_-]{1,64}$/.test(txn) || !(amount > 0) || !Number.isFinite(saleMs)) return { ok: false, skipped: "bad_input" };
   const rows = await findInvoicesByOrderId(ref, poolImpl);
   if (rows.some((r) => String(r.payload?.transactionId || "") === txn)) return { ok: false, skipped: "txn_on_link" };
+  let wide = 0;
   const hits = rows.filter((r) => {
     const p = r.payload || {};
     if (p.confirming !== true || String(p.transactionId || "") !== "" || !isShortPayCode(r.id)) return false;
@@ -336,9 +337,12 @@ export async function settleConfirmingLink({ invoiceNumber, amountUsd, transacti
     const claimMs = Date.parse(String(p.paidAt || ""));
     const sinceMs = Date.parse(String(p.confirmingSince || ""));
     if (!Number.isFinite(claimMs) || !Number.isFinite(sinceMs)) return false;
+    // Gabbai leftover C5: one guest attempt spans seconds; a claim-to-confirming span over 5 minutes is not a
+    // window this guard can vouch for (it would no longer depend only on nmi-card.js's call order) - left alone.
+    if (sinceMs - claimMs > 5 * 60 * 1000) { wide++; return false; }
     return saleMs >= claimMs - 60 * 1000 && saleMs <= sinceMs + 2 * 60 * 1000;
   });
-  if (hits.length !== 1) return { ok: false, skipped: hits.length ? "ambiguous" : "none" };
+  if (hits.length !== 1) return { ok: false, skipped: hits.length ? "ambiguous" : wide ? "window_too_wide" : "none" };
   try {
     const pool = storePool(poolImpl);
     const r = await pool.query(
