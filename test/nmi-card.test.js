@@ -609,6 +609,10 @@ describe("chargeWithToken", () => {
     });
     assert.equal(named.first_name, "Ada");
     assert.equal(named.last_name, "Lovelace");
+    // Audit #125: one typed word is never "<word> Customer" on the processor record.
+    const one = saleBillingAddress({ customerName: "Cohen" });
+    assert.deepEqual(one, { first_name: "Cohen" });
+    assert.doesNotMatch(JSON.stringify(saleBillingAddress({ customerName: "  Cohen  ", zip: "10977" })), /Customer|Guest|last_name/);
     assert.equal(named.address1, "12 Main St");
     assert.equal(named.city, "Spring Valley");
     assert.equal(named.state, "NY");
@@ -1474,6 +1478,8 @@ describe("chargePayCode", () => {
     assert.equal(body.billing_address.state, "NY");
     assert.equal(body.billing_address.country, "US");
     assert.equal(body.billing_address.first_name, "Ada");
+    // Audit #125: the one-word name is not padded with an invented "Customer".
+    assert.equal(body.billing_address.last_name, undefined);
     assert.equal(
       Object.prototype.hasOwnProperty.call(body, "payment_descriptor"),
       false

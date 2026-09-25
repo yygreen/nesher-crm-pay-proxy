@@ -358,49 +358,64 @@ async function saleBeforeReversal(txnId, deps) {
   return { ok: true, sale, dayBackCents: read.dayBackCents, nowMs: clock() };
 }
 
-/** Plain words for a gateway response_code. The raw code stays in its own field. */
+/**
+ * Plain words for a gateway response_code, English and Hebrew side by side in ONE table (audit E11 #62,
+ * 25 Sep: a Hebrew rep read 'לא אושר: ' + English). The raw code stays in its own field. No sentence
+ * ends in "tell the office" / "tell Joseph" (audit E16 #127) - the next step is declineNext's alone.
+ */
 const DECLINE_WORDS = [
-  [/^100$/, "Approved."],
-  [/^200$/, "The card was declined by the bank."],
-  [/^201$/, "The bank said do not honor this card."],
-  [/^202$/, "Insufficient funds."],
-  [/^203$/, "The card is over its limit."],
-  [/^204$/, "This kind of transaction is not allowed on the card."],
-  [/^220$/, "The card details were not accepted."],
-  [/^221$/, "No such card issuer."],
-  [/^222$/, "The issuer does not know this card number."],
-  [/^223$/, "The card has expired."],
-  [/^224$/, "The expiration date is wrong."],
-  [/^225$/, "The security code is wrong."],
-  [/^226$/, "The PIN is wrong."],
-  [/^240$/, "The bank asks the cardholder to call them."],
-  [/^25[0-3]$/, "The issuer flagged this card. Do not retry."],
-  [/^26[0-4]$/, "Declined. The cardholder should call the bank."],
-  [/^300$/, "The gateway rejected the transaction."],
-  [/^400$/, "Processor error. Try again in a minute."],
-  [/^410$/, "Merchant configuration error. Tell the office."],
-  [/^411$/, "The merchant account is inactive. Tell the office."],
-  [/^420$/, "Could not reach the processor. Try again."],
-  [/^421$/, "Could not reach the card issuer. Try again."],
-  [/^430$/, "The processor saw this as a duplicate."],
-  [/^44[01]$/, "The transaction details were rejected by the processor."],
-  [/^460$/, "This card type is not supported here."],
-  [/^461$/, "This card type is not supported here."],
+  [/^100$/, "Approved.", "אושר."],
+  [/^200$/, "The card was declined by the bank.", "הבנק דחה את הכרטיס."],
+  [/^201$/, "The bank said do not honor this card.", "הבנק הורה לא לכבד את הכרטיס."],
+  [/^202$/, "Insufficient funds.", "אין מספיק יתרה בכרטיס."],
+  [/^203$/, "The card is over its limit.", "הכרטיס חורג מהמסגרת שלו."],
+  [/^204$/, "This kind of transaction is not allowed on the card.", "סוג העסקה הזה לא מותר בכרטיס."],
+  [/^220$/, "The card details were not accepted.", "פרטי הכרטיס לא התקבלו."],
+  [/^221$/, "No such card issuer.", "אין מנפיק כרטיסים כזה."],
+  [/^222$/, "The issuer does not know this card number.", "המנפיק לא מכיר את מספר הכרטיס הזה."],
+  [/^223$/, "The card has expired.", "תוקף הכרטיס פג."],
+  [/^224$/, "The expiration date is wrong.", "תאריך התוקף שגוי."],
+  [/^225$/, "The security code is wrong.", "קוד האבטחה שגוי."],
+  [/^226$/, "The PIN is wrong.", "הקוד הסודי שגוי."],
+  [/^240$/, "The bank asks the cardholder to call them.", "הבנק מבקש שבעל הכרטיס יתקשר אליו."],
+  [/^25[0-3]$/, "The issuer flagged this card. Do not retry.", "המנפיק סימן את הכרטיס. אל תנסה שוב."],
+  [/^26[0-4]$/, "Declined. The cardholder should call the bank.", "נדחה. בעל הכרטיס צריך להתקשר לבנק."],
+  [/^300$/, "The gateway rejected the transaction.", "מערכת הסליקה דחתה את העסקה."],
+  [/^400$/, "Processor error. Try again in a minute.", "תקלה אצל המעבד. נסה שוב בעוד דקה."],
+  [/^410$/, "The processor refused the merchant account's setup.", "המעבד דחה את הגדרות חשבון הסוחר."],
+  [/^411$/, "The merchant account is inactive at the processor.", "חשבון הסוחר לא פעיל אצל המעבד."],
+  [/^420$/, "Could not reach the processor. Try again.", "לא הצלחנו להגיע למעבד. נסה שוב."],
+  [/^421$/, "Could not reach the card issuer. Try again.", "לא הצלחנו להגיע למנפיק הכרטיס. נסה שוב."],
+  [/^430$/, "The processor saw this as a duplicate.", "המעבד זיהה את זה ככפילות."],
+  [/^44[01]$/, "The transaction details were rejected by the processor.", "המעבד דחה את פרטי העסקה."],
+  [/^460$/, "This card type is not supported here.", "סוג הכרטיס הזה לא נתמך כאן."],
+  [/^461$/, "This card type is not supported here.", "סוג הכרטיס הזה לא נתמך כאן."],
 ];
+
+/** The payment server has no processor key (keys_missing): what happened, and where to charge instead. */
+export const KEYS_MISSING_WORDS = {
+  reason: "Card processing is not set up on the payment server.",
+  next: "Nothing was charged. Charge it in the gateway portal; the payment server is missing its processor key.",
+  reasonHe: "סליקת כרטיסים לא מוגדרת בשרת התשלומים.",
+  nextHe: "לא חויב כלום. חייב בפורטל של המעבד; בשרת התשלומים חסר מפתח הסליקה.",
+};
 
 export function declineHuman(code, fallbackText, o = {}) {
   const c = String(code || "").trim();
-  for (const [re, words] of DECLINE_WORDS) if (re.test(c)) return words;
+  const he = o.lang === "he";
+  for (const [re, words, wordsHe] of DECLINE_WORDS) if (re.test(c)) return he ? wordsHe : words;
   const t = String(fallbackText || "").trim();
-  if (/declin/i.test(t)) return "The card was declined.";
-  if (/expired/i.test(t)) return "The card has expired.";
-  if (/insufficient/i.test(t)) return "Insufficient funds.";
-  if (/duplicate/i.test(t)) return "The processor saw this as a duplicate.";
+  if (/declin/i.test(t)) return he ? "הכרטיס נדחה." : "The card was declined.";
+  if (/expired/i.test(t)) return he ? "תוקף הכרטיס פג." : "The card has expired.";
+  if (/insufficient/i.test(t)) return he ? "אין מספיק יתרה בכרטיס." : "Insufficient funds.";
+  if (/duplicate/i.test(t)) return he ? "המעבד זיהה את זה ככפילות." : "The processor saw this as a duplicate.";
   // Mr. AT (25 Sep, the Kaufman charge): a v5 request the gateway refused carries no code and made no
   // transaction - the bank never saw it. Say that, with the gateway's own words when it gave any.
-  if (o.refused) return "The card processor refused the charge itself - it never reached the bank." + (o.said ? ` It said: "${String(o.said).slice(0, 140)}".` : "");
+  if (o.refused) return he
+    ? "מערכת הסליקה דחתה את החיוב עצמו - הוא לא הגיע לבנק." + (o.said ? ` היא כתבה: "${String(o.said).slice(0, 140)}".` : "")
+    : "The card processor refused the charge itself - it never reached the bank." + (o.said ? ` It said: "${String(o.said).slice(0, 140)}".` : "");
   // Mr. AU: the next step is declineNext's alone - two different next steps in one tile contradicted each other.
-  return "The card was not charged.";
+  return he ? "הכרטיס לא חויב." : "The card was not charged.";
 }
 
 /**
@@ -412,6 +427,8 @@ export const KEEP_CODES = /^(200|201|202|203|220|224|225|240|260|300|400|420|421
 
 export function declineNext(code, o = {}) {
   const c = String(code || "").trim();
+  // Audit E11 (#62): the same one next step in Hebrew (o.lang === "he"), branch for branch.
+  if (o.lang === "he") return declineNextHe(c, o);
   const again = o.kept ? " and tap Charge again - the card is held 5 more minutes, no need to send it again" : "";
   if (/^225$/.test(c)) return o.kept ? `Type the right security code in the box on the tile${again}.` : "Send the card again with the right security code.";
   if (/^22[04]$/.test(c)) return o.kept ? `Type the right expiry here (like 08/29)${again}.` : "Check the expiry and send the card again.";
@@ -419,12 +436,28 @@ export function declineNext(code, o = {}) {
   if (/^(20[01]|24\d|26\d)$/.test(c)) return o.kept ? `Ask the customer to call the bank and approve the charge, then tap Charge again within 5 minutes - or use another card.` : "Ask the customer to call the bank and approve the charge, then send the card again - or use another card.";
   if (/^(204|223|25\d|46[01])$/.test(c)) return "Use another card.";
   if (/^22[12]$/.test(c)) return "Check the card number and send the card again.";
-  if (/^41[01]$/.test(c)) return "Nothing was charged - tell Joseph, the merchant account needs a fix.";
+  // Audit E16 (#127): never "tell Joseph" - he is often the one reading. What is wrong, and what to do now.
+  if (/^41[01]$/.test(c)) return "Nothing was charged - the merchant account needs a fix at Pinpoint (the processor), and no card goes through it until then. Send the customer a bank-transfer link instead.";
   if (/^430$/.test(c)) return "Check in the processor whether the first charge went through before trying again.";
-  if (/^(300|4[0-4]\d)$/.test(c)) return o.kept ? "Nothing was charged. Try once more in a minute; if it says the same, tell Joseph." : "Nothing was charged. Send the card again in a minute; if it says the same, tell Joseph.";
+  if (/^(300|4[0-4]\d)$/.test(c)) return o.kept ? "Nothing was charged. Try once more in a minute; if it says the same, charge it in the gateway portal." : "Nothing was charged. Send the card again in a minute; if it says the same, charge it in the gateway portal.";
   // Gabbai AT B3 (canon s.7): never advise splitting a sale to get under a limit.
-  if (o.refused) return "Nothing was charged. If it is about the amount, ask Joseph to call Pinpoint about the account's limit, or send the customer a bank-transfer link." + (o.kept ? " The card is held 5 more minutes." : "");
+  if (o.refused) return "Nothing was charged. If it is about the amount, send the customer a bank-transfer link; the account's card limit is raised only by Pinpoint (the processor)." + (o.kept ? " The card is held 5 more minutes." : "");
   return o.kept ? "Tap Charge again within 5 minutes, or use another card." : "Send the card again, or use another card.";
+}
+
+function declineNextHe(c, o) {
+  const again = o.kept ? " ולחץ חייב שוב - הכרטיס מוחזק עוד 5 דקות, אין צורך לשלוח אותו מחדש" : "";
+  if (/^225$/.test(c)) return o.kept ? `הקלד בכרטיס את קוד האבטחה הנכון${again}.` : "שלח את הכרטיס שוב עם קוד האבטחה הנכון.";
+  if (/^22[04]$/.test(c)) return o.kept ? `כתוב כאן את התוקף הנכון (למשל 08/29)${again}.` : "בדוק את התוקף ושלח את הכרטיס שוב.";
+  if (/^20[23]$/.test(c)) return o.kept ? `נסה סכום קטן יותר${again}, או כרטיס אחר.` : "נסה סכום קטן יותר, או כרטיס אחר.";
+  if (/^(20[01]|24\d|26\d)$/.test(c)) return o.kept ? "בקש מהלקוח להתקשר לבנק ולאשר את החיוב, ואז לחץ חייב שוב תוך 5 דקות - או כרטיס אחר." : "בקש מהלקוח להתקשר לבנק ולאשר את החיוב, ואז שלח את הכרטיס שוב - או כרטיס אחר.";
+  if (/^(204|223|25\d|46[01])$/.test(c)) return "השתמש בכרטיס אחר.";
+  if (/^22[12]$/.test(c)) return "בדוק את מספר הכרטיס ושלח אותו שוב.";
+  if (/^41[01]$/.test(c)) return "לא חויב כלום - חשבון הסוחר צריך תיקון אצל Pinpoint (המעבד), ועד אז שום כרטיס לא יעבור בו. שלח ללקוח קישור להעברה בנקאית במקום.";
+  if (/^430$/.test(c)) return "בדוק אצל המעבד אם החיוב הראשון עבר לפני שמנסים שוב.";
+  if (/^(300|4[0-4]\d)$/.test(c)) return o.kept ? "לא חויב כלום. נסה שוב פעם אחת בעוד דקה; אם זה חוזר, חייב בפורטל של המעבד." : "לא חויב כלום. שלח את הכרטיס שוב בעוד דקה; אם זה חוזר, חייב בפורטל של המעבד.";
+  if (o.refused) return "לא חויב כלום. אם זה בגלל הסכום, שלח ללקוח קישור להעברה בנקאית; את מסגרת הכרטיסים של החשבון מעלה רק Pinpoint (המעבד)." + (o.kept ? " הכרטיס מוחזק עוד 5 דקות." : "");
+  return o.kept ? "לחץ חייב שוב תוך 5 דקות, או כרטיס אחר." : "שלח את הכרטיס שוב, או כרטיס אחר.";
 }
 
 function isInt(n) {
@@ -722,8 +755,11 @@ export async function handleChargeRequest(req, res, deps = {}) {
       {
         ok: false,
         error: (sale && sale.error) || "declined",
-        decline_reason_human: sale && sale.error === "keys_missing" ? "Card processing is not configured. Tell the office." : declineHuman(code, sale && sale.responseText, { refused, said }),
-        decline_next: sale && sale.error === "keys_missing" ? "Nothing was charged - tell Joseph." : declineNext(code, { kept: Boolean(kept), refused }),
+        decline_reason_human: sale && sale.error === "keys_missing" ? KEYS_MISSING_WORDS.reason : declineHuman(code, sale && sale.responseText, { refused, said }),
+        decline_next: sale && sale.error === "keys_missing" ? KEYS_MISSING_WORDS.next : declineNext(code, { kept: Boolean(kept), refused }),
+        // Audit E11 (#62): the same two sentences in Hebrew; the desk shows them on a tile born from a Hebrew line.
+        decline_reason_he: sale && sale.error === "keys_missing" ? KEYS_MISSING_WORDS.reasonHe : declineHuman(code, sale && sale.responseText, { refused, said, lang: "he" }),
+        decline_next_he: sale && sale.error === "keys_missing" ? KEYS_MISSING_WORDS.nextHe : declineNext(code, { kept: Boolean(kept), refused, lang: "he" }),
         decline_code: code,
         decline_text: sale && sale.responseText ? String(sale.responseText).slice(0, 120) : (said ? said.slice(0, 120) : null),
         // A refusal of the REQUEST (no transaction exists at the gateway) vs the bank's answer.
@@ -970,7 +1006,7 @@ async function reversalDoor(kind, req, res, deps) {
         {
           ok: false,
           error: out.error || `${kind}_failed`,
-          decline_reason_human: out.error === "keys_missing" ? "Card processing is not configured. Tell the office." : kind === "refund" ? "The processor refused the refund. Check the sale in the gateway portal." : "The processor refused the void. If the sale already settled, refund it instead.",
+          decline_reason_human: out.error === "keys_missing" ? KEYS_MISSING_WORDS.reason : kind === "refund" ? "The processor refused the refund. Check the sale in the gateway portal." : "The processor refused the void. If the sale already settled, refund it instead.",
           decline_code: out.responseCode || null,
           decline_text: out.responseText ? String(out.responseText).slice(0, 120) : null,
           txn_id: txnId,

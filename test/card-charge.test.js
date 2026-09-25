@@ -9,6 +9,8 @@ import {
   chargeFamilyPath,
   refundCapCents,
   declineHuman,
+  declineNext,
+  KEYS_MISSING_WORDS,
   KEEP_CODES,
   handleChargeRequest,
   handleVoidRequest,
@@ -108,6 +110,44 @@ describe("card-charge basics", () => {
     for (const code of ["200", "201", "202", "203", "204", "220", "221", "222", "223", "224", "225", "226", "240", "250", "260", "300", "400", "410", "411", "420", "421", "430", "440", "460", "461"]) {
       assert.doesNotMatch(declineHuman(code), /\d/, `no digits for ${code}`);
     }
+  });
+
+  // money-leftover-words, 25 Sep: audit E11 (#62) Hebrew beside English, E16 (#127) no dead-end "tell Joseph".
+  it("E11 #62: every code has its Hebrew words, in Hebrew letters, with no digits and no English", () => {
+    const codes = ["100", "200", "201", "202", "203", "204", "220", "221", "222", "223", "224", "225", "226", "240", "250", "251", "260", "264", "300", "400", "410", "411", "420", "421", "430", "440", "441", "460", "461"];
+    for (const code of codes) {
+      const he = declineHuman(code, null, { lang: "he" });
+      assert.match(he, /[א-ת]/, `Hebrew for ${code}`);
+      assert.doesNotMatch(he, /\d|[A-Za-z]/, `no digits or English for ${code}: ${he}`);
+      assert.notEqual(he, declineHuman(code), `not the English for ${code}`);
+    }
+    assert.equal(declineHuman("999", "DECLINED BY ISSUER", { lang: "he" }), "הכרטיס נדחה.");
+    assert.equal(declineHuman(null, "", { lang: "he" }), "הכרטיס לא חויב.");
+    assert.match(declineHuman(null, "", { refused: true, said: "Amount exceeds limit", lang: "he" }), /^מערכת הסליקה דחתה את החיוב עצמו - הוא לא הגיע לבנק\. היא כתבה: "Amount exceeds limit"\.$/);
+    // English is word for word what it was, for the codes this lane did not touch
+    assert.equal(declineHuman("202"), "Insufficient funds.");
+    assert.equal(declineNext("225", { kept: true }), "Type the right security code in the box on the tile and tap Charge again - the card is held 5 more minutes, no need to send it again.");
+  });
+  it("E11 #62 / E16 #127: every next step exists in Hebrew, and no next step in either language says tell Joseph / ask Joseph / tell the office", () => {
+    const codes = ["200", "201", "202", "203", "204", "220", "221", "222", "223", "224", "225", "240", "250", "260", "300", "400", "410", "411", "420", "430", "440", "460", "999", ""];
+    const dead = /tell joseph|ask joseph|tell the office|תגיד ליוסף|ספר ליוסף|למשרד/i;
+    for (const code of codes) {
+      for (const kept of [true, false]) {
+        for (const refused of [true, false]) {
+          const en = declineNext(code, { kept, refused });
+          const he = declineNext(code, { kept, refused, lang: "he" });
+          assert.doesNotMatch(en, dead, `${code} kept=${kept} refused=${refused}: ${en}`);
+          assert.doesNotMatch(he, dead, `${code} kept=${kept} refused=${refused}: ${he}`);
+          assert.match(he, /[א-ת]/, `Hebrew next for ${code}`);
+        }
+      }
+      assert.doesNotMatch(declineHuman(code), dead, `reason ${code}`);
+    }
+    for (const w of Object.values(KEYS_MISSING_WORDS)) assert.doesNotMatch(w, dead, w);
+    assert.match(KEYS_MISSING_WORDS.next, /gateway portal/);
+    assert.match(declineNext("410"), /Pinpoint/);
+    // Gabbai AT B3 (canon s.7) still holds in both languages: never advise splitting a sale under a limit
+    assert.doesNotMatch(declineNext(null, { refused: true }) + declineNext(null, { refused: true, lang: "he" }), /split|two charges|לפצל|שני חיובים/i);
   });
 });
 
@@ -382,6 +422,9 @@ describe("POST /__nesher_pay/charge", () => {
       assert.equal(p.status, 402);
       assert.equal(p.body.ok, false);
       assert.equal(p.body.decline_reason_human, "Insufficient funds.");
+      // Audit E11 (#62): the same pair in Hebrew rides beside the English.
+      assert.equal(p.body.decline_reason_he, "אין מספיק יתרה בכרטיס.");
+      assert.match(p.body.decline_next_he, /סכום קטן יותר/);
       assert.equal(p.body.decline_code, "202");
       assert.equal(p.body.decline_text, "DECLINED: INSUFFICIENT FUNDS");
       assert.equal(p.body.last4, "1486");
@@ -907,7 +950,10 @@ describe("declines say why and what next, and keep the card for a retry", () => 
       assert.equal(p.body.refused_by_processor, true);
       assert.match(p.body.decline_reason_human, /never reached the bank/);
       assert.match(p.body.decline_reason_human, /Amount exceeds the maximum/);
-      assert.match(p.body.decline_next, /call Pinpoint about the account's limit/);
+      // Audit E16 (#127): the limit is named as Pinpoint's, and the next step is one the reader can take now.
+      assert.match(p.body.decline_next, /send the customer a bank-transfer link; the account's card limit is raised only by Pinpoint/);
+      assert.doesNotMatch(p.body.decline_next, /ask Joseph|tell Joseph/i);
+      assert.match(p.body.decline_next_he, /קישור להעברה בנקאית/);
       assert.doesNotMatch(p.body.decline_next, /split/i, "never advise splitting a sale (Gabbai AT B3)");
       assert.match(s.logs.at(-1), /"said_len":\d+/);
       assert.doesNotMatch(s.logs.at(-1), /maximum allowed/, 'the sentence itself is never logged');

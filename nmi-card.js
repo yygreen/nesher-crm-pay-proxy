@@ -376,8 +376,10 @@ export function saleBillingAddress(opts = {}) {
   const country = isoCountry(opts.country, hasPlace);
   const addr = {};
   if (names) {
+    // Audit #125 (25 Sep): ONE typed word is the whole name that was given - never "<name> Customer", a name
+    // nobody said. The word stays where it always went (first_name); the invented last name is left out.
     addr.first_name = names.first_name;
-    addr.last_name = names.last_name;
+    if (customerName.trim().split(/\s+/).filter(Boolean).length > 1) addr.last_name = names.last_name;
   }
   if (address1) addr.address1 = address1;
   if (city) addr.city = city;
