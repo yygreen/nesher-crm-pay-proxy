@@ -1553,13 +1553,16 @@ export function zeroHold(entry) {
  * 24 random bytes = 192 bits: the reference cannot be guessed, and on its own
  * it is worthless - spending it also needs a charge ticket signed over it.
  */
-export function registerCardHold(entry, { now = Date.now(), ttlMs = CARD_HOLD_TTL_MS } = {}) {
+export function registerCardHold(entry, { now = Date.now(), ttlMs = CARD_HOLD_TTL_MS, allowNoExpiry = false } = {}) {
   const number = String(entry.pan || "");
   if (!/^\d{12,19}$/.test(number)) return { ok: false, error: "pan_invalid" };
   const rep = String(entry.rep || "").trim();
   if (!rep) return { ok: false, error: "rep_required" };
   const expMMYY = expiryToMMYY(entry.expiry);
-  if (!expMMYY) return { ok: false, error: "expiry_unknown" };
+  // Mr. AT (25 Sep, the Kaufman charge): a typed card whose expiry comes in the NEXT message is held
+  // without one (card-hold `partial`), and fillCardHold adds it. It can never be charged without one:
+  // redeemCardHold refuses a hold that still needs its expiry.
+  if (!expMMYY && !allowNoExpiry) return { ok: false, error: "expiry_unknown" };
   const life = Math.min(Number(ttlMs) || CARD_HOLD_TTL_MS, CARD_HOLD_TTL_MS);
   const expiresAt = now + life;
   // A security code only ever arrives with a typed / pasted / spoken card
@@ -1571,15 +1574,78 @@ export function registerCardHold(entry, { now = Date.now(), ttlMs = CARD_HOLD_TT
   cardHolds.set(ref, {
     pan: Buffer.from(number, "latin1"),
     cvv: cvvText ? Buffer.from(cvvText, "latin1") : null,
-    expMMYY,
+    expMMYY: expMMYY || "",
     brand: entry.brand || brandOf(number),
     last4: number.slice(-4),
-    expiry: entry.expiry || null,
+    expiry: expMMYY ? entry.expiry || null : null,
     rep,
     expiresAt,
+    declines: 0,
   });
-  return { ok: true, ref, expiresAt };
+  return { ok: true, ref, expiresAt, needsExpiry: !expMMYY };
 }
+
+/**
+ * The missing piece of a held card, typed in a later message (Mr. AT): its expiry, and/or a code.
+ * Same rep only - a wrong rep burns the hold, exactly like redeemCardHold. The life of the hold is
+ * NOT extended here: five minutes from the read, whatever is added to it.
+ */
+export function fillCardHold(ref, { now = Date.now(), rep, expiry, cvv } = {}) {
+  const key = String(ref || "");
+  const e = cardHolds.get(key);
+  if (!e) return { ok: false, error: "unknown" };
+  if (e.expiresAt <= now) {
+    cardHolds.delete(key);
+    zeroHold(e);
+    return { ok: false, error: "expired" };
+  }
+  if (String(rep || "") !== e.rep) {
+    cardHolds.delete(key);
+    zeroHold(e);
+    return { ok: false, error: "rep_mismatch" };
+  }
+  const cvvText = cvv == null ? "" : String(cvv).trim();
+  if (cvvText && !/^\d{3,4}$/.test(cvvText)) return { ok: false, error: "cvv_invalid" };
+  if (expiry != null && expiry !== "") {
+    const mmyy = expiryToMMYY(expiry);
+    if (!mmyy) return { ok: false, error: "expiry_invalid" };
+    e.expMMYY = mmyy;
+    e.expiry = expiry;
+  }
+  if (cvvText) {
+    if (e.cvv && typeof e.cvv.fill === "function") e.cvv.fill(0);
+    e.cvv = Buffer.from(cvvText, "latin1");
+  }
+  return { ok: true, expiresAt: e.expiresAt, entry: { brand: e.brand, last4: e.last4, expiry: e.expiry, cvvHeld: Boolean(e.cvv), needsExpiry: !e.expMMYY } };
+}
+
+/** How many clear declines one held card may take before it is dropped (Mr. AT). */
+export const MAX_HOLD_DECLINES = 3;
+
+/**
+ * AFTER A CLEAR DECLINE (Mr. AT, Joseph 25 Sep): the card goes back behind the SAME reference for
+ * five more minutes, bound to the same rep, so a corrected security code, expiry or amount can be
+ * tried without sending the card again. Only a clear answer from the gateway ever gets here - an
+ * approval spends the hold for good and an unknown outcome zeroes it (it may have charged). After
+ * MAX_HOLD_DECLINES declines the number is zeroed and the rep sends the card again.
+ */
+export function reholdAfterDecline(ref, entry, { now = Date.now(), ttlMs = CARD_HOLD_TTL_MS } = {}) {
+  const key = String(ref || "");
+  if (!entry || !entry.pan || !CARD_REF_OK.test(key)) {
+    zeroHold(entry);
+    return { ok: false, error: "invalid" };
+  }
+  const n = (Number(entry.declines) || 0) + 1;
+  if (n >= MAX_HOLD_DECLINES || cardHolds.has(key)) {
+    zeroHold(entry);
+    return { ok: false, error: "too_many" };
+  }
+  entry.declines = n;
+  entry.expiresAt = now + Math.min(Number(ttlMs) || CARD_HOLD_TTL_MS, CARD_HOLD_TTL_MS);
+  cardHolds.set(key, entry);
+  return { ok: true, expiresAt: entry.expiresAt, declinesLeft: MAX_HOLD_DECLINES - n };
+}
+const CARD_REF_OK = /^cr_[A-Za-z0-9_-]{16,64}$/;
 
 /**
  * Spend the hold. ONE presentation is the whole life of a reference: it is
@@ -1599,6 +1665,11 @@ export function redeemCardHold(ref, { now = Date.now(), rep } = {}) {
   if (rep !== undefined && String(rep || "") !== e.rep) {
     zeroHold(e);
     return { ok: false, error: "rep_mismatch" };
+  }
+  // Never charged without its expiry (Mr. AT partial hold). The desk never arms one; this is the lock.
+  if (!e.expMMYY) {
+    zeroHold(e);
+    return { ok: false, error: "needs_expiry" };
   }
   return { ok: true, entry: e };
 }
@@ -1990,6 +2061,43 @@ export async function handleCardHoldRequest(req, res, deps = {}) {
   purge([read.buffer]);
   if (!body || typeof body !== "object" || Array.isArray(body)) return done(400, { ok: false, error: "invalid_json" }, { ...fields, outcome: "invalid_json" });
 
+  // FILL (Mr. AT, 25 Sep): the expiry (or a code) for a card ALREADY held, typed in a later message.
+  // No number on this body - the reference and the ticket's rep find the hold.
+  if (body.token_ref != null && body.pan == null) {
+    const ref = String(body.token_ref || "");
+    const cvvF = body.cvv == null ? "" : String(body.cvv).trim();
+    body.cvv = null;
+    delete body.cvv;
+    if (!/^cr_[A-Za-z0-9_-]{16,64}$/.test(ref)) return done(400, { ok: false, error: "token_ref_invalid" }, { ...fields, outcome: "fill:token_ref_invalid" });
+    const expF = body.exp == null ? body.expiry : body.exp;
+    let expiryF = null;
+    if (expF != null && String(expF).trim() !== "") {
+      expiryF = normalizeExpiry(expF, new Date(clock()));
+      if (!expiryF) return done(400, { ok: false, error: "expiry_invalid" }, { ...fields, outcome: "fill:expiry_invalid" });
+    }
+    if (!expiryF && !cvvF) return done(400, { ok: false, error: "nothing_to_fill" }, { ...fields, outcome: "fill:nothing" });
+    const f = fillCardHold(ref, { now: clock(), rep: ticket.repId, expiry: expiryF, cvv: cvvF });
+    if (!f.ok) {
+      const status = f.error === "cvv_invalid" || f.error === "expiry_invalid" ? 400 : 410;
+      return done(status, { ok: false, error: f.error === "unknown" || f.error === "expired" || f.error === "rep_mismatch" ? "token_ref_spent_or_expired" : f.error }, { ...fields, outcome: `fill:${f.error}` });
+    }
+    return done(
+      200,
+      {
+        ok: true,
+        brand: f.entry.brand || "card",
+        brandLabel: BRAND_LABEL[f.entry.brand] || "Card",
+        last4: f.entry.last4,
+        expiry: f.entry.expiry || null,
+        needs_expiry: f.entry.needsExpiry === true,
+        cvv_held: f.entry.cvvHeld === true,
+        token_ref: ref,
+        token_ref_expires_at: new Date(f.expiresAt).toISOString(),
+      },
+      { ...fields, outcome: `fill:ok${expiryF ? ":exp" : ""}${cvvF ? ":cvv" : ""}` }
+    );
+  }
+
   const digits = String(body.pan == null ? "" : body.pan).replace(/[\s\-.]/g, "");
   const expRaw = body.exp == null ? body.expiry : body.exp;
   const cvvRaw = body.cvv == null ? "" : String(body.cvv).trim();
@@ -2005,9 +2113,13 @@ export async function handleCardHoldRequest(req, res, deps = {}) {
   // NOT sliced: a five-digit slip must never reach the bank as a four-digit code.
   if (cvvRaw && !/^\d{3,4}$/.test(cvvRaw)) return done(400, { ok: false, error: "cvv_invalid" }, { ...fields, outcome: "cvv_invalid" });
   const expiry = normalizeExpiry(expRaw, new Date(clock()));
-  if (!expiry) return done(400, { ok: false, error: "expiry_invalid" }, { ...fields, outcome: "expiry_invalid" });
+  // A card typed WITHOUT its expiry (Mr. AT): held as `partial` only when the desk asks for it, so the
+  // rep's next message ("08/29") completes it instead of the card being typed again. An expiry that was
+  // given but is wrong or past is still refused here, in words.
+  const partial = body.partial === true && (expRaw == null || String(expRaw).trim() === "");
+  if (!expiry && !partial) return done(400, { ok: false, error: "expiry_invalid" }, { ...fields, outcome: "expiry_invalid" });
   const brand = brandOf(digits);
-  const held = registerCardHold({ pan: digits, expiry, brand, rep: ticket.repId, cvv: cvvRaw }, { now: clock() });
+  const held = registerCardHold({ pan: digits, expiry: expiry || null, brand, rep: ticket.repId, cvv: cvvRaw }, { now: clock(), allowNoExpiry: partial });
   if (!held.ok) return done(400, { ok: false, error: held.error }, { ...fields, outcome: held.error });
   const name = nameCandidate(nameRaw) || null;
 
@@ -2019,7 +2131,8 @@ export async function handleCardHoldRequest(req, res, deps = {}) {
       brand: brand || "card",
       brandLabel: BRAND_LABEL[brand] || "Card",
       last4: digits.slice(-4),
-      expiry: expiry,
+      expiry: expiry || null,
+      needs_expiry: !expiry,
       name: name,
       // Typed digits are what the rep meant; spoken ones were heard, so the rep confirms the last four.
       confidence: source === "spoken" ? "low" : "high",
@@ -2030,6 +2143,6 @@ export async function handleCardHoldRequest(req, res, deps = {}) {
       token_ref_expires_at: new Date(held.expiresAt).toISOString(),
       token_ref_error: null,
     },
-    { ...fields, outcome: `ok:${source}${cvvRaw ? ":cvv" : ""}` }
+    { ...fields, outcome: `ok:${source}${cvvRaw ? ":cvv" : ""}${expiry ? "" : ":partial"}` }
   );
 }

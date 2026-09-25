@@ -152,6 +152,69 @@ describe("card-hold door", () => {
     assert.equal(gateway[0].payment_details.card_number, PAN);
     assert.equal(gateway[0].payment_details.card_cvv, "123");
     assert.ok(trace.buffers.length >= 2, "the number and the code were both traced");
-    for (const b of trace.buffers) assert.equal(b.every((x) => x === 0), true, "every held buffer is zero after the charge");
+    // Mr. AT: a clear decline keeps the card (and its code) for a retry; spending it zeroes both.
+    assert.equal(j.hold_kept, true);
+    const kept = redeemCardHold(ref, { rep: "joseph" });
+    assert.equal(kept.ok, true);
+    zeroHold(kept.entry);
+    for (const b of trace.buffers) assert.equal(b.every((x) => x === 0), true, "every held buffer is zero once the kept hold is spent");
+  });
+
+  // ---- Mr. AT (25 Sep, the Kaufman charge): a card typed without its expiry is held as partial and the
+  // next message completes it; it can never be charged before it has one.
+  it("partial: a card without its expiry is held only when the desk asks, and says it needs one", async () => {
+    const no = await hold({ pan: PAN });
+    assert.equal(no.status, 400);
+    assert.equal(no.json.error, "expiry_invalid", "without partial the old answer stands");
+    const r = await hold({ pan: PAN, partial: true });
+    assert.equal(r.status, 200, JSON.stringify(r.json));
+    assert.equal(r.json.needs_expiry, true);
+    assert.equal(r.json.expiry, null);
+    assert.equal(r.json.last4, "1111");
+    assert.match(r.logs.at(-1), /"outcome":"ok:typed:partial"/);
+    assert.equal(JSON.stringify(r).includes(PAN), false);
+    // a wrong expiry given WITH partial is still refused in words
+    const bad = await hold({ pan: PAN, partial: true, exp: "13/30" });
+    assert.equal(bad.json.error, "expiry_invalid");
+  });
+
+  it("partial: charging before the expiry arrives is refused and burns nothing at the gateway", async () => {
+    const r = await hold({ pan: PAN, partial: true });
+    const ref = r.json.token_ref;
+    const gateway = [];
+    const fetchImpl = async (u, init) => { gateway.push(1); return { ok: true, status: 200, text: async () => "{}" }; };
+    const tk = mintTicket({ kind: "charge", repId: "joseph", bind: ref, secret: SECRET }).token;
+    const rr = res();
+    await handleChargeRequest(req({ token_ref: ref, amount_cents: 2500, currency: "USD", brand: "nesher", rep: "joseph", customer_name: "Kaufman" }, { "x-ocr-ticket": tk }), rr, { secret: SECRET, fetchImpl, privateKey: "k", log: () => {} });
+    assert.equal(rr.out.status, 409);
+    assert.equal(JSON.parse(rr.out.body).error, "token_ref_needs_expiry");
+    assert.equal(gateway.length, 0);
+  });
+
+  it("fill: the expiry typed next completes the SAME hold (same rep only), and it then charges", async () => {
+    const r = await hold({ pan: PAN, partial: true });
+    const ref = r.json.token_ref;
+    const f = await hold({ token_ref: ref, exp: "08/29" });
+    assert.equal(f.status, 200, JSON.stringify(f.json));
+    assert.equal(f.json.token_ref, ref);
+    assert.equal(f.json.expiry, "08/29");
+    assert.equal(f.json.needs_expiry, false);
+    assert.match(f.logs.at(-1), /"outcome":"fill:ok:exp"/);
+    // another rep cannot fill it - and the try burns it
+    const r2 = await hold({ pan: PAN, partial: true });
+    const wrong = await hold({ token_ref: r2.json.token_ref, exp: "08/29" }, ticket("hold", "sruly"));
+    assert.equal(wrong.status, 410);
+    assert.equal(redeemCardHold(r2.json.token_ref, { rep: "joseph" }).error, "unknown");
+    // a fill with nothing in it is refused in words
+    const empty = await hold({ token_ref: ref });
+    assert.equal(empty.json.error, "nothing_to_fill");
+    // the completed hold charges with the typed expiry
+    const sale = [];
+    const fetchImpl = async (u, init) => { sale.push(JSON.parse(init.body)); return { ok: true, status: 200, text: async () => JSON.stringify({ response: "1", id: "t9" }) }; };
+    const tk = mintTicket({ kind: "charge", repId: "joseph", bind: ref, secret: SECRET }).token;
+    const rr = res();
+    await handleChargeRequest(req({ token_ref: ref, amount_cents: 2500, currency: "USD", brand: "nesher", rep: "joseph", customer_name: "Kaufman" }, { "x-ocr-ticket": tk }), rr, { secret: SECRET, fetchImpl, privateKey: "k", log: () => {} });
+    assert.equal(rr.out.status, 200, rr.out.body);
+    assert.equal(sale[0].payment_details.card_exp, "0829");
   });
 });
