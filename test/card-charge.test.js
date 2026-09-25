@@ -19,6 +19,7 @@ import {
   matchSales,
   _resetSaleCache,
   _resetArmingsForTests,
+  _resetSaleClaimsForTests,
   PRE_REVERSAL_READ_MS,
   CRM_WRITE_MS,
 } from "../card-charge.js";
@@ -518,6 +519,24 @@ describe("a past sale read from the processor (24 Sep)", () => {
     assert.equal(sales[0].txn_id, "txn-300", "newest first");
   });
 
+  it("a REFUND that was itself voided sent nothing back: not refunded_cents, not lastBack, not the day cap", () => {
+    const list = ledger();
+    // A $300 Nesher sale, and a refund of the whole amount that was itself voided minutes later
+    // (its own condition is canceled AND it carries a successful void action).
+    list.push({ id: "txn-700", order: "RES-VOIDRF", proc: "mav7067", cond: "complete", actions: [{ type: "sale", amount: "300.00", at: DAYS(1) }] });
+    list.push({ id: "txn-701", orig: "txn-700", proc: "mav7067", cond: "canceled", actions: [{ type: "refund", amount: "-300.00", at: NOW_MS - 3600000 }, { type: "void", amount: "-300.00", at: NOW_MS - 1800000 }] });
+    const { sales, dayBackCents } = salesFromXml(nmiXml(list), { nowMs: NOW_MS });
+    const by = Object.fromEntries(sales.map((s) => [s.txn_id, s]));
+    assert.equal(by["txn-700"].refunded_cents, 0, "the voided refund must not count as money already back");
+    assert.equal(by["txn-700"].refundable_cents, 30000);
+    assert.equal(by["txn-700"].action, "refund");
+    assert.equal(by["txn-700"].last_back_cents, 0);
+    assert.equal(by["txn-700"].last_back_at, null);
+    assert.equal(dayBackCents, 0, "a voided refund never eats the day cap or the 15-minute guard");
+    // Positive control: a normal, non-voided complete refund still counts (txn-100/txn-101 in ledger()).
+    assert.equal(by["txn-100"].refunded_cents, 10000);
+  });
+
   it("matchSales: txn, booking with or without RES-, last four, name + day; an identifier is required", () => {
     const { sales } = salesFromXml(nmiXml(ledger()), { nowMs: NOW_MS, nameNeedle: "cohen" });
     assert.deepEqual(matchSales(sales, { txn: "txn-100" }).matches.map((s) => s.txn_id), ["txn-100"]);
@@ -570,7 +589,7 @@ describe("a past sale read from the processor (24 Sep)", () => {
 });
 
 describe("POST /__nesher_pay/void and /refund", () => {
-  beforeEach(() => { _resetCardRefsForTests(); _resetSaleCache(); });
+  beforeEach(() => { _resetCardRefsForTests(); _resetSaleCache(); _resetSaleClaimsForTests(); });
 
   it("void: an UNSETTLED sale, whole amount, bound to txn_id, documented empty body; settled or partial refused", async () => {
     const pm = processorMock();
@@ -748,7 +767,7 @@ describe("unknown gateway outcome at the desk charge door (Gabbai 23 Sep F5)", (
 });
 
 describe("a refund or void whose outcome is not known is never told as 'did not go through' (Gabbai 24 Sep C2-C5)", () => {
-  beforeEach(() => { _resetSaleCache(); _resetArmingsForTests(); });
+  beforeEach(() => { _resetSaleCache(); _resetArmingsForTests(); _resetSaleClaimsForTests(); });
   const unknowns = [
     ["a throw", async () => { throw new Error("socket hang up"); }],
     ["a 5xx", async () => ({ ok: false, status: 502, text: async () => "<html>bad gateway</html>" })],
@@ -840,6 +859,32 @@ describe("a refund or void whose outcome is not known is never told as 'did not 
       const p = await post(s.url, REFUND_PATH, mintTicket({ kind: "refund", repId: "joseph", bind: "txn-100", secret: SECRET }).token, { txn_id: "txn-100", amount_cents: 100 });
       assert.equal(p.status, 200);
       assert.deepEqual(p.body.crm, { state: "not_recorded", reason: "crm_slow" });
+    } finally {
+      await s.close();
+    }
+  });
+
+  it("two DIFFERENT tiles refunding the SAME sale at once: exactly one reaches the gateway, the other gets 409 sale_busy", async () => {
+    const pm = processorMock();
+    let gatewayCalls = 0;
+    const fetchImpl = async (u, init) => {
+      if (/query\.php$/.test(String(u))) return pm.fetchImpl(u, init);
+      gatewayCalls++;
+      await new Promise((r) => setTimeout(r, 300));
+      return { ok: true, status: 200, text: async () => JSON.stringify({ response: "1", id: `rf-${gatewayCalls}` }) };
+    };
+    const s = await startDoor(handleRefundRequest, { secret: SECRET, fetchImpl, privateKey: "k", env: CAPS_ON });
+    try {
+      const mk = (arming) => post(s.url, REFUND_PATH, mintTicket({ kind: "refund", repId: "joseph", bind: "txn-100", secret: SECRET }).token, { txn_id: "txn-100", amount_cents: 200, arming });
+      const [a, b] = await Promise.all([mk("mcfirst00001:1700000000000"), mk("mcsecond0002:1700000000000")]);
+      const results = [a, b];
+      const busy = results.filter((r) => r.status === 409 && r.body.error === "sale_busy");
+      const ok = results.filter((r) => r.status === 200);
+      assert.equal(busy.length, 1, "exactly one screen is told the other is already sending money back on this sale");
+      assert.equal(ok.length, 1);
+      assert.equal(gatewayCalls, 1, "the gateway saw exactly ONE refund");
+      assert.match(busy[0].body.decline_reason_human, /Another screen is sending money back on this sale right now/);
+      assert.equal(busy[0].body.txn_id, "txn-100");
     } finally {
       await s.close();
     }

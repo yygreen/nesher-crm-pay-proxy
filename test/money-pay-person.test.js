@@ -13,6 +13,8 @@ import {
   payeeFingerprint,
   payeeVerdict,
   maskEmail,
+  externalMemoOf,
+  noteTileId,
   TOKEN_FULL,
   NOTE_MARK,
 } from "../mercury-gateway.js";
@@ -147,6 +149,57 @@ describe("the pure rules", () => {
     assert.equal(recipientDraft({ name: "Air Today Travel", routing: CFSB, account: ACCT }).error, "own_or_other_org");
     assert.equal(recipientDraft({ name: "", routing: CFSB, account: ACCT }).error, "name_required");
     assert.equal(recipientDraft({ name: "Yael", routing: CFSB, account: "12" }).error, "account_invalid");
+  });
+  it("25 Sep audit + Gabbai B1: a business keeps digits in its legal name; a person does not; an instruction tail never passes", () => {
+    const base = { name: "Yael Sher", routing: CFSB, account: ACCT, type: "Checking", emails: ["yael.sher@example.com"], address: { address1: "89-16 Jamaica Ave", city: "Woodhaven", region: "NY", postalCode: "11421", country: "US" } };
+    for (const nm of ["Y33 Hotel Ltd", "Hotel 1868 LLC", "7 Seas Travel Inc", "3M Company"]) {
+      const d = recipientDraft({ ...base, name: nm, business: true });
+      assert.equal(d.ok, true, nm + " " + JSON.stringify(d));
+      assert.equal(d.body.name, nm);
+    }
+    for (const nm of ["Yael Sher - please refund $630", "Yael Sher refund 630", "Acme LLC 630 dollars"]) {
+      const d = recipientDraft({ ...base, name: nm, business: true });
+      assert.equal(d.ok, false, nm); assert.equal(d.error, "name_invalid", nm);
+    }
+    assert.equal(recipientDraft({ ...base, name: "Yael 2 Sher" }).error, "name_invalid");
+    // Gabbai D3: a payment word is part of real business names; on a person it is an instruction.
+    for (const nm of ["Airport Transfer 24 Ltd", "Express Pay 24 LLC"]) assert.equal(recipientDraft({ ...base, name: nm, business: true }).ok, true, nm);
+    assert.equal(recipientDraft({ ...base, name: "Leah Roth 2" }).error, "name_invalid");
+    assert.equal(recipientDraft({ ...base, name: "Cohen Travel refund 630", business: true }).error, "name_invalid");
+    assert.equal(recipientDraft({ ...base, name: "Cohen Travel pay 630" }).error, "name_invalid");
+    assert.equal(recipientDraft({ ...base, name: "Acme LLC ₪630", business: true }).error, "name_invalid");
+  });
+  it("Gabbai D2: the supplier's memo keeps dates, invoice and ticket numbers; only bank- and card-shaped runs are cut", () => {
+    for (const m of ["Refund for stay 2026-09-24", "Invoice 123456", "ticket 0141234567890"]) assert.equal(externalMemoOf(m), m);
+    assert.equal(externalMemoOf("PNR ABC123 account 000123456789"), "PNR ABC123 account ••6789");
+    assert.equal(externalMemoOf("routing 021000021"), "routing ••0021");
+    assert.equal(externalMemoOf("for 021000021 please"), "for ••0021 please");
+    assert.equal(externalMemoOf("card 4111 1111 1111 1111"), "card ••1111");
+  });
+  it("25 Sep audit #109 + Gabbai C7: the external memo and the log keep only the last four; only a real tile id is a tile", () => {
+    assert.equal(externalMemoOf("PNR ABC123 account 000123456789"), "PNR ABC123 account ••6789");
+    assert.equal(noteTileId("mpabc12345 by joseph"), "mpabc12345");
+    assert.equal(noteTileId("- by joseph"), "");
+    assert.equal(noteTileId("anything by joseph"), "");
+  });
+  it("25 Sep audit: WhatsApp/markdown decoration is stripped off the name and street before Mercury sees it", () => {
+    const base = { name: "Yael Sher", routing: CFSB, account: ACCT, type: "Checking", emails: ["yael.sher@example.com"], address: { address1: "89-16 Jamaica Ave", city: "Woodhaven", region: "NY", postalCode: "11421", country: "US" } };
+    let d = recipientDraft({ ...base, name: "* Yael Sher" });
+    assert.equal(d.ok, true, JSON.stringify(d));
+    assert.equal(d.body.name, "Yael Sher");
+
+    d = recipientDraft({ ...base, name: "* Leah Roth *" });
+    assert.equal(d.ok, true, JSON.stringify(d));
+    assert.equal(d.body.name, "Leah Roth");
+
+    d = recipientDraft({ ...base, address: { ...base.address, address1: "* 3 Park Pl" } });
+    assert.equal(d.ok, true, JSON.stringify(d));
+    assert.equal(d.body.electronicRoutingInfo.address.address1, "3 Park Pl");
+
+    d = recipientDraft({ ...base, name: "Yael Sher - please refund $630" });
+    assert.equal(d.ok, false);
+    assert.equal(d.error, "name_invalid");
+    assert.match(d.decline_reason_human, /numbers or signs/);
   });
   it("a person is a payee only with the switch", () => {
     assert.equal(payeeVerdict(BASE_R.cohen).why, "personal");
@@ -311,6 +364,25 @@ describe("sendPay: direct ACH from Nesher checking, every rule checked here", ()
     r = await gw(s).sendPay(base(s, { allowDup: true }));
     assert.equal(r.body.ok, true);
     assert.equal(s.sends.length, 1);
+  });
+  it("Mr. AR (25 Sep): a retry of the SAME desk tile is itself, not a duplicate - a DIFFERENT tile still gets 409", async () => {
+    // base()'s idempotencyKey is "nesher-desk-mpak000001" and note is "mpak000001 by joseph" -
+    // exactly what deskNote() puts at the front of the Mercury note, after NOTE_MARK.
+    const sameTile = mercury({ txns: [{ id: "cccccccc-0000-4000-8000-000000000010", amount: -630, status: "pending", counterpartyId: BASE_R.cohen.id, note: "Refund RES-8P4R3T" + NOTE_MARK + "mpak000001 by joseph", createdAt: new Date(NOW - 600e3).toISOString(), estimatedDeliveryDate: "2026-09-28T00:00:00Z" }] });
+    let r = await gw(sameTile).sendPay(base(sameTile));
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    assert.equal(r.body.ok, true);
+    assert.equal(r.body.mode, "direct");
+    assert.equal(r.body.reused, true);
+    assert.equal(r.body.txn.id, "cccccccc-0000-4000-8000-000000000010");
+    assert.equal(sameTile.sends.length, 0, "the SAME tile's retry never reaches Mercury again");
+
+    const otherTile = mercury({ txns: [{ id: "cccccccc-0000-4000-8000-000000000011", amount: -630, status: "pending", counterpartyId: BASE_R.cohen.id, note: "Refund RES-8P4R3T" + NOTE_MARK + "mpzz999999 by hershy", createdAt: new Date(NOW - 600e3).toISOString() }] });
+    r = await gw(otherTile).sendPay(base(otherTile));
+    assert.equal(r.status, 409);
+    assert.equal(r.body.error, "duplicate_24h");
+    assert.equal(r.body.existing.amount, 630);
+    assert.equal(otherTile.sends.length, 0);
   });
   it("Mercury holding an API send for approval is said as such (approval_forced), never 'sent'", async () => {
     const s = mercury({ sendMode: "approval" });

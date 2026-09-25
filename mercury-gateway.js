@@ -233,6 +233,28 @@ export function scrubDigits(t) {
     .replace(/\d[\d \-]{3,}\d/g, scrubCut(5));
 }
 
+/**
+ * Gabbai 25 Sep D2 (audit #109): the SUPPLIER-FACING belt. Only what is bank- or card-shaped is cut to its last four:
+ * a labelled account / routing run, an ABA-valid 9-digit run, a Luhn-valid 13-19 digit run (never right after a
+ * ticket label). Dates, invoice and ticket numbers reach the supplier as the rep wrote them. Pure.
+ */
+export function maskBankShaped(t) {
+  const four = (m) => "••" + String(m).replace(/\D/g, "").slice(-4);
+  let s = String(t == null ? "" : t);
+  s = s.replace(/\b(account|acct|a\/c|routing|aba|iban|checking|savings)(\s*(?:number|no\.?|#)?\s*[:#]?\s*)(\d[\d \-]{3,30}\d)/gi, (all, lab, sep, num) => lab + sep + four(num));
+  s = s.replace(/(^|[^\d•])(\d{9})(?!\d)/g, (all, lead, num) => (abaOk(num) ? lead + four(num) : all));
+  s = s.replace(/(^|[^\d•])((?:\d[ \-]?){12,18}\d)(?!\d)/g, (all, lead, num, off, whole) => {
+    const d = num.replace(/\D/g, "");
+    if (d.length < 13 || d.length > 19) return all;
+    let sum = 0, alt = false;
+    for (let i = d.length - 1; i >= 0; i--) { let n = d.charCodeAt(i) - 48; if (alt) { n *= 2; if (n > 9) n -= 9; } sum += n; alt = !alt; }
+    if (sum % 10 !== 0) return all;
+    if (/(?:ticket|tkt)\W{0,3}$/i.test(whole.slice(Math.max(0, off - 12), off + lead.length))) return all;
+    return lead + four(num);
+  });
+  return s;
+}
+
 /** "yael.sher@gmail.com" -> "y***@gmail.com". For logs and the tile. Pure. */
 export function maskEmail(e) {
   const s = String(e || "").trim();
@@ -270,6 +292,19 @@ export function countryCode(c) {
 }
 
 /**
+ * WhatsApp/markdown decoration off a pasted name or street line: a leading "- " or "> " (a reply
+ * quote or bullet marker, possibly repeated), and any "*", "_", "~" or bullet character (used for
+ * bold/italic/strike, or as a list mark) wherever it sits - so "*Name:* Leah Roth"-style wrapping and
+ * inner bold pairs come off too, not only the ends. Pure.
+ */
+export function stripDecoration(v) {
+  let s = String(v == null ? "" : v);
+  s = s.replace(/^(?:[-•▪‣·>]\s+)+/, "");
+  s = s.replace(/[*_~•▪‣·]/g, "");
+  return s.replace(/\s+/g, " ").trim();
+}
+
+/**
  * What a pasted set of bank details may become, checked before anything reaches Mercury. Pure.
  * in: {name, routing, account, type, business, emails[], address{address1,city,region,postalCode,country}}
  * -> {ok:true, body, view} | {ok:false, error}
@@ -278,8 +313,16 @@ export function countryCode(c) {
 export function recipientDraft(input) {
   const x = input && typeof input === "object" ? input : {};
   const clean = (v, n) => String(v == null ? "" : v).replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim().slice(0, n);
-  const name = clean(x.name, 80);
-  if (name.length < 2 || !/\p{L}/u.test(name)) return { ok: false, error: "name_required" };
+  const name = clean(stripDecoration(x.name), 80);
+  if (name.length < 2 || !/\p{L}/u.test(name) || !/^[\p{L}\p{Nd}]/u.test(name)) return { ok: false, error: "name_required" };
+  // Gabbai 25 Sep B1: a business's legal name may carry digits ("Y33 Hotel Ltd", "3M Company"); a person's may not.
+  // Every name is refused with a currency sign or the rep's instruction / an amount glued on ("Yael Sher - please
+  // refund $630", "Yael Sher refund 630").
+  // Gabbai D3: "pay", "send", "wire", "transfer" are words in real business names ("Airport Transfer 24 Ltd",
+  // "Express Pay 24 LLC") - those count as an instruction only on a person's name.
+  const INSTR_TAIL = /\s[-–—]\s+(?:please|pls|refund|pay|send)\b|\b(?:please|pls|refund|reimburse)\b[^\n]*\d|\d[\d,.]*\s?(?:usd|dollars?|nis|ils|shekels?)\b/i;
+  const PAY_WORD_TAIL = /\b(?:pay|send|wire|transfer)\b[^\n]*\d/i;
+  if (/[$₪]/.test(name) || INSTR_TAIL.test(name) || (x.business !== true && (/\d/.test(name) || PAY_WORD_TAIL.test(name)))) return { ok: false, error: "name_invalid", decline_reason_human: "The recipient name has numbers or signs in it - nothing was added. Type just the account holder's name." };
   if (PAY_BLOCK_NAME.test(name)) return { ok: false, error: "own_or_other_org" };
   const routing = String(x.routing || "").replace(/\D/g, "");
   if (!abaOk(routing)) return { ok: false, error: "routing_invalid" };
@@ -300,8 +343,9 @@ export function recipientDraft(input) {
   // No complete address = refused HERE, before Mercury, and the tile asks the rep for one line.
   const a = x.address && typeof x.address === "object" ? x.address : null;
   if (!a) return { ok: false, error: "address_required" };
-  const address = { address1: clean(a.address1, 120), city: clean(a.city, 60), region: clean(a.region, 40), postalCode: clean(a.postalCode, 12), country: countryCode(a.country == null || a.country === "" ? "US" : a.country) };
+  const address = { address1: clean(stripDecoration(a.address1), 120), city: clean(a.city, 60), region: clean(a.region, 40), postalCode: clean(a.postalCode, 12), country: countryCode(a.country == null || a.country === "" ? "US" : a.country) };
   if (!address.address1 || !address.city || !address.region || !address.postalCode || !address.country) return { ok: false, error: "address_required" };
+  if (!/^[\p{L}\p{Nd}]/u.test(address.address1)) return { ok: false, error: "address_required" };
   if (clean(a.address2, 60)) address.address2 = clean(a.address2, 60);
   const eri = { accountNumber: account, routingNumber: routing, electronicAccountType: type, address };
   const body = { name, emails, electronicRoutingInfo: eri };
@@ -406,6 +450,7 @@ export const NOTE_MARK = " · desk chat ";
  * left = "Supplier payment". The full memo stays in the note, the tile and the log.
  */
 export function externalMemoOf(memo, fallback) {
+  // Audit #109: the supplier's bank never gets a full account number from a memo - a 5+ digit run keeps its last four.
   const out = String(memo || "")
     .replace(/\bJRM[-\s]?Hotels?\b/gi, " ")
     .replace(/\bJRM-[A-Z0-9-]+/gi, " ")
@@ -413,7 +458,7 @@ export function externalMemoOf(memo, fallback) {
     .replace(/\s+/g, " ")
     .replace(/^[\s,;:.\-–]+|[\s,;:\-–]+$/g, "")
     .trim();
-  return out || String(fallback || "Supplier payment");
+  return maskBankShaped(out) || String(fallback || "Supplier payment");
 }
 
 /** The rep's memo out of an echoed memo (the part before the desk-chat marker). */
@@ -421,6 +466,22 @@ export function memoBase(echo) {
   const s = String(echo || "");
   const i = s.indexOf(NOTE_MARK);
   return i >= 0 ? s.slice(0, i) : s;
+}
+
+/**
+ * The desk tile id at the front of a note - deskNote's own words are "<tileId> by <rep>...", and the
+ * gateway puts that straight after NOTE_MARK when it sends (money-pay.js deskNote/sendDoor). Works on
+ * either shape: the raw desk-note text (o.note, before NOTE_MARK is added) or the full Mercury note
+ * Mercury hands back on a read (memo + NOTE_MARK + desk-note). "" when there is no tile id to read -
+ * an older or hand-made note, never our own retry. Pure.
+ */
+export function noteTileId(s) {
+  const raw = String(s || "");
+  const i = raw.indexOf(NOTE_MARK);
+  const desk = i >= 0 ? raw.slice(i + NOTE_MARK.length) : raw;
+  const m = desk.match(/^(\S+)\s+by\s+/);
+  // Gabbai 25 Sep C7: only a real desk tile id - deskNote writes "-" when tile_id is empty, and "-" is nobody's tile.
+  return m && /^(?:mp|pr)[a-z0-9]{6,20}$/.test(m[1]) ? m[1] : "";
 }
 
 /**
@@ -1123,7 +1184,16 @@ export function createMercuryGateway(opts = {}) {
     if (o.allowDup !== true) {
       const dupT = out.find((t) => t.counterpartyId === payee.raw.id && Math.round(Number(t.amount) * 100) === -cents);
       const dupR = live.find((x) => x.recipientId === payee.raw.id && Math.round(Number(x.amount) * 100) === cents);
-      if (dupT || dupR) return { status: 409, body: { ok: false, error: "duplicate_24h", existing: dupT ? payTxnView(dupT) : payRequestView(dupR) } };
+      if (dupT || dupR) {
+        // A retry of the SAME desk tile (it lost the first answer and tried again) is ITSELF, not a
+        // duplicate: our own note carries the tile id right after NOTE_MARK, and Mercury hands it
+        // straight back on the read. A different tile at the same payee and amount is still refused.
+        const myTile = noteTileId(o.note);
+        if (dupT && myTile && noteTileId(dupT.note) === myTile) {
+          return { status: 200, body: { ok: true, mode: "direct", txn: payTxnView(dupT), payee: payee.view, reused: true } };
+        }
+        return { status: 409, body: { ok: false, error: "duplicate_24h", existing: dupT ? payTxnView(dupT) : payRequestView(dupR) } };
+      }
     }
     const chatSent = out.filter((t) => String(t.note || "").includes(NOTE_MARK)).reduce((s, t) => s + Math.round(-Number(t.amount) * 100), 0);
     const dayUsed = chatSent + live.reduce((s, x) => s + Math.round(Number(x.amount) * 100), 0);
