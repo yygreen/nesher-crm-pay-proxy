@@ -68,7 +68,9 @@
 
 import crypto from "node:crypto";
 import { chargeWithToken } from "./nmi-card.js";
-import { readLineGlyphs, findRows } from "./ocr-glyphs.js";
+// The glyph matcher and the row finder run in a worker thread (ocr-glyph-worker.js): pure
+// arithmetic on the main thread froze the proxy for up to a second a read (Gabbai B1, 25 Sep).
+import { glyphWorker } from "./ocr-glyph-worker.js";
 
 export const OCR_PATH = "/__nesher_pay/ocr";
 export const OCR_TICKET_SECRET_NAME = "OCR_TICKET_SECRET";
@@ -695,6 +697,9 @@ export function sniffFormat(buf) {
  * only) returns null - "that PDF has no picture of a card in it".
  * Every intermediate Buffer goes to `scratch` so the caller zeroes it.
  */
+/** The largest picture a PDF may declare (25 MP, a 5000 x 5000 scan). */
+export const PDF_MAX_PIXELS = 25e6;
+
 export async function imageFromPdf(pdf, scratch = []) {
   const zlib = await import("node:zlib");
   const src = pdf.toString("latin1");
@@ -711,7 +716,8 @@ export async function imageFromPdf(pdf, scratch = []) {
     while (stop > start && (src.charCodeAt(stop - 1) === 0x0a || src.charCodeAt(stop - 1) === 0x0d)) stop -= 1;
     const w = Number((/\/Width\s+(\d+)/.exec(dict) || [])[1] || 0);
     const h = Number((/\/Height\s+(\d+)/.exec(dict) || [])[1] || 0);
-    if (!w || !h) continue;
+    // Bounds before any work (Gabbai C1): a declared picture over 25 MP is refused unread.
+    if (!w || !h || w * h > PDF_MAX_PIXELS) continue;
     found.push({ dict, start, stop, w, h });
   }
   found.sort((a, b) => b.w * b.h - a.w * a.h);
@@ -725,7 +731,8 @@ export async function imageFromPdf(pdf, scratch = []) {
     const ch = /\/DeviceGray/.test(f.dict) ? 1 : /\/DeviceRGB/.test(f.dict) ? 3 : 0;
     if (!ch) continue;
     let raw;
-    try { raw = zlib.inflateSync(bytes); } catch { continue; }
+    // Never inflate past the picture's own size: a 10 KB stream can claim gigabytes.
+    try { raw = zlib.inflateSync(bytes, { maxOutputLength: f.w * f.h * ch + f.h }); } catch { continue; }
     scratch.push(raw);
     const pred = Number((/\/Predictor\s+(\d+)/.exec(f.dict) || [])[1] || 1);
     let pix = raw;
@@ -734,6 +741,8 @@ export async function imageFromPdf(pdf, scratch = []) {
       pix = Buffer.alloc(row * f.h);
       scratch.push(pix);
       for (let y = 0; y < f.h; y += 1) {
+        // Undoing the PNG predictor is main-thread arithmetic: hand the loop back every 64 rows.
+        if (y && y % 64 === 0) await new Promise((r) => setImmediate(r));
         const t = raw[y * (row + 1)];
         for (let x = 0; x < row; x += 1) {
           const v = raw[y * (row + 1) + 1 + x];
@@ -840,6 +849,11 @@ export function regionStats(img, box) {
   return { mean: sum / n, sat: sat / n, sharp: lap2 / n - mu * mu };
 }
 
+/** Debug output only: the printed group lengths ("4-4-4-4"), never a digit. */
+function digitShape(t) {
+  return String(t || "").split(/\r?\n/).map((l) => (l.match(/[0-9]+/g) || []).map((r) => r.length).join("-")).filter(Boolean).join("|");
+}
+
 function digitsIn(s) {
   return (String(s).match(/\d/g) || []).length;
 }
@@ -894,7 +908,7 @@ async function locateLines(engine, img, scratch, budget, { textPass = false, not
   });
   // Rows of digit-sized shapes, found without tesseract (embossed and metal cards).
   const small = textPass ? null : await rawGray(base().toColourspace("b-w"), scratch);
-  const shapeLines = !small ? [] : findRows(small.data, small.width, small.height).map((L) => ({ ...L, left: L.left / k, right: L.right / k, top: L.top / k, bottom: L.bottom / k, h: L.h / k }));
+  const shapeLines = (!small ? [] : await glyphWorker().rows(small)).map((L) => ({ ...L, left: L.left / k, right: L.right / k, top: L.top / k, bottom: L.bottom / k, h: L.h / k }));
   // Dedupe the same word seen in several preparations: keep the one with more digits.
   words.sort((a, b) => b.d - a.d);
   const uniq = [];
@@ -1193,7 +1207,7 @@ async function recognizeCardOnce(input, opts) {
       const halves = [];
       for (const part of line.parts) {
         const pb = await cutLine(img, part, { flip }, scratch);
-        halves.push(pb ? readLineGlyphs(pb, { digitPx: LINE_DIGIT_PX, minGlyphs: 6 }) : []);
+        halves.push(pb ? (await glyphWorker().lines([{ ...pb, minGlyphs: 6 }], { digitPx: LINE_DIGIT_PX }))[0] : []);
       }
       for (const a of halves[flip ? 1 : 0] || []) {
         const b = (halves[flip ? 0 : 1] || []).find((x) => x.prep === a.prep && x.font === a.font);
@@ -1201,15 +1215,16 @@ async function recognizeCardOnce(input, opts) {
         glyphReads.push({ ...a, text: a.text + " " + b.text, minMargin: Math.min(a.minMargin, b.minMargin), minScore: Math.min(a.minScore, b.minScore), meanScore: (a.meanScore + b.meanScore) / 2 });
       }
     } else {
-      glyphReads.push(...readLineGlyphs(band, { digitPx: LINE_DIGIT_PX }));
-      glyphReads.push(...readLineGlyphs(clahe, { digitPx: LINE_DIGIT_PX }).map((g) => ({ ...g, prep: "c" + g.prep })));
       // A photo of a screen: soften the moire before the glyphs are cut.
       const soft = await rawGray(sharpG(band.data, { raw: { width: band.width, height: band.height, channels: 1 } }).blur(1.4).toColourspace("b-w"), scratch);
-      glyphReads.push(...readLineGlyphs(soft, { digitPx: LINE_DIGIT_PX }).map((g) => ({ ...g, prep: "b" + g.prep })));
+      const [plain, local, softened] = await glyphWorker().lines([band, clahe, soft], { digitPx: LINE_DIGIT_PX });
+      glyphReads.push(...plain);
+      glyphReads.push(...local.map((g) => ({ ...g, prep: "c" + g.prep })));
+      glyphReads.push(...softened.map((g) => ({ ...g, prep: "b" + g.prep })));
     }
     for (const g of glyphReads) {
       if (g.minScore >= GLYPH_MIN_SCORE) noteLast(g.text);
-      if (opts.debug) opts.debug({ stage: "glyph", prep: g.prep, font: g.font, text: g.text, mean: +g.meanScore.toFixed(3), minS: +g.minScore.toFixed(3), minM: +g.minMargin.toFixed(3) });
+      if (opts.debug) opts.debug({ stage: "glyph", prep: g.prep, font: g.font, shape: digitShape(g.text), mean: +g.meanScore.toFixed(3), minS: +g.minScore.toFixed(3), minM: +g.minMargin.toFixed(3) });
       const gsrc = `glyph:${g.prep}@${rot}${flip ? "f" : ""}`;
       const lk = `${rot}:${Math.round(line.top)}:${flip ? 1 : 0}`;
       for (const gr of groupedReads(g.text)) lineReads.push({ ...gr, lineKey: lk });
@@ -1233,7 +1248,7 @@ async function recognizeCardOnce(input, opts) {
         const source = `line${Math.round(line.top)}:${p.name}@${rot}${flip ? "f" : ""}#${mode}`;
         texts.push({ source, rotation: rot, variant: p.name, text: r.text, confidence: r.confidence, line: true });
         noteLast(r.text);
-        if (opts.debug) opts.debug({ stage: "line", source, text: r.text.trim() });
+        if (opts.debug) opts.debug({ stage: "line", source, shape: digitShape(r.text) });
         for (const hit of extractPans(r.text)) hits.push({ ...hit, source, lineKey: `${rot}:${Math.round(line.top)}:${flip ? 1 : 0}`, h: line.h });
         for (const g of groupedReads(r.text)) lineReads.push({ ...g, lineKey: `${rot}:${Math.round(line.top)}:${flip ? 1 : 0}` });
       }));
@@ -1328,7 +1343,8 @@ async function recognizeCardOnce(input, opts) {
     hits.push(...own);
   }
   const win = vote();
-  if (opts.debug) opts.debug({ stage: "hits", hits: hits.map((x) => x.pan + " " + x.source) });
+  // Diagnosis only (the route never passes opts.debug): the last four, the length and where it came from - never the number.
+  if (opts.debug) opts.debug({ stage: "hits", hits: hits.map((x) => `${x.pan.slice(-4)}/${x.pan.length} ${x.source}`) });
 
   // What was read of the number line even when the whole number was not: the last group, when two reads agree.
   const partialLast4 = () => {

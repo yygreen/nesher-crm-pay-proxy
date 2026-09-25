@@ -428,12 +428,25 @@ export function expiryAhead(now, years, month) {
   return `${String(month).padStart(2, "0")}/${String(y % 100).padStart(2, "0")}`;
 }
 
-export async function buildHardSet({ now = new Date(), seed = 20260924, only = null } = {}) {
+/**
+ * HELD_OUT_PANS: published test numbers the thresholds were never tuned on (Gabbai C5, 25 Sep).
+ * buildHardSet({ heldOut: true }) swaps the list AND the seed, so every random number changes too.
+ */
+export const HELD_OUT_PANS = [
+  "4000000000003220", "4000002500003155", "4000003720000278", "2223000048400011",
+  "378734493671000", "4000000000000077", "4000000000000093", "4000000000000341",
+  "4000000000009995", "5454545454545454", "6011000400000000", "4917610000000000",
+  "5425233430109903", "374245455400126", "4263982640269299",
+];
+
+export async function buildHardSet({ now = new Date(), seed = 20260924, only = null, heldOut = false } = {}) {
+  const PANS = heldOut ? HELD_OUT_PANS : TEST_PANS;
+  if (heldOut) seed = 777001;
   const rand = seeded(seed);
   const items = [];
   let n = 0;
   let panI = 0;
-  const nextPan = (kind) => (kind ? randomPan(rand, kind) : TEST_PANS[panI++ % TEST_PANS.length]);
+  const nextPan = (kind) => (kind ? randomPan(rand, kind) : PANS[panI++ % PANS.length]);
   const person = () => NAMES[Math.floor(rand() * NAMES.length)];
   const exp = () => expiryAhead(now, 1 + Math.floor(rand() * 6), 1 + Math.floor(rand() * 12));
   const brandOfPan = (pan) => (pan[0] === "4" ? "VISA" : pan[0] === "3" ? "AMERICAN EXPRESS" : pan[0] === "6" ? "DISCOVER" : "mastercard");

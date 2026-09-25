@@ -18,6 +18,8 @@ const workers = Number(arg("--workers", 3));
 const only = arg("--only", "") ? arg("--only").split(",") : null;
 const deadlineMs = arg("--deadline") ? Number(arg("--deadline")) : undefined;
 const verbose = args.includes("--verbose");
+const heldOut = args.includes("--heldout");
+const totalMs = arg("--total") ? Number(arg("--total")) : undefined;
 const NOW = new Date(Date.UTC(2026, 8, 24, 12, 0, 0));
 
 const quiet = { warn: console.warn, error: console.error };
@@ -27,10 +29,10 @@ const out = (...a) => process.stdout.write(a.join(" ") + "\n");
 
 const pool = createEnginePool({ size: workers });
 await pool.warm();
-const set = await buildHardSet({ now: NOW, only });
+const set = await buildHardSet({ now: NOW, only, heldOut });
 const rows = [];
 for (const s of set) {
-  const r = await recognizeCard(Buffer.from(s.buffer), { engine: pool, now: NOW, deadlineMs, contentType: s.contentType });
+  const r = await recognizeCard(Buffer.from(s.buffer), { engine: pool, now: NOW, deadlineMs, totalMs, contentType: s.contentType });
   const got = r.ok ? r.pan : null;
   let verdict;
   if (s.expect === "refuse") verdict = got ? "WRONG" : "ok";
@@ -67,7 +69,7 @@ const exact = rows.filter((r) => r.verdict.startsWith("ok")).length;
 const wrong = rows.filter((r) => r.verdict === "WRONG").length;
 const p95 = pct(rows.map((r) => r.ms), 95);
 const lowOk = rows.filter((r) => r.verdict === "ok" && r.conf === "low").length;
-out(`TOTAL n=${total} exact=${exact} (${((100 * exact) / total).toFixed(1)}%) wrong=${wrong} lowConfidenceCorrect=${lowOk} expiry=${rows.filter((r) => r.expiry).length}/${total} name=${rows.filter((r) => r.name).length}/${total} p50=${pct(rows.map((r) => r.ms), 50)}ms p95=${p95}ms max=${Math.max(...rows.map((r) => r.ms))}ms workers=${workers}`);
+out(`TOTAL n=${total} exact=${exact} (${((100 * exact) / total).toFixed(1)}%) wrong=${wrong} lowConfidenceCorrect=${lowOk} expiry=${rows.filter((r) => r.expiry).length}/${total} name=${rows.filter((r) => r.name).length}/${total} p50=${pct(rows.map((r) => r.ms), 50)}ms p95=${p95}ms max=${Math.max(...rows.map((r) => r.ms))}ms workers=${workers}${heldOut ? " heldOut" : ""}${totalMs ? " totalMs=" + totalMs : ""}`);
 console.warn = quiet.warn;
 console.error = quiet.error;
 process.exitCode = wrong === 0 && exact / total >= 0.95 && p95 < 8000 ? 0 : 1;

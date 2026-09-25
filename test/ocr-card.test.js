@@ -816,3 +816,48 @@ describe("wiring", () => {
     assert.match(src, /const OUTCOME_KEYS = \["method", "ticket", "outcome", "ms"\]/);
   });
 });
+
+describe("Gabbai 25 Sep conditions: PDF bounds, debug fence, glyph worker", () => {
+  it("C1: a small deflate stream that would inflate past the picture's size is refused without allocating it", async () => {
+    const zlib = await import("node:zlib");
+    const bomb = zlib.deflateSync(Buffer.alloc(210 * 1024 * 1024)); // ~200 KB that inflates to 210 MB
+    assert.ok(bomb.length < 400 * 1024);
+    const head = Buffer.from(`%PDF-1.4\n4 0 obj\n<< /Type /XObject /Subtype /Image /Width 100 /Height 100 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode /Length ${bomb.length} >>\nstream\n`, "latin1");
+    const pdf = Buffer.concat([head, bomb, Buffer.from("\nendstream\nendobj\n%%EOF\n", "latin1")]);
+    const before = process.memoryUsage().arrayBuffers;
+    assert.equal(await imageFromPdf(pdf, []), null, "declared 100x100 but the stream is far larger: refused");
+    assert.ok(process.memoryUsage().arrayBuffers - before < 50 * 1024 * 1024, "nothing near 210 MB was allocated");
+  });
+
+  it("C1: a declared 20000 x 20000 picture is refused before any inflate", async () => {
+    let inflated = false;
+    const zlib = await import("node:zlib");
+    const tiny = zlib.deflateSync(Buffer.alloc(16));
+    const head = Buffer.from(`%PDF-1.4\n4 0 obj\n<< /Type /XObject /Subtype /Image /Width 20000 /Height 20000 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode /Length ${tiny.length} >>\nstream\n`, "latin1");
+    const pdf = Buffer.concat([head, tiny, Buffer.from("\nendstream\nendobj\n%%EOF\n", "latin1")]);
+    assert.equal(await imageFromPdf(pdf, []), null);
+    const r = await recognizeCard(pdf, { engine: fakeEngine(() => { inflated = true; return ""; }), now: NOW_DATE });
+    assert.equal(r.error, "pdf_no_image");
+    assert.equal(inflated, false, "the engine never saw it");
+  });
+
+  it("C4: the route never passes the debug hooks, and the hits hook carries last four + length only", async () => {
+    const boom = () => { throw new Error("debug hook fired from the route"); };
+    const engine = fakeEngine((i, o) => (o.charset === "text" ? "VALID THRU 10/29" : i < 3 ? PAN : ""));
+    const s = await startServer({ secret: SECRET, engine, debug: boom, debugBands: boom });
+    try {
+      const t = mintOcrTicket({ repId: "sruly", secret: SECRET });
+      const r = await fetch(s.url, { method: "POST", headers: { "content-type": "image/png", "x-ocr-ticket": t.token }, body: await tinyImage() });
+      assert.equal(r.status, 200, "read completed; no hook threw");
+    } finally {
+      await s.close();
+    }
+    const seen = [];
+    const lone = fakeEngine((i, o) => (o.charset === "text" ? "" : i < 2 ? PAN : ""));
+    await recognizeCard(await tinyImage(), { engine: lone, now: NOW_DATE, debug: (e) => seen.push(JSON.stringify(e)) });
+    const all = seen.join("\n");
+    assert.ok(all.includes('"stage":"hits"'));
+    assert.equal(all.includes(PAN), false, "no whole number in any debug event");
+    assert.match(all, /1486\/16/);
+  });
+});

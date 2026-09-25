@@ -29,6 +29,7 @@ import {
   startCardHoldSweeper,
 } from "./ocr-card.js";
 import { sharedEnginePool } from "./ocr-engine.js";
+import { loadTemplates as loadGlyphTemplates } from "./ocr-glyphs.js";
 import {
   chargeFamilyPath,
   handleChargeRequest,
@@ -1603,6 +1604,8 @@ const server = http.createServer(async (req, res) => {
         // The one-time card references this process is holding right now.
         // A count, never a reference and never a card.
         holds: cardHoldCount(),
+        // Card fonts the glyph matcher knows (14). 0 = ocr-glyphs.json missing from the image: the matcher is off.
+        glyphFonts: loadGlyphTemplates().length,
       },
     });
     return;
