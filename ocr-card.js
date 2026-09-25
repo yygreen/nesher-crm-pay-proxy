@@ -1024,7 +1024,12 @@ async function cutLine(img, line, { flip = false, below = false } = {}, scratch)
   const slope = Math.tan((line.angle * Math.PI) / 180);
   const drift = Math.abs(slope) * (x1 - x0) / 2;
   let y0, y1;
-  if (below) {
+  if (below && flip) {
+    // D3 (25 Sep): the card is upside down in this picture, so what is printed BELOW the number on the
+    // card (expiry, name) sits ABOVE the number line here. The cut is turned 180 below, as for the line.
+    y0 = Math.floor(line.top - 5.5 * h - drift);
+    y1 = Math.ceil(line.top - 0.2 * h);
+  } else if (below) {
     y0 = Math.floor(line.bottom + 0.2 * h);
     y1 = Math.ceil(line.bottom + 5.5 * h + drift);
   } else {
@@ -1486,6 +1491,9 @@ async function recognizeCardOnce(input, opts) {
   }
   let name = null;
   const lineHit = winHits.find((x) => x.lineKey);
+  // D3: a number read from a TURNED cut (flip) means the card is upside down at `rotation`; the
+  // whole-card text passes below must read it the right way up.
+  const textRotation = lineHit && lineHit.lineKey.split(":")[2] === "1" ? (rotation + 180) % 360 : rotation;
   if (lineHit) {
     const [r, top, fl] = lineHit.lineKey.split(":");
     const seen = seenLines.find((s) => s.rot === Number(r) && Math.round(s.line.top) === Number(top));
@@ -1509,7 +1517,7 @@ async function recognizeCardOnce(input, opts) {
       if (budget.left() < 200) break;
       const v = variants.find((x) => x.name === vName);
       if (!v) continue;
-      const img = await rotated(v.buffer, rotation, scratch);
+      const img = await rotated(v.buffer, textRotation, scratch);
       passes += 1;
       const r = await engine.recognize(img, { mode: "sparse", charset: "text", notAfter });
       if (!expiry) expiry = parseExpiry(r.text, now);

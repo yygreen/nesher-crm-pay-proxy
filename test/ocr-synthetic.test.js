@@ -107,6 +107,13 @@ describe("synthetic card set (real tesseract.js)", () => {
     // and PaddleOCR). npm test runs files in parallel on one CPU, so this is a ceiling, not a benchmark:
     // the real figures come from node test/ocr-bench.mjs on an idle machine.
     assert.ok(p95 < 8000, `p95 ${p95}ms under the 8 s target (measured on this machine)`);
+    // D3 (25 Sep): a card turned 90 / 180 gave its number but never its expiry or name (0 of 24 on
+    // 0e14f81), so the photo could not be held. They are read the right way up now.
+    const turned = clean.filter((r) => r.rotation === 90 || r.rotation === 180);
+    const turnedExpiry = turned.filter((r) => r.expiryOk).length;
+    const turnedName = turned.filter((r) => r.nameOk).length;
+    assert.ok(turnedExpiry / turned.length >= 0.9, `turned cards: expiry ${turnedExpiry}/${turned.length}`);
+    assert.ok(turnedName / turned.length >= 0.9, `turned cards: name ${turnedName}/${turned.length}`);
   });
 
   it("nothing logged during the suite carries a card number", () => {
