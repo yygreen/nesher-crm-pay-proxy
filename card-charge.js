@@ -857,7 +857,9 @@ async function reversalDoor(kind, req, res, deps) {
   }
   saleClaims.add(saleClaimKey);
   try {
-    const facts = await saleBeforeReversal(txnId, deps);
+    // The fresh sale read happens INSIDE the one-at-a-time lock below, so the day total and the 15-minute
+    // guard it carries already include any reversal that finished while this one waited its turn.
+    let facts = null;
     let refused = null;
     let out;
     try {
@@ -865,6 +867,8 @@ async function reversalDoor(kind, req, res, deps) {
       // second concurrent reversal (a different sale) waits its turn here rather than checking the
       // cap against a number the first one is about to move past.
       out = await withDaycapLock(async () => {
+        // A read that throws sent nothing: it is the same clear no as an unreadable sale, never "unknown".
+        facts = await saleBeforeReversal(txnId, deps).catch(() => ({ ok: false }));
         refused = reversalRefusal(kind, txnId, amountCents, facts, env);
         if (refused) return null;
         return kind === "refund"
