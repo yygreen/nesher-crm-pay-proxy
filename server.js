@@ -66,6 +66,7 @@ import {
   chargeOpenPay,
   chargeOfficePay,
   lookupOfficeCrmRef,
+  officeCrmState,
 } from "./open-pay.js";
 import {
   storeInvoice,
@@ -117,6 +118,7 @@ import {
   shadowNmiPayment,
   recordNmiException,
   recordNmiReversal,
+  recordSweepReversal,
   listInvoicesViaSeat,
 } from "./payments-sync.js";
 import {
@@ -124,8 +126,9 @@ import {
   listPaymentPostExceptions,
   postingMode,
   shadowReport,
+  loopReview,
 } from "./payment-posts.js";
-import { runNmiRecovery } from "./nmi-recovery.js";
+import { runNmiRecovery, sweepDays } from "./nmi-recovery.js";
 import { validateStaffSession, extractSessionId } from "./auth.js";
 import {
   buildReservationDraft,
@@ -174,6 +177,8 @@ function moneyDoors(path) {
     return {
       recordNmiPaidInvoice: (args) => recordNmiPaidInvoice({ pool: getPool(), path, ...args }),
       recordPaymentException: (ev) => recordNmiException({ pool: getPool(), path, ...ev }),
+      // Audit #26: a void / refund the sweep finds (done outside the desk chat) - reverses only a sale the loop posted.
+      reverseFromSweep: (ev) => recordSweepReversal({ pool: getPool(), path, ...ev }),
     };
   }
   return {
@@ -1074,6 +1079,24 @@ function proxyWithInject(req, res) {
   proxy.web(req, fakeRes);
 }
 
+// Audit #27 (25 Sep): GET /__money_hop/loop-review, answered here behind the hop signature, never forwarded.
+const LOOP_REVIEW_PATH = "/loop-review";
+async function loopReviewAnswer() {
+  if (!(process.env.DATABASE_URL || process.env.DATABASE_PUBLIC_URL)) return { status: 503, body: JSON.stringify({ ok: false, error: "no_database" }) };
+  try {
+    return { status: 200, body: JSON.stringify(await loopReview({ pool: getPool() })) };
+  } catch {
+    return { status: 503, body: JSON.stringify({ ok: false, error: "loop_review_unavailable" }) };
+  }
+}
+// Audit #178 (25 Sep): the PUBLIC health page names no account last four and no token length.
+function publicMercuryHealth(h) {
+  const out = JSON.parse(JSON.stringify(h || {}));
+  if (out.pay && typeof out.pay === "object") delete out.pay.account_last4;
+  for (const k of Object.keys(out.tokens || {})) if (out.tokens[k] && typeof out.tokens[k] === "object") delete out.tokens[k].length;
+  return out;
+}
+
 // Mr Money hop (money-hop.js): the money seat on Joseph's PC polls this service; a caller's
 // signed GET /__money_hop/<seat path> becomes one job for the seat. MONEY_HOP_KEY unset = 503.
 // Off the PC (Joseph 23 Sep: "nothing needs to work through this machine"): a verified data GET
@@ -1087,6 +1110,8 @@ const moneyHop = createMoneyHop({
     const p = String(sub).split("?")[0];
     if (p === MONEY_MAP_PATH) return moneyMap.hopAnswer(sub);
     if (p === CRM_SEARCH_PATH) return crmSearch.hopAnswer(sub);
+    // Audit #27 (25 Sep): what the collection loop could not close by itself, for the desk's 07:00 line. READ ONLY.
+    if (p === LOOP_REVIEW_PATH) return loopReviewAnswer();
     return mercuryGateway.hopDirect(sub);
   },
 });
@@ -1363,9 +1388,13 @@ const server = http.createServer(async (req, res) => {
             ...moneyDoors("open"),
           });
       if (openResult.ok) {
+        // Audit #77: the OFFICE page is told what happened in the CRM (the public page is not).
+        const bookingRef = /^(?:RES-[A-Za-z0-9_-]{1,40}|JRM-1[0-9]{1,12}(?:-O[0-9]{1,12})?)$/i.test(String(openResult.invoiceNumber || "")) ? String(openResult.invoiceNumber).toUpperCase() : null;
+        const crmState = officeCrmState(openResult);
         sendJson(res, 200, {
           ok: true,
           transactionId: openResult.transactionId || null,
+          ...(officeCharge ? { crm: bookingRef || crmState === "recorded" || crmState === "pending" ? crmState : "nobooking", booking: bookingRef } : {}),
         });
         return;
       }
@@ -1546,7 +1575,7 @@ const server = http.createServer(async (req, res) => {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-09-25-paddle-reader",
+      build: "2026-09-25-money-loop",
       instance: INSTANCE_ID,
       snapEngage: {
         enabled: SNAPENGAGE_ENABLED,
@@ -1580,7 +1609,7 @@ const server = http.createServer(async (req, res) => {
       moneyHop: moneyHop.health(),
       crmSearch: crmSearch.health(),
       moneyMap: moneyMap.health(),
-      mercury: mercuryGateway.health(),
+      mercury: publicMercuryHealth(mercuryGateway.health()),
       moneyWatch: moneyWatch.summary(),
       whatsappWebhook: {
         path: "/__nesher_wa/webhook/",
@@ -1938,7 +1967,9 @@ async function runPaymentPosting() {
   paymentPostingBusy = true;
   try {
     const out = await retryPaymentPosts({ pool: getPool(), post: recordNmiPaidInvoice });
-    lastPaymentPosting = { at: new Date().toISOString(), ...out };
+    let waiting = null;
+    try { waiting = (await loopReview({ pool: getPool() })).count; } catch { waiting = null; }
+    lastPaymentPosting = { at: new Date().toISOString(), ...out, waiting };
   } catch {
     lastPaymentPosting = { at: new Date().toISOString(), errors: 1, error: 'posting_recovery_failed' };
   } finally {
@@ -1971,12 +2002,26 @@ if (process.env.DATABASE_URL || process.env.DATABASE_PUBLIC_URL) {
   setInterval(refreshPayLinkStats, 60 * 1000).unref();
 }
 let nmiRecoveryBusy = false;
+let nmiRecoveryGoodAt = null;
+let nmiRecoveryErrorAt = null;
+
+// Audit #145: a pay link held as "confirming" (the gateway answer was lost) is marked paid once the
+// sweep has the processor's approved sale for it: same order id, same amount, exactly one such link.
+async function settleConfirmingLink(ev) {
+  const rows = await findInvoicesByOrderId(ev.invoiceNumber);
+  const hits = (rows || []).filter((r) => r.payload && r.payload.confirming === true && !String(r.payload.transactionId || "")
+    && Math.abs(Number(r.payload.amountUsd) - Number(ev.amountUsd)) < 0.005);
+  if (hits.length !== 1) return { ok: false, skipped: hits.length ? "ambiguous" : "none" };
+  return markInvoicePaid(hits[0].id, { paidAt: ev.paidAt, transactionId: ev.transactionId });
+}
 async function runNmiRecoverySweep(days) {
   if (nmiRecoveryBusy) return;
   nmiRecoveryBusy = true;
   try {
     const doors = moneyDoors("recovery");
     const out = await runNmiRecovery({
+      reverse: doors.reverseFromSweep,
+      settled: POSTING_MODE === "live" ? settleConfirmingLink : undefined,
       host: process.env.NMI_HOST || "https://pinpointpayments.transactiongateway.com",
       securityKey: process.env.NMI_PRIVATE_KEY || "",
       days,
@@ -1985,7 +2030,8 @@ async function runNmiRecoverySweep(days) {
       post: doors.recordNmiPaidInvoice,
       except: doors.recordPaymentException,
     });
-    lastNmiRecovery = out;
+    nmiRecoveryGoodAt = out.at;
+    lastNmiRecovery = { ...out, lastGoodAt: nmiRecoveryGoodAt, lastErrorAt: nmiRecoveryErrorAt };
   } catch (e) {
     const msg = String(e?.message || "failed");
     lastNmiRecovery = {
@@ -1993,6 +2039,8 @@ async function runNmiRecoverySweep(days) {
       mode: POSTING_MODE,
       errors: 1,
       error: /^nmi_query_[a-z_0-9]+$/.test(msg) ? msg : "sweep_failed",
+      lastGoodAt: nmiRecoveryGoodAt,
+      lastErrorAt: (nmiRecoveryErrorAt = new Date().toISOString()),
     };
     console.warn("nmi recovery sweep failed:", lastNmiRecovery.error);
   } finally {
@@ -2005,7 +2053,7 @@ if (
   process.env.NMI_RECOVERY !== "off"
 ) {
   setTimeout(() => runNmiRecoverySweep(45), 60 * 1000).unref();
-  setInterval(() => runNmiRecoverySweep(3), 15 * 60 * 1000).unref();
+  setInterval(() => runNmiRecoverySweep(sweepDays(nmiRecoveryGoodAt)), 15 * 60 * 1000).unref();
 }
 
 let lastPaySync = null;

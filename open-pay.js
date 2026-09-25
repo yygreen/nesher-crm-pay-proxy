@@ -121,6 +121,15 @@ export function isOfficePayLookupPath(pathname) {
 }
 
 export const OFFICE_CRM_MISS = "We could not find that CRM reference.";
+// Audit #77 (25 Sep): the office page says what happened in the CRM, not just "received". "none" is the
+// only line the PUBLIC /pay/open page ever shows (the server sends a CRM state for the office page only).
+export const OFFICE_DONE_WORDS = Object.freeze({
+  recorded: "Card payment received and recorded on {booking} in the CRM - nothing to enter.",
+  pending: "Card payment received. The CRM is still saving it - check {booking} in a few minutes before entering anything.",
+  review: "Card payment received but NOT recorded in the CRM automatically - check {booking} and enter it if it is not there.",
+  nobooking: "Card payment received with no booking on it - record it on the booking it belongs to.",
+  none: "Card payment received. Thank you.",
+});
 
 /**
  * Guest open-amount brands from Host + X-Forwarded-Host + Forwarded.
@@ -750,6 +759,7 @@ async function chargeOfficeCrmRef(opts, classified) {
   }
   let crmRecorded = false;
   let crmPending = false;
+  let crmReview = false;
   if (kind === "hotel" || kind === "reservation") {
     const paidAt = opts.now || new Date().toISOString();
     await observeSafely(opts.shadowPayment, {
@@ -775,6 +785,8 @@ async function chargeOfficeCrmRef(opts, classified) {
         });
         crmRecorded = posted?.ok === true;
         crmPending = !crmRecorded;
+        // Audit #77: a durable review row is NOT "still saving" - the retry will never post it, a person must.
+        if (!crmRecorded && posted?.durable && posted?.state === "review") crmReview = true;
       } catch (e) {
         crmPending = true;
         console.warn("recordNmiPaidInvoice failed");
@@ -788,8 +800,21 @@ async function chargeOfficeCrmRef(opts, classified) {
     transactionId: sale.transactionId || null,
     crmRecorded,
     crmPending,
+    ...(crmReview ? { needsReview: true } : {}),
     httpStatus: 200,
   };
+}
+
+/**
+ * What the office page may say about the CRM after a charge (audit #77, 25 Sep). The page used to say
+ * "Card payment received" whatever happened, so some reps typed the payment in again (double) and
+ * others never entered the ones that were not recorded. One word for the page, from the result.
+ */
+export function officeCrmState(result = {}) {
+  if (result.crmRecorded) return "recorded";
+  if (result.needsReview) return "review";
+  if (result.crmPending) return "pending";
+  return "none";
 }
 
 export async function chargeOfficePay(opts = {}) {
@@ -957,7 +982,10 @@ ${officeFields}              if(address1) payload.address1=address1;
                   if(address) address.hidden=true;
                   if(wrap) wrap.hidden=true;
                   if(avs) avs.hidden=true;
-                  if(form) form.innerHTML="<p class='hint'>Card payment received. Thank you.</p>";
+                  var said=${JSON.stringify(OFFICE_DONE_WORDS)};
+                  var bk=(x.j&&typeof x.j.booking==="string")?x.j.booking.replace(/[^A-Za-z0-9-]/g,"").slice(0,40):"";
+                  var line=(said[x.j&&x.j.crm]||said.none).replace("{booking}",bk||"the booking");
+                  if(form){form.innerHTML="";var p=document.createElement("p");p.className="hint";p.textContent=line;form.appendChild(p);}
                 } else {
                   if(btn) btn.disabled=false;
                   showErr((x.j&&x.j.message)||${JSON.stringify(GUEST_DECLINE_DEFAULT)});

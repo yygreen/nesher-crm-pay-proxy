@@ -18,6 +18,7 @@ import {
   recordNmiPaid,
 } from "./nmi-card.js";
 import { observeSafely } from "./payment-posts.js";
+import { NMI_PROCESSOR_BRAND } from "./nmi-recovery.js";
 
 export const NMI_WEBHOOK_PATH = "/__nesher_pay/nmi-webhook";
 
@@ -190,6 +191,9 @@ export function parseNmiWebhook(body) {
     return Number.isFinite(x) && x > 0 ? x : null;
   })();
   const brandHint = String(mdf(inner, 1) || mdf(root, 1) || "").toLowerCase();
+  // Audit #140 (25 Sep): a portal sale carries no MDF 1; the merchant account (processor_id) names the
+  // brand, exactly as the recovery sweep reads it. MDF 1 still wins when it is there.
+  const processorId = String(inner.processor_id || inner.processorId || root.processor_id || "").trim().toLowerCase();
   const rep = String(mdf(inner, 5) || mdf(root, 5) || "").trim();
   return {
     eventType,
@@ -197,7 +201,7 @@ export function parseNmiWebhook(body) {
     orderId: orderId || null,
     amountUsd: amountFixed,
     actionType: String(action?.action_type || inner.action_type || "").toLowerCase(),
-    brand: brandHint === "jrm" || brandHint === "nesher" ? brandHint : null,
+    brand: brandHint === "jrm" || brandHint === "nesher" ? brandHint : (NMI_PROCESSOR_BRAND[processorId] || null),
     rep: /^[A-Za-z][A-Za-z .'-]{0,39}$/.test(rep) ? rep : null,
     cardLast4: cardLastFour(inner) || cardLastFour(inner.card ? { card: inner.card } : null),
   };
@@ -259,6 +263,10 @@ export async function applyNmiSaleSuccess(parsed, opts = {}) {
     if (typeof opts.recordPaymentException !== "function") return { ok: true, ignored };
     const kept = await opts.recordPaymentException({ ...ev, reason });
     if (kept?.durable) return { ok: true, ignored, needsReview: true };
+    // Audit #140: no brand at all (no MDF 1, no CRM reference, no known merchant account) cannot be kept
+    // here. The 15-minute sweep reads the processor record, where the merchant account is always named,
+    // and keeps it; asking NMI to redeliver forever would only get this webhook switched off.
+    if (Array.isArray(kept?.errors) && kept.errors[0] === "brand_unknown") return { ok: true, ignored: "brand_unknown_left_to_sweep", needsReview: true };
     return { ok: false, error: "exception_recording_failed", httpStatus: 503 };
   };
 

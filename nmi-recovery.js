@@ -73,6 +73,8 @@ export function parseNmiQueryXml(xml) {
       amountUsd: Math.round(Math.abs(money.amount) * 100) / 100,
       success: money.success,
       voided: actions.some((a) => a.type === "void" && a.success),
+      voidedAt: (actions.find((a) => a.type === "void" && a.success) || {}).date || null,
+      originalTransactionId: /^[A-Za-z0-9_-]{1,64}$/.test(tag(b, "original_transaction_id")) ? tag(b, "original_transaction_id") : null,
       paidAt: money.date,
       cardLast4: last4(tag(b, "cc_number")),
       rep: /^[A-Za-z][A-Za-z .'-]{0,39}$/.test(rep) ? rep : null,
@@ -112,6 +114,18 @@ export async function queryNmiRange({ host, securityKey, since, until, fetchImpl
   }
 }
 
+/**
+ * How far back the 15-minute sweep reads (audit #142): never less than the floor (3 days), and always back to
+ * an hour before the last sweep that WORKED - so a processor read that was down for longer than three
+ * days is caught up on the first good pass instead of waiting for the next redeploy. Capped at 60.
+ */
+export function sweepDays(lastGoodAt, now = Date.now(), floor = 3) {
+  const t = Date.parse(String(lastGoodAt || ""));
+  if (!Number.isFinite(t)) return floor;
+  const back = (Number(now) - t) / 86400000 + 1 / 24;
+  return Math.min(60, Math.max(floor, Math.ceil(back)));
+}
+
 /** The decision the live paths would take for one processor-confirmed event. */
 export function recoveryDecision(e) {
   if (e.kind === "refund") return { action: "exception", reason: "reversal_requires_review" };
@@ -129,12 +143,15 @@ export function recoveryDecision(e) {
  * One sweep. `observe(ev)` (shadow) or `post(ev)` / `except(ev)` (live) are
  * injected by the server. Returns counts only.
  */
-export async function runNmiRecovery({ host, securityKey, days = 3, now = new Date(), fetchImpl, mode = "shadow", observe, post, except }) {
+export async function runNmiRecovery({ host, securityKey, days = 3, now = new Date(), fetchImpl, mode = "shadow", observe, post, except, reverse, settled }) {
   const until = new Date(now.getTime());
   const since = new Date(now.getTime() - Math.max(1, Math.min(60, Number(days) || 3)) * 86400000);
   const xml = await queryNmiRange({ host, securityKey, since, until, fetchImpl });
   const events = parseNmiQueryXml(xml);
-  const out = { at: new Date().toISOString(), mode, days, transactions: events.length, confirmed: 0, notMoney: 0, noBrand: 0, observed: 0, posted: 0, exceptions: 0, errors: 0 };
+  // `fresh` (audit #142): what THIS pass did for the first time - a new CRM row, a new reversal, a new
+  // review row - apart from the running totals that re-count every sale still in the window.
+  const out = { at: new Date().toISOString(), mode, days, transactions: events.length, confirmed: 0, notMoney: 0, noBrand: 0, observed: 0, posted: 0, reversed: 0, exceptions: 0, errors: 0,
+    fresh: { posted: 0, reversed: 0, exceptions: 0 } };
   for (const e of events) {
     // Only the processor's approval makes it money. Failed = no money moved.
     if (!e.success || !(e.amountUsd > 0) || !(MONEY_CONDITIONS.has(e.condition) || e.condition === "canceled")) { out.notMoney++; continue; }
@@ -156,10 +173,36 @@ export async function runNmiRecovery({ host, securityKey, days = 3, now = new Da
     };
     try {
       if (mode === "live") {
+        // A VOID OR REFUND (audit #26): through the reversal door when the server gives one - it reverses
+        // only a sale the loop itself posted, and keeps everything else for a person.
+        const isReversal = e.kind === "refund" || e.voided || e.condition === "canceled";
+        if (isReversal && typeof reverse === "function") {
+          const r = await reverse({
+            ...ev,
+            reversal: e.kind === "refund" ? "refund" : "void",
+            originalTransactionId: e.originalTransactionId || null,
+            reversedAt: e.voidedAt || null,
+            refundVoided: e.kind === "refund" && (e.voided || e.condition === "canceled"),
+          });
+          if (r?.reversal && r?.ok) {
+            out.reversed++;
+            if (r.recorded?.length) out.fresh.reversed++;
+          } else if (r?.ok || r?.durable || r?.needsReview) {
+            out.exceptions++;
+            if (r?.inserted) out.fresh.exceptions++;
+          } else out.errors++;
+          continue;
+        }
         const r = decision.action === "post" ? await post(ev) : await except({ ...ev, reason: decision.reason });
-        if (decision.action === "post" && r?.ok) out.posted++;
-        else if (r?.durable || r?.needsReview) out.exceptions++;
-        else out.errors++;
+        if (decision.action === "post" && r?.ok) {
+          out.posted++;
+          if (r.recorded?.length) out.fresh.posted++;
+          // Audit #145: a pay link stuck on "confirming" is cleared once its sale is in the CRM.
+          if (typeof settled === "function") { try { await settled(ev); } catch { /* the link stays as it was */ } }
+        } else if (r?.durable || r?.needsReview) {
+          out.exceptions++;
+          if (r?.inserted || r?.newlyReviewed) out.fresh.exceptions++;
+        } else out.errors++;
       } else {
         const r = await observe(ev);
         if (r?.ok) out.observed++;

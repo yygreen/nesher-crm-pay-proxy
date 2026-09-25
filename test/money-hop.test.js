@@ -126,7 +126,7 @@ describe("money-hop route", () => {
   it("forwards only the seven GETs (plan 17.4 added /invoices, F6 /money-map); anything else is 405 not_forwardable and never becomes a job", async () => {
     const t = await rig();
     try {
-      assert.deepEqual(MONEY_HOP_FORWARDABLE, ["/health", "/balances", "/transactions", "/caps", "/state", "/invoices", "/money-map", "/crm-search"]);
+      assert.deepEqual(MONEY_HOP_FORWARDABLE, ["/health", "/balances", "/transactions", "/caps", "/state", "/invoices", "/money-map", "/crm-search", "/loop-review"]);
       for (const [m, p] of [["POST", "/balances"], ["POST", "/money-map"], ["GET", "/send"], ["GET", "/balances/x"], ["GET", "/transfer?amount=1"], ["GET", "/recipients"], ["DELETE", "/state"]]) {
         const r = await call(t, m, p, { body: m === "POST" ? "{}" : null });
         assert.equal(r.status, 405, m + " " + p);
@@ -280,11 +280,11 @@ describe("wiring", () => {
     const src = fs.readFileSync(new URL("../server.js", import.meta.url), "utf8");
     assert.match(src, /import \{ createMoneyHop \} from "\.\/money-hop\.js"/);
     // F6: the money map is answered by the pay-proxy itself; every other data GET goes to the Mercury door
-    assert.match(src, /createMoneyHop\(\{\s+key: process\.env\.MONEY_HOP_KEY \|\| "",[\s\S]{0,200}?direct: \(sub\) => \{\s+const p = String\(sub\)\.split\("\?"\)\[0\];\s+if \(p === MONEY_MAP_PATH\) return moneyMap\.hopAnswer\(sub\);\s+if \(p === CRM_SEARCH_PATH\) return crmSearch\.hopAnswer\(sub\);\s+return mercuryGateway\.hopDirect\(sub\);\s+\},\s+\}\)/);
+    assert.match(src, /createMoneyHop\(\{\s+key: process\.env\.MONEY_HOP_KEY \|\| "",[\s\S]{0,200}?direct: \(sub\) => \{\s+const p = String\(sub\)\.split\("\?"\)\[0\];\s+if \(p === MONEY_MAP_PATH\) return moneyMap\.hopAnswer\(sub\);\s+if \(p === CRM_SEARCH_PATH\) return crmSearch\.hopAnswer\(sub\);[\s\S]{0,200}?if \(p === LOOP_REVIEW_PATH\) return loopReviewAnswer\(\);\s+return mercuryGateway\.hopDirect\(sub\);\s+\},\s+\}\)/);
     assert.match(src, /url\.pathname\.startsWith\("\/__money_hop\/"\)/);
     assert.match(src, /await moneyHop\.handle\(req, res\)/);
     assert.match(src, /moneyHop: moneyHop\.health\(\)/);
-    assert.match(src, /build: "2026-09-25-paddle-reader"/);
+    assert.match(src, /build: "2026-09-25-money-loop"/);
     // the hop is mounted before the Mercury relay and everything behind it
     assert.ok(src.indexOf('url.pathname.startsWith("/__money_hop/")') < src.indexOf("/^\\/__mercury_relay\\/(.+)$/"));
     // no Mercury token or send path anywhere in the module
