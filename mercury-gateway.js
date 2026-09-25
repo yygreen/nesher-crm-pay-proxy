@@ -251,6 +251,19 @@ export function countryCode(c) {
 }
 
 /**
+ * WhatsApp/markdown decoration off a pasted name or street line: a leading "- " or "> " (a reply
+ * quote or bullet marker, possibly repeated), and any "*", "_", "~" or bullet character (used for
+ * bold/italic/strike, or as a list mark) wherever it sits - so "*Name:* Leah Roth"-style wrapping and
+ * inner bold pairs come off too, not only the ends. Pure.
+ */
+export function stripDecoration(v) {
+  let s = String(v == null ? "" : v);
+  s = s.replace(/^(?:[-•▪‣·>]\s+)+/, "");
+  s = s.replace(/[*_~•▪‣·]/g, "");
+  return s.replace(/\s+/g, " ").trim();
+}
+
+/**
  * What a pasted set of bank details may become, checked before anything reaches Mercury. Pure.
  * in: {name, routing, account, type, business, emails[], address{address1,city,region,postalCode,country}}
  * -> {ok:true, body, view} | {ok:false, error}
@@ -259,8 +272,9 @@ export function countryCode(c) {
 export function recipientDraft(input) {
   const x = input && typeof input === "object" ? input : {};
   const clean = (v, n) => String(v == null ? "" : v).replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim().slice(0, n);
-  const name = clean(x.name, 80);
-  if (name.length < 2 || !/\p{L}/u.test(name)) return { ok: false, error: "name_required" };
+  const name = clean(stripDecoration(x.name), 80);
+  if (name.length < 2 || !/\p{L}/u.test(name) || !/^[\p{L}\p{Nd}]/u.test(name)) return { ok: false, error: "name_required" };
+  if (/[\d$₪]/.test(name)) return { ok: false, error: "name_invalid", decline_reason_human: "The recipient name has numbers or signs in it - nothing was added. Type just the account holder's name." };
   if (PAY_BLOCK_NAME.test(name)) return { ok: false, error: "own_or_other_org" };
   const routing = String(x.routing || "").replace(/\D/g, "");
   if (!abaOk(routing)) return { ok: false, error: "routing_invalid" };
@@ -281,8 +295,9 @@ export function recipientDraft(input) {
   // No complete address = refused HERE, before Mercury, and the tile asks the rep for one line.
   const a = x.address && typeof x.address === "object" ? x.address : null;
   if (!a) return { ok: false, error: "address_required" };
-  const address = { address1: clean(a.address1, 120), city: clean(a.city, 60), region: clean(a.region, 40), postalCode: clean(a.postalCode, 12), country: countryCode(a.country == null || a.country === "" ? "US" : a.country) };
+  const address = { address1: clean(stripDecoration(a.address1), 120), city: clean(a.city, 60), region: clean(a.region, 40), postalCode: clean(a.postalCode, 12), country: countryCode(a.country == null || a.country === "" ? "US" : a.country) };
   if (!address.address1 || !address.city || !address.region || !address.postalCode || !address.country) return { ok: false, error: "address_required" };
+  if (!/^[\p{L}\p{Nd}]/u.test(address.address1)) return { ok: false, error: "address_required" };
   if (clean(a.address2, 60)) address.address2 = clean(a.address2, 60);
   const eri = { accountNumber: account, routingNumber: routing, electronicAccountType: type, address };
   const body = { name, emails, electronicRoutingInfo: eri };

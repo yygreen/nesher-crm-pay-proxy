@@ -148,6 +148,25 @@ describe("the pure rules", () => {
     assert.equal(recipientDraft({ name: "", routing: CFSB, account: ACCT }).error, "name_required");
     assert.equal(recipientDraft({ name: "Yael", routing: CFSB, account: "12" }).error, "account_invalid");
   });
+  it("Mr. AV (25 Sep): WhatsApp/markdown decoration is stripped off the name and street before Mercury sees it", () => {
+    const base = { name: "Yael Sher", routing: CFSB, account: ACCT, type: "Checking", emails: ["yael.sher@example.com"], address: { address1: "89-16 Jamaica Ave", city: "Woodhaven", region: "NY", postalCode: "11421", country: "US" } };
+    let d = recipientDraft({ ...base, name: "* Yael Sher" });
+    assert.equal(d.ok, true, JSON.stringify(d));
+    assert.equal(d.body.name, "Yael Sher");
+
+    d = recipientDraft({ ...base, name: "* Leah Roth *" });
+    assert.equal(d.ok, true, JSON.stringify(d));
+    assert.equal(d.body.name, "Leah Roth");
+
+    d = recipientDraft({ ...base, address: { ...base.address, address1: "* 3 Park Pl" } });
+    assert.equal(d.ok, true, JSON.stringify(d));
+    assert.equal(d.body.electronicRoutingInfo.address.address1, "3 Park Pl");
+
+    d = recipientDraft({ ...base, name: "Yael Sher - please refund $630" });
+    assert.equal(d.ok, false);
+    assert.equal(d.error, "name_invalid");
+    assert.match(d.decline_reason_human, /numbers or signs/);
+  });
   it("a person is a payee only with the switch", () => {
     assert.equal(payeeVerdict(BASE_R.cohen).why, "personal");
     assert.equal(payeeVerdict(BASE_R.cohen, { persons: true }).ok, true);
