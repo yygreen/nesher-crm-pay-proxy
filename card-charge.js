@@ -147,7 +147,7 @@ export function saleExtras(xml, nameNeedle = "") {
       const hay = ` ${[mdfText(head, "first_name"), mdfText(head, "last_name"), mdfText(head, "company")].join(" ").toLowerCase()} `;
       nameHit = needle.split(" ").every((w) => w.length >= 2 && hay.includes(w));
     }
-    // 25 Sep evening (Joseph: receipts print the approval code): the processor's authorization_code, only when it is
+    // 25 Sep evening (money-docs receipts print the processor's approval code): the authorization_code, only when it is
     // a code - 2-12 letters/digits and not 7+ digits (never a card-shaped run). The phone reader applies the same guard.
     const code = mdfText(head, "authorization_code");
     const authCode = /^[A-Za-z0-9]{2,12}$/.test(code) && !/^\d{7,}$/.test(code) ? code : null;

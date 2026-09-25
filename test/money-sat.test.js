@@ -1,4 +1,4 @@
-// Mr Money leftovers, 25 Sep evening (Joseph ~16:20 IL: "reguler work i never said dont waork" / "make it perfect").
+// Mr Money leftovers, 25 Sep evening (Joseph 17:28 IL: "reguler work i never said dont waork"; ~17:19 IL "make it perfect").
 // Written RED FIRST against live 37b7864 (build 2026-09-25-leftover-loop). Fixtures only: fake query.php XML, an
 // in-memory PGlite CRM, a fake Mercury read. No network, no real CRM, no gateway call, no card number.
 //  1. /__nesher_pay/sale: every match carries the sale's NMI authorization code (auth_code) and the id of the latest
@@ -6,8 +6,8 @@
 //  2. crm-search: every booking carries remaining_balance_usd = the CRM's OWN Reservation.remaining_balance (price +
 //     services - refunds to the customer - payments - ledger applications - active sponsorships), so the phone's
 //     "Use $X" comes back from a complete source. balance_usd (price minus paid) stays for ranking only.
-//  3. money map (F4, Gabbai s.8 (b)): a Mercury invoice marked PAID after a card payment is not counted a second time,
-//     and one held for a person is shown apart - under the MONEY_LEFTOVER_LOOP switch.
+//  3. money map, s.8 (b) money counted once (Gabbai r3): a Mercury invoice marked PAID after a card payment is not
+//     counted a second time, and one held for that reason is shown apart - under the MONEY_LEFTOVER_LOOP switch.
 import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -31,7 +31,7 @@ const nmiXml = (list) => `<?xml version="1.0" encoding="UTF-8"?><nm_response>${l
 function ledger() {
   return [
     // settled $500 sale, two refunds by their own transactions: the LATER one is last_back_txn
-    { id: "txn-100", order: "RES-79RHW4", auth: "OK123A", actions: [{ type: "sale", amount: "500.00", at: DAYS(3) }] },
+    { id: "txn-100", order: "RES-ZZ1TST", auth: "OK123A", actions: [{ type: "sale", amount: "500.00", at: DAYS(3) }] },
     { id: "txn-101", orig: "txn-100", actions: [{ type: "refund", amount: "-100.00", at: DAYS(2) }] },
     { id: "txn-102", orig: "txn-100", actions: [{ type: "refund", amount: "-50.00", at: DAYS(1) }] },
     // fully refunded; a 6-digit approval code is a real code
@@ -156,7 +156,7 @@ describe("2. crm-search returns the CRM's own full balance as remaining_balance_
   });
 });
 
-// ── 3. money map F4 ────────────────────────────────────────────────────────────────────────────────────────
+// ── 3. money map: s.8 (b) money counted once ──────────────────────────────────────────────────────────────
 const NOWM = Date.parse("2026-09-20T12:00:00Z");
 const DAY = mm.periodFor({ period: "day", date: "2026-09-18" }, NOWM);
 const inv = (id, ref, amount) => ({ id, invoiceNumber: ref, status: "Paid", amount, createdAt: "2026-09-18T08:00:00Z", updatedAt: "2026-09-18T08:00:00Z" });
@@ -165,32 +165,54 @@ function mapOf(crmExtra, invoices) {
   return mm.buildMoneyMap({ period: DAY, nowMs: NOWM, nmi: mm.parseNmiTransactions("<nm_response></nm_response>"), bank: [], invoices, crm,
     sources: { nmi: { ok: true }, mercury: { ok: true }, invoices: { ok: true }, crm: { ok: true } } });
 }
-describe("3. money map F4: a Mercury invoice marked PAID after a card payment is not counted twice; one held for a person is apart", () => {
+describe("3. money map s.8 (b), money counted once: a Mercury invoice marked PAID after a card payment is not counted twice; one held for that reason is apart", () => {
   const crm = {
-    mercuryPaid: [{ invoice_id: "m-rec", paid_at: "2026-09-18T09:00:00Z", source: "crm" }, { invoice_id: "m-held", paid_at: "2026-09-18T10:00:00Z", source: "ledger" }],
-    mercuryCardRows: [{ ref: "RES-CARDED", amount: 750 }],
+    mercuryPaid: [
+      { invoice_id: "m-rec", paid_at: "2026-09-18T09:00:00Z", source: "crm" },
+      { invoice_id: "m-held", paid_at: "2026-09-18T10:00:00Z", source: "ledger", reason: "mercury_paid_after_card_link" },
+      { invoice_id: "m-same", paid_at: "2026-09-18T10:30:00Z", source: "ledger", reason: "mercury_same_amount_on_booking" },
+      { invoice_id: "m-fly", paid_at: "2026-09-18T11:00:00Z", source: "ledger", reason: "flight_link_not_wired" },
+    ],
+    mercuryCardRows: [{ ref: "RES-CARDED", amount: 750 }, { ref: "JRM-142", amount: 400 }],
   };
-  const invoices = [inv("m-rec", "RES-RECORD", 100), inv("m-held", "RES-HELD01", 1000), inv("m-marked", "RES-CARDED", 750), inv("m-plain", "RES-PLAIN1", 40)];
-  it("on: recorded + plain are Mercury paid; the held one and the marked-after-card one are shown apart and not in the confirmed total", () => {
+  const invoices = [inv("m-rec", "RES-RECORD", 100), inv("m-held", "RES-HELD01", 1000), inv("m-same", "RES-HELD02", 60), inv("m-fly", "FLY-1055-R7", 300),
+    inv("m-marked", "RES-CARDED", 750), inv("m-jrm", "JRM-142", 400), inv("m-plain", "RES-PLAIN1", 40)];
+  it("on: recorded, plain and a paid FLY- link (flight_link_not_wired) are counted; the two card-overlap holds and the marked-after-card ones are apart", () => {
     const m = mapOf(crm, invoices);
     const I = m.brands.nesher.mercury_invoices;
-    assert.equal(I.paid, 140);
-    assert.equal(I.count, 2);
-    assert.deepEqual(I.held_for_person, { count: 1, amount: 1000 });
+    assert.equal(I.paid, 440, "100 recorded + 40 plain + 300 FLY- (real money, no card overlap)");
+    assert.equal(I.count, 3);
+    assert.deepEqual(I.held_for_person, { count: 2, amount: 1060 });
     assert.deepEqual(I.marked_paid_after_card, { count: 1, amount: 750 });
-    assert.ok(m.notes.some((n) => /1 paid invoice\(s\) \(\$1000\) wait for a person and are not counted/.test(n)), m.notes.join(" | "));
-    assert.ok(m.notes.some((n) => /1 invoice\(s\) \(\$750\) were marked paid on a booking whose card payment of the same amount is already counted/.test(n)), m.notes.join(" | "));
+    const J = m.brands.jrm.mercury_invoices;
+    assert.equal(J.paid, 0);
+    assert.deepEqual(J.marked_paid_after_card, { count: 1, amount: 400 }, "JRM keyed JRM-1<id>: refKey and the loadCrm SQL agree");
+    assert.ok(m.notes.some((n) => n.includes("2 paid invoice(s) ($1060) on a booking that already has a card payment wait for a person (held_for_person) and are not counted here - they may be that card payment marked paid in Mercury. A payment a person typed for one shows with the rep-recorded payments.")), m.notes.join(" | "));
+    assert.ok(m.notes.some((n) => n.includes("2 paid invoice(s) ($1150) have no CRM record and match a card payment of the same amount on the same booking - taken as that card payment marked paid in Mercury and not counted again (marked_paid_after_card).")), m.notes.join(" | "));
+    assert.ok(m.notes.some((n) => n.includes("1 paid invoice(s) have no CRM record yet (a review row waits for a person); counted, dated by when our sync first saw them paid.")), m.notes.join(" | "));
+  });
+  it("C1: a paid FLY- invoice with a flight_link_not_wired ledger row is counted; only the two card-overlap reasons are held", () => {
+    const only = (row, invoice) => mapOf({ mercuryPaid: [row], mercuryCardRows: [] }, [invoice]).brands.nesher.mercury_invoices;
+    const fly = only({ invoice_id: "f1", paid_at: "2026-09-18T11:00:00Z", source: "ledger", reason: "flight_link_not_wired" }, inv("f1", "FLY-1055-R7", 300));
+    assert.equal(fly.paid, 300);
+    assert.equal(fly.held_for_person, undefined);
+    for (const reason of ["mercury_same_amount_on_booking", "mercury_paid_after_card_link"]) {
+      const h = only({ invoice_id: "h1", paid_at: "2026-09-18T11:00:00Z", source: "ledger", reason }, inv("h1", "RES-HELD01", 300));
+      assert.equal(h.paid, 0, reason);
+      assert.deepEqual(h.held_for_person, { count: 1, amount: 300 }, reason);
+    }
   });
   it("off (MONEY_LEFTOVER_LOOP=off): everything paid is counted, as on 07c394c", () => {
     process.env.MONEY_LEFTOVER_LOOP = "off";
     try {
-      const I = mapOf(crm, invoices).brands.nesher.mercury_invoices;
-      assert.equal(I.paid, 1890);
-      assert.equal(I.held_for_person, undefined);
-      assert.equal(I.marked_paid_after_card, undefined);
+      const m = mapOf(crm, invoices);
+      assert.equal(m.brands.nesher.mercury_invoices.paid, 2250);
+      assert.equal(m.brands.jrm.mercury_invoices.paid, 400);
+      assert.equal(m.brands.nesher.mercury_invoices.held_for_person, undefined);
+      assert.equal(m.brands.nesher.mercury_invoices.marked_paid_after_card, undefined);
     } finally { delete process.env.MONEY_LEFTOVER_LOOP; }
   });
-  it("loadCrm reads the card rows of the paid invoices' bookings (anchored nmi: marker), read only", async () => {
+  it("loadCrm reads the card rows of the paid invoices' bookings (anchored nmi: marker) and the ledger reason, read only", async () => {
     const pg = new PGlite();
     await pg.exec(`
       CREATE TABLE core_reservation (id bigint primary key, reservation_code varchar, customer_price numeric, supplier_cost numeric, booked_with_points boolean);
@@ -199,14 +221,17 @@ describe("3. money map F4: a Mercury invoice marked PAID after a card payment is
       CREATE TABLE core_jrmhoteloffer (id bigint primary key, request_id bigint, currency varchar, hotel_price numeric, markup numeric, customer_price numeric, customer_answer_status varchar);
       CREATE TABLE core_jrmhotelrequest (id bigint primary key, status varchar);
       CREATE TABLE core_refund (id bigint primary key, reservation_id bigint);
+      CREATE TABLE nesher_money_payment_posts (transaction_id text primary key, paid_at timestamptz, reason text);
       INSERT INTO core_reservation VALUES (7, 'CARDED', 0, 0, false), (8, 'NOCARD', 0, 0, false);
       INSERT INTO core_payment VALUES (1, 750, 'card', '2026-09-10', 'Card payment ... nmi:t-750', '2026-09-10', 7), (2, 750, 'card', '2026-09-10', 'typed by hand', '2026-09-10', 8),
                                       (3, 20, 'card', '2026-09-10', 'VOID nmi-void:t-9', '2026-09-10', 8);
       INSERT INTO core_jrmhotelpayment VALUES (1, '2026-09-10', 400, 'USD', 'card', 'JRM-142 nmi:t-400', '2026-09-10', null, 42);
+      INSERT INTO nesher_money_payment_posts VALUES ('mercury_m-fly', '2026-09-18T11:00:00Z', 'flight_link_not_wired');
     `);
     const pool = { query: (s, p) => pg.query(s, p), connect: async () => ({ query: (s, p) => pg.query(s, p), release() {} }) };
     const data = await mm.loadCrm(pool, DAY, { res: [], jrm: [], mercury: { res: ["CARDED", "NOCARD"], jrm: [42] } });
     assert.deepEqual((data.mercuryCardRows || []).map((r) => r.ref + ":" + r.amount).sort(), ["JRM-142:400", "RES-CARDED:750"]);
+    assert.deepEqual(data.mercuryPaid.filter((r) => r.source === "ledger").map((r) => r.invoice_id + ":" + r.reason), ["m-fly:flight_link_not_wired"]);
     await pg.close();
   });
 });

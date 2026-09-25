@@ -27,7 +27,7 @@ import { queryNmiRange, nmiDateMs, NMI_PROCESSOR_BRAND } from "./nmi-recovery.js
 import { parseInvoiceNumber } from "./payments-sync.js";
 import { leftoverLoopOn } from "./payments-sync.js"; // the leftover lane's kill switch (one home: payments-sync)
 
-export const MONEY_MAP_BUILD = "2026-09-25-map-f4";
+export const MONEY_MAP_BUILD = "2026-09-25-map-once";
 export const MONEY_MAP_PATH = "/money-map";
 export const MONEY_MAP_TZ = "Asia/Jerusalem";
 // Ids and brands come from the ONE table (nmi-recovery.js NMI_PROCESSOR_BRAND); here only the
@@ -449,10 +449,10 @@ export async function loadCrm(pool, period, refs) {
     ];
     const ledger = await q(`SELECT to_regclass('public.nesher_money_payment_posts') IS NOT NULL AS ok`);
     if (ledger[0] && ledger[0].ok) {
-      mercuryPaid.push(...(await q(`SELECT substring(transaction_id from 9) AS invoice_id, paid_at
+      mercuryPaid.push(...(await q(`SELECT substring(transaction_id from 9) AS invoice_id, paid_at, reason
                                      FROM nesher_money_payment_posts WHERE left(transaction_id, 8) = 'mercury_'`)).map((r) => ({ ...r, source: "ledger" })));
     }
-    // F4 (Gabbai s.8 (b)): the card payments (anchored nmi: marker) on the bookings of the paid Mercury invoices, so a
+    // s.8 (b) money counted once: the card payments (anchored nmi: marker) on the bookings of the paid Mercury invoices, so a
     // Mercury invoice marked PAID after a card payment of the same amount is not counted as money a second time.
     const mres = [...new Set(((refs && refs.mercury && refs.mercury.res) || []).map((c) => String(c).toUpperCase()))];
     const mjrm = [...new Set(((refs && refs.mercury && refs.mercury.jrm) || []).map(String))];
@@ -729,21 +729,24 @@ export function buildMoneyMap({ period, nowMs, nmi, bank, invoices, crm, sources
     for (const r of (dateBySync && crm && crm.mercuryPaid) || []) {
       const id = String((r && r.invoice_id) || "");
       const ms = r && r.payment_date ? ilMidnightMs(String(r.payment_date).slice(0, 10)) : r && r.paid_at != null ? new Date(r.paid_at).getTime() : NaN;
-      if (id && Number.isFinite(ms) && !(paidDay.has(id) && paidDay.get(id).source === "crm")) paidDay.set(id, { ms, source: r.source });
+      if (id && Number.isFinite(ms) && !(paidDay.has(id) && paidDay.get(id).source === "crm")) paidDay.set(id, { ms, source: r.source, reason: r.reason || null });
     }
     const paidMs = (inv) => (paidDay.has(String(inv.id)) ? paidDay.get(String(inv.id)).ms : Date.parse(inv.updatedAt || ""));
     const paid = invoices.filter((inv) => String(inv.status) === "Paid" && inPeriod(paidMs(inv)))
       .map((inv) => ({ inv, ms: paidMs(inv), amt: Number(inv.amount) || 0, bySent: !paidDay.has(String(inv.id)),
-        byLedger: paidDay.has(String(inv.id)) && paidDay.get(String(inv.id)).source === "ledger" }));
+        byLedger: paidDay.has(String(inv.id)) && paidDay.get(String(inv.id)).source === "ledger", reason: paidDay.has(String(inv.id)) ? paidDay.get(String(inv.id)).reason : null }));
     const fits = (p, x) => x.createdMs >= p.ms - 86400000 && x.createdMs <= p.ms + 10 * 86400000 && x.amount <= p.amt + CENT && x.amount >= 0.9 * p.amt;
-    // F4 (switch on): money counted once. A paid invoice waiting for a person (its ledger review row) is not
-    // confirmed money; one with no CRM record whose booking has a card payment of the same amount is that card
-    // payment marked PAID in Mercury (the #74 note) - already in the card figures. Both are shown apart.
+    // s.8 (b) money counted once (switch on). A paid invoice held by paySync BECAUSE its booking already has a card
+    // payment (the two card-overlap review reasons) may be that card payment marked PAID - held_for_person, apart.
+    // Any other review reason (a paid FLY- link, flight_link_not_wired) is real money and stays counted. One with no
+    // CRM record whose booking has a card payment of the same amount is taken as that card payment marked PAID in
+    // Mercury (the #74 note) - marked_paid_after_card, apart; the card figures already hold it.
+    const HOLD_REASONS = new Set(["mercury_same_amount_on_booking", "mercury_paid_after_card_link"]);
     const cardRows = (dateBySync && crm && crm.mercuryCardRows) || [];
     const refKey = (n) => { const r = refOf(n); return r ? (r.brand === "jrm" ? r.label : "RES-" + String(r.code).toUpperCase()) : null; };
     const apart = (p) => {
       if (!dateBySync) return null;
-      if (p.byLedger) return "held_for_person";
+      if (p.byLedger) return HOLD_REASONS.has(String(p.reason || "")) ? "held_for_person" : null;
       if (!p.bySent) return null;
       const k = refKey(p.inv.invoiceNumber);
       return k && cardRows.some((c) => c.ref === k && Math.abs(Number(c.amount) - p.amt) < 0.01) ? "marked_paid_after_card" : null;
@@ -775,8 +778,9 @@ export function buildMoneyMap({ period, nowMs, nmi, bank, invoices, crm, sources
     const byLedger = paid.filter((p) => p.byLedger).length;
     if (dateBySync) notes.push(crm
       ? "A Mercury invoice is dated by the day on the payment the CRM recorded for it, or on its review row while it waits for a person; Mercury itself gives no paid date."
-        + (byLedger ? ` ${byLedger} paid invoice(s) ($${r2(kept.held_for_person.amt)}) wait for a person and are not counted until the CRM records them (held_for_person); dated by when our sync first saw them paid.` : "")
-        + (kept.marked_paid_after_card.n ? ` ${kept.marked_paid_after_card.n} invoice(s) ($${r2(kept.marked_paid_after_card.amt)}) were marked paid on a booking whose card payment of the same amount is already counted - not counted again (marked_paid_after_card).` : "")
+        + (kept.held_for_person.n ? ` ${kept.held_for_person.n} paid invoice(s) ($${r2(kept.held_for_person.amt)}) on a booking that already has a card payment wait for a person (held_for_person) and are not counted here - they may be that card payment marked paid in Mercury. A payment a person typed for one shows with the rep-recorded payments.` : "")
+        + (byLedger - kept.held_for_person.n > 0 ? ` ${byLedger - kept.held_for_person.n} paid invoice(s) have no CRM record yet (a review row waits for a person); counted, dated by when our sync first saw them paid.` : "")
+        + (kept.marked_paid_after_card.n ? ` ${kept.marked_paid_after_card.n} paid invoice(s) ($${r2(kept.marked_paid_after_card.amt)}) have no CRM record and match a card payment of the same amount on the same booking - taken as that card payment marked paid in Mercury and not counted again (marked_paid_after_card).` : "")
         + (bySent ? ` ${bySent} paid invoice(s) with no CRM record are dated by when they were sent.` : "")
       : "A Mercury invoice is dated by when it was sent: the CRM could not be read, and Mercury itself gives no paid date.");
   } else notes.push("Mercury invoices could not be read (" + (sources.invoices?.error || "unknown") + ").");

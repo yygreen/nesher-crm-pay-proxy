@@ -88,7 +88,7 @@ describe("#150 a Mercury invoice is dated by the payment the CRM recorded for it
   it("R2: an invoice dated by its ledger review row is counted apart - it waits for a person and is NOT in the CRM", () => {
     const period = day("2026-08-11");
     const crm = { nesherInPeriod: [], reservations: [], nesherAll: [], jrmInPeriod: [], jrmAll: [], offers: [], requests: [], refundRows: [],
-      mercuryPaid: [{ invoice_id: "inv-held", paid_at: "2026-08-11T08:00:00Z", source: "ledger" }] };
+      mercuryPaid: [{ invoice_id: "inv-held", paid_at: "2026-08-11T08:00:00Z", source: "ledger", reason: "mercury_same_amount_on_booking" }] };
     const m = buildMoneyMap({ period, nowMs: NOW, nmi: parseNmiTransactions("<nm_response></nm_response>"), bank: [],
       invoices: [{ id: "inv-held", invoiceNumber: "RES-A3L4RS", status: "Paid", amount: 300, updatedAt: "2026-08-01T10:00:00Z" }], crm,
       sources: { nmi: { ok: true }, mercury: { ok: true }, invoices: { ok: true }, crm: { ok: true } } });
@@ -96,7 +96,7 @@ describe("#150 a Mercury invoice is dated by the payment the CRM recorded for it
     // shown apart as held_for_person, not counted in paid or the confirmed total
     assert.equal(m.brands.nesher.mercury_invoices.paid, 0);
     assert.deepEqual(m.brands.nesher.mercury_invoices.held_for_person, { count: 1, amount: 300 });
-    assert.ok(m.notes.some((n) => /1 paid invoice\(s\) \(\$300\) wait for a person and are not counted until the CRM records them \(held_for_person\); dated by when our sync first saw them paid/.test(n)), m.notes.join(" | "));
+    assert.ok(m.notes.some((n) => n.includes("1 paid invoice(s) ($300) on a booking that already has a card payment wait for a person (held_for_person) and are not counted here - they may be that card payment marked paid in Mercury. A payment a person typed for one shows with the rep-recorded payments.")), m.notes.join(" | "));
   });
 
   it("an invoice with no CRM record keeps the day it was sent, and the notes say so; an unreadable CRM says so too", () => {
@@ -113,7 +113,7 @@ describe("#150 a Mercury invoice is dated by the payment the CRM recorded for it
   });
 
   it("the read: reservation paid_at, hotel payment_date (an Israel day) and a ledger review row, in the READ ONLY transaction", async () => {
-    await db.exec(`CREATE TABLE nesher_money_payment_posts (transaction_id TEXT PRIMARY KEY, paid_at TIMESTAMPTZ NOT NULL)`);
+    await db.exec(`CREATE TABLE nesher_money_payment_posts (transaction_id TEXT PRIMARY KEY, paid_at TIMESTAMPTZ NOT NULL, reason TEXT)`);
     await rows();
     await pool.query(`INSERT INTO core_jrmhotelpayment (payment_date, amount, currency, method, reference, created_at, request_id) VALUES ('2026-08-11', 90, 'USD', 'bank', 'Mercury JRM-142 mercury:inv-h1', '2026-08-11T09:00:00Z', 42)`);
     await pool.query(`INSERT INTO nesher_money_payment_posts (transaction_id, paid_at) VALUES ('mercury_inv-fly1', '2026-08-11T08:00:00Z'), ('t-card-9', '2026-08-11T08:00:00Z')`);
