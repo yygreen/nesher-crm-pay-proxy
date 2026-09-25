@@ -214,6 +214,28 @@ export function scrubDigits(t) {
   });
 }
 
+/**
+ * Gabbai 25 Sep D2 (audit #109): the SUPPLIER-FACING belt. Only what is bank- or card-shaped is cut to its last four:
+ * a labelled account / routing run, an ABA-valid 9-digit run, a Luhn-valid 13-19 digit run (never right after a
+ * ticket label). Dates, invoice and ticket numbers reach the supplier as the rep wrote them. Pure.
+ */
+export function maskBankShaped(t) {
+  const four = (m) => "••" + String(m).replace(/\D/g, "").slice(-4);
+  let s = String(t == null ? "" : t);
+  s = s.replace(/\b(account|acct|a\/c|routing|aba|iban|checking|savings)(\s*(?:number|no\.?|#)?\s*[:#]?\s*)(\d[\d \-]{3,30}\d)/gi, (all, lab, sep, num) => lab + sep + four(num));
+  s = s.replace(/(^|[^\d•])(\d{9})(?!\d)/g, (all, lead, num) => (abaOk(num) ? lead + four(num) : all));
+  s = s.replace(/(^|[^\d•])((?:\d[ \-]?){12,18}\d)(?!\d)/g, (all, lead, num, off, whole) => {
+    const d = num.replace(/\D/g, "");
+    if (d.length < 13 || d.length > 19) return all;
+    let sum = 0, alt = false;
+    for (let i = d.length - 1; i >= 0; i--) { let n = d.charCodeAt(i) - 48; if (alt) { n *= 2; if (n > 9) n -= 9; } sum += n; alt = !alt; }
+    if (sum % 10 !== 0) return all;
+    if (/(?:ticket|tkt)\W{0,3}$/i.test(whole.slice(Math.max(0, off - 12), off + lead.length))) return all;
+    return lead + four(num);
+  });
+  return s;
+}
+
 /** "yael.sher@gmail.com" -> "y***@gmail.com". For logs and the tile. Pure. */
 export function maskEmail(e) {
   const s = String(e || "").trim();
@@ -277,8 +299,11 @@ export function recipientDraft(input) {
   // Gabbai 25 Sep B1: a business's legal name may carry digits ("Y33 Hotel Ltd", "3M Company"); a person's may not.
   // Every name is refused with a currency sign or the rep's instruction / an amount glued on ("Yael Sher - please
   // refund $630", "Yael Sher refund 630").
-  const INSTR_TAIL = /\s[-–—]\s+(?:please|pls|refund|pay|send)\b|\b(?:please|pls|refund|reimburse|pay|send|wire|transfer)\b[^\n]*\d|\d[\d,.]*\s?(?:usd|dollars?|nis|ils|shekels?)\b/i;
-  if (/[$₪]/.test(name) || INSTR_TAIL.test(name) || (x.business !== true && /\d/.test(name))) return { ok: false, error: "name_invalid", decline_reason_human: "The recipient name has numbers or signs in it - nothing was added. Type just the account holder's name." };
+  // Gabbai D3: "pay", "send", "wire", "transfer" are words in real business names ("Airport Transfer 24 Ltd",
+  // "Express Pay 24 LLC") - those count as an instruction only on a person's name.
+  const INSTR_TAIL = /\s[-–—]\s+(?:please|pls|refund|pay|send)\b|\b(?:please|pls|refund|reimburse)\b[^\n]*\d|\d[\d,.]*\s?(?:usd|dollars?|nis|ils|shekels?)\b/i;
+  const PAY_WORD_TAIL = /\b(?:pay|send|wire|transfer)\b[^\n]*\d/i;
+  if (/[$₪]/.test(name) || INSTR_TAIL.test(name) || (x.business !== true && (/\d/.test(name) || PAY_WORD_TAIL.test(name)))) return { ok: false, error: "name_invalid", decline_reason_human: "The recipient name has numbers or signs in it - nothing was added. Type just the account holder's name." };
   if (PAY_BLOCK_NAME.test(name)) return { ok: false, error: "own_or_other_org" };
   const routing = String(x.routing || "").replace(/\D/g, "");
   if (!abaOk(routing)) return { ok: false, error: "routing_invalid" };
@@ -414,7 +439,7 @@ export function externalMemoOf(memo, fallback) {
     .replace(/\s+/g, " ")
     .replace(/^[\s,;:.\-–]+|[\s,;:\-–]+$/g, "")
     .trim();
-  return scrubDigits(out) || String(fallback || "Supplier payment");
+  return maskBankShaped(out) || String(fallback || "Supplier payment");
 }
 
 /** The rep's memo out of an echoed memo (the part before the desk-chat marker). */

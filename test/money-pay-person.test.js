@@ -162,6 +162,19 @@ describe("the pure rules", () => {
       assert.equal(d.ok, false, nm); assert.equal(d.error, "name_invalid", nm);
     }
     assert.equal(recipientDraft({ ...base, name: "Yael 2 Sher" }).error, "name_invalid");
+    // Gabbai D3: a payment word is part of real business names; on a person it is an instruction.
+    for (const nm of ["Airport Transfer 24 Ltd", "Express Pay 24 LLC"]) assert.equal(recipientDraft({ ...base, name: nm, business: true }).ok, true, nm);
+    assert.equal(recipientDraft({ ...base, name: "Leah Roth 2" }).error, "name_invalid");
+    assert.equal(recipientDraft({ ...base, name: "Cohen Travel refund 630", business: true }).error, "name_invalid");
+    assert.equal(recipientDraft({ ...base, name: "Cohen Travel pay 630" }).error, "name_invalid");
+    assert.equal(recipientDraft({ ...base, name: "Acme LLC ₪630", business: true }).error, "name_invalid");
+  });
+  it("Gabbai D2: the supplier's memo keeps dates, invoice and ticket numbers; only bank- and card-shaped runs are cut", () => {
+    for (const m of ["Refund for stay 2026-09-24", "Invoice 123456", "ticket 0141234567890"]) assert.equal(externalMemoOf(m), m);
+    assert.equal(externalMemoOf("PNR ABC123 account 000123456789"), "PNR ABC123 account ••6789");
+    assert.equal(externalMemoOf("routing 021000021"), "routing ••0021");
+    assert.equal(externalMemoOf("for 021000021 please"), "for ••0021 please");
+    assert.equal(externalMemoOf("card 4111 1111 1111 1111"), "card ••1111");
   });
   it("25 Sep audit #109 + Gabbai C7: the external memo and the log keep only the last four; only a real tile id is a tile", () => {
     assert.equal(externalMemoOf("PNR ABC123 account 000123456789"), "PNR ABC123 account ••6789");
