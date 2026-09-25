@@ -497,6 +497,33 @@ export const GUEST_RECURRING_UPDATE =
 export const GUEST_RECURRING_RETRY_LATER =
   "Nothing is wrong on our side. The bank declined this recurring charge and asked to retry in a few days. Call the customer. Do not keep retrying today.";
 
+/**
+ * The gateway's own sentence on a refused or declined sale, safe to show a rep: v5 puts it in
+ * message / error_message / details[] (a 4xx request refusal) or response_text (a bank answer).
+ * Never a dump, never a run of six or more digits (a card, an account, an order id), at most 160.
+ */
+export function gatewaySaid(json) {
+  if (!json || typeof json !== "object") return null;
+  const parts = [];
+  for (const k of ["message", "error_message", "response_text", "responsetext", "processor_response_text"]) {
+    const v = json[k];
+    if (typeof v === "string" && v.trim()) parts.push(v.trim());
+  }
+  if (Array.isArray(json.details)) {
+    for (const d of json.details.slice(0, 3)) {
+      if (typeof d === "string") parts.push(d);
+      else if (d && typeof d === "object") parts.push([d.field || d.path || "", d.message || d.description || d.error || ""].filter(Boolean).join(": "));
+    }
+  }
+  const seen = new Set();
+  const clean = parts
+    .filter((p) => !isUglyDump(p) && !looksLikePan(p))
+    .map((p) => String(p).replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\d(?:[ -]?\d){5,}/g, "[number]").replace(/\s+/g, " ").trim())
+    .filter((p) => p && !seen.has(p.toLowerCase()) && seen.add(p.toLowerCase()));
+  const out = clean.join(" - ").slice(0, 160).trim();
+  return out || null;
+}
+
 /** docs.nmi.com response_code → one plain-English sentence. Never JSON. */
 export const NMI_CODE_MESSAGES = {
   200: notUs("declined by processor"),
@@ -1109,6 +1136,12 @@ export async function chargeWithToken(opts = {}) {
       httpStatus: res.status,
       responseCode: json.response_code != null ? String(json.response_code) : null,
       responseText: String(json.response_text || json.responsetext || "").slice(0, 200) || null,
+      // Mr. AT (25 Sep, the Kaufman charge): a v5 request the gateway refused (HTTP 4xx) carries no
+      // response_code - its reason is in message / details, and it used to be dropped, so the rep read
+      // only "try again or use another card". The gateway's own words, cleaned (no dumps, no long digit
+      // runs), and whether it was a request refusal (no transaction exists) or a bank answer.
+      gatewayText: gatewaySaid(json),
+      refusedRequest: refusedRequest && json.response_code == null && !["1", "2", "3"].includes(response),
     };
   }
   return {

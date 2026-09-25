@@ -22,7 +22,7 @@ import {
   CRM_WRITE_MS,
 } from "../card-charge.js";
 import { REVERSAL_TIMEOUT_MS } from "../nmi-card.js";
-import { mintTicket, mintOcrTicket, registerCardHold, redeemCardHold, CARD_HOLD_TTL_MS, _resetCardRefsForTests } from "../ocr-card.js";
+import { mintTicket, mintOcrTicket, registerCardHold, redeemCardHold, zeroHold, sweepCardHolds, MAX_HOLD_DECLINES, CARD_HOLD_TTL_MS, _resetCardRefsForTests } from "../ocr-card.js";
 
 const SECRET = "test-ocr-secret-0123456789abcdef";
 const PAN = "4539578763621486"; // synthetic, Luhn-valid, Visa range
@@ -277,10 +277,18 @@ describe("POST /__nesher_pay/charge", () => {
         // Gabbai 23 Sep F5: a gateway that throws is an UNKNOWN outcome (503), never "declined".
         assert.equal(p.status, { approved: 200, declined: 402, threw: 503 }[script.name], `${script.name}: ${p.status} ${p.text}`);
         assert.equal(trace.buffers.length, 1, `${script.name}: the door held exactly one number`);
+        if (script.name === "declined") {
+          // Mr. AT (Joseph 25 Sep): a CLEAR decline puts the card back behind the same reference for a
+          // retry. It is zeroed by the next spend; here the test spends and zeroes it by hand.
+          assert.equal(p.body.hold_kept, true, "a clear decline keeps the card for a retry");
+          const again = redeemCardHold(ref, { rep: "sruly" });
+          assert.equal(again.ok, true, "declined: still held, same reference");
+          zeroHold(again.entry);
+        }
         assert.equal(
           trace.buffers[0].every((b) => b === 0),
           true,
-          `${script.name}: the number is zeroed once the answer is out`
+          `${script.name}: the number is zeroed once the answer is out (or once the kept hold is spent)`
         );
         assert.equal(redeemCardHold(ref, { rep: "sruly" }).error, "unknown", `${script.name}: gone from the store`);
         const said = everythingSaid(s, p);
@@ -831,6 +839,127 @@ describe("a refund or void whose outcome is not known is never told as 'did not 
       const p = await post(s.url, REFUND_PATH, mintTicket({ kind: "refund", repId: "joseph", bind: "txn-100", secret: SECRET }).token, { txn_id: "txn-100", amount_cents: 100 });
       assert.equal(p.status, 200);
       assert.deepEqual(p.body.crm, { state: "not_recorded", reason: "crm_slow" });
+    } finally {
+      await s.close();
+    }
+  });
+});
+
+// ---- Mr. AT (25 Sep, the Kaufman charge): the gateway's own reason and the one next step; a clear
+// decline keeps the card for a retry (same reference, same rep, 5 minutes, at most 3 declines).
+describe("declines say why and what next, and keep the card for a retry", () => {
+  beforeEach(() => _resetCardRefsForTests());
+
+  it("a request the gateway refused (HTTP 400, no code, no transaction) is said as that, with its words", async () => {
+    const { fetchImpl } = gatewayMock({ saleStatus: 400, sale: { error_code: "validation", message: "Amount exceeds the maximum allowed for this merchant" } });
+    const s = await startDoor(handleChargeRequest, { secret: SECRET, fetchImpl, privateKey: "k" });
+    try {
+      const ref = newRef();
+      const t = mintTicket({ kind: "charge", repId: "sruly", bind: ref, secret: SECRET });
+      const p = await post(s.url, CHARGE_PATH, t.token, { token_ref: ref, amount_cents: 1566700, brand: "nesher", rep: "sruly", customer_name: "Guest" });
+      assert.equal(p.status, 402, p.text);
+      assert.equal(p.body.refused_by_processor, true);
+      assert.match(p.body.decline_reason_human, /never reached the bank/);
+      assert.match(p.body.decline_reason_human, /Amount exceeds the maximum/);
+      assert.match(p.body.decline_next, /single-charge limit/);
+      assert.equal(p.body.hold_kept, true);
+      assert.ok(Date.parse(p.body.token_ref_expires_at) > Date.now());
+      assert.match(s.logs.at(-1), /"gw":"http_400"/);
+      assert.match(s.logs.at(-1), /"kept":true/);
+      assert.equal(everythingSaid(s, p).includes(PAN), false);
+    } finally {
+      await s.close();
+    }
+  });
+
+  it("a wrong security code: the next step says type the right one, and the retry with the typed code charges the SAME card", async () => {
+    let n = 0;
+    const calls = [];
+    const fetchImpl = async (url, init = {}) => {
+      calls.push(JSON.parse(init.body));
+      n++;
+      const r = n === 1 ? { response: "2", response_code: "225", response_text: "CVV2 MISMATCH" } : { response: "1", id: "txn-ok", auth_code: "A1", cvv_response: "M" };
+      return { ok: true, status: 200, text: async () => JSON.stringify(r) };
+    };
+    const s = await startDoor(handleChargeRequest, { secret: SECRET, fetchImpl, privateKey: "k" });
+    try {
+      const ref = newRef();
+      let t = mintTicket({ kind: "charge", repId: "sruly", bind: ref, secret: SECRET });
+      let p = await post(s.url, CHARGE_PATH, t.token, { token_ref: ref, amount_cents: 2500, brand: "jrm", rep: "sruly", customer_name: "Guest", cvv: "111" });
+      assert.equal(p.status, 402);
+      assert.equal(p.body.decline_reason_human, "The security code is wrong.");
+      assert.match(p.body.decline_next, /right security code/);
+      assert.match(p.body.decline_next, /held 5 more minutes/);
+      assert.equal(p.body.hold_kept, true);
+      t = mintTicket({ kind: "charge", repId: "sruly", bind: ref, secret: SECRET });
+      p = await post(s.url, CHARGE_PATH, t.token, { token_ref: ref, amount_cents: 2500, brand: "jrm", rep: "sruly", customer_name: "Guest", cvv: "999" });
+      assert.equal(p.status, 200, p.text);
+      assert.equal(calls[1].payment_details.card_number, PAN);
+      assert.equal(calls[1].payment_details.card_cvv, "999");
+      // one use per SUCCESSFUL charge: gone now
+      assert.equal(redeemCardHold(ref, { rep: "sruly" }).error, "unknown");
+      const said = everythingSaid(s, p);
+      assert.equal(said.includes("999"), false);
+    } finally {
+      await s.close();
+    }
+  });
+
+  it("the kept card is bound to the rep, and dropped (zeroed) after the third decline", async () => {
+    const trace = { buffers: [] };
+    const fetchImpl = async () => ({ ok: true, status: 200, text: async () => JSON.stringify({ response: "2", response_code: "201" }) });
+    const s = await startDoor(handleChargeRequest, { secret: SECRET, fetchImpl, privateKey: "k", trace });
+    try {
+      const ref = newRef();
+      const kept = [];
+      for (let i = 0; i < MAX_HOLD_DECLINES; i++) {
+        const t = mintTicket({ kind: "charge", repId: "sruly", bind: ref, secret: SECRET });
+        const p = await post(s.url, CHARGE_PATH, t.token, { token_ref: ref, amount_cents: 2500, brand: "jrm", rep: "sruly", customer_name: "Guest" });
+        assert.equal(p.status, 402);
+        kept.push(p.body.hold_kept);
+        if (i === 0) assert.match(p.body.decline_next, /call the bank/);
+      }
+      assert.deepEqual(kept, [true, true, false]);
+      assert.equal(redeemCardHold(ref, { rep: "sruly" }).error, "unknown");
+      for (const b of trace.buffers) assert.equal(b.every((x) => x === 0), true, "zeroed once dropped");
+      // another rep's ticket for a kept card is refused and burns it
+      const ref2 = newRef();
+      let t = mintTicket({ kind: "charge", repId: "sruly", bind: ref2, secret: SECRET });
+      let p = await post(s.url, CHARGE_PATH, t.token, { token_ref: ref2, amount_cents: 2500, brand: "jrm", rep: "sruly", customer_name: "Guest" });
+      assert.equal(p.body.hold_kept, true);
+      t = mintTicket({ kind: "charge", repId: "hershy", bind: ref2, secret: SECRET });
+      p = await post(s.url, CHARGE_PATH, t.token, { token_ref: ref2, amount_cents: 2500, brand: "jrm", rep: "hershy", customer_name: "Guest" });
+      assert.equal(p.status, 403);
+    } finally {
+      await s.close();
+    }
+  });
+
+  it("an unknown outcome (gateway 5xx) is never kept - it may have charged", async () => {
+    const fetchImpl = async () => ({ ok: false, status: 502, text: async () => "bad gateway" });
+    const s = await startDoor(handleChargeRequest, { secret: SECRET, fetchImpl, privateKey: "k" });
+    try {
+      const ref = newRef();
+      const t = mintTicket({ kind: "charge", repId: "sruly", bind: ref, secret: SECRET });
+      const p = await post(s.url, CHARGE_PATH, t.token, { token_ref: ref, amount_cents: 2500, brand: "jrm", rep: "sruly", customer_name: "Guest" });
+      assert.equal(p.status, 503);
+      assert.equal(redeemCardHold(ref, { rep: "sruly" }).error, "unknown");
+    } finally {
+      await s.close();
+    }
+  });
+
+  it("a kept card expires with the sweeper like any other hold", async () => {
+    const fetchImpl = async () => ({ ok: true, status: 200, text: async () => JSON.stringify({ response: "2", response_code: "202" }) });
+    const s = await startDoor(handleChargeRequest, { secret: SECRET, fetchImpl, privateKey: "k" });
+    try {
+      const ref = newRef();
+      const t = mintTicket({ kind: "charge", repId: "sruly", bind: ref, secret: SECRET });
+      const p = await post(s.url, CHARGE_PATH, t.token, { token_ref: ref, amount_cents: 2500, brand: "jrm", rep: "sruly", customer_name: "Guest" });
+      assert.equal(p.body.hold_kept, true);
+      assert.match(p.body.decline_next, /smaller amount/);
+      assert.equal(sweepCardHolds({ now: Date.now() + CARD_HOLD_TTL_MS + 1000 }), 1);
+      assert.equal(redeemCardHold(ref, { rep: "sruly" }).error, "unknown");
     } finally {
       await s.close();
     }

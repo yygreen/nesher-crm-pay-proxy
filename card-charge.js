@@ -60,6 +60,7 @@ import {
   purge,
   readLimitedBody,
   redeemCardHold,
+  reholdAfterDecline,
   sendTicketJson,
   ticketFromHeaders,
   verifyTicket,
@@ -378,7 +379,7 @@ const DECLINE_WORDS = [
   [/^461$/, "This card type is not supported here."],
 ];
 
-export function declineHuman(code, fallbackText) {
+export function declineHuman(code, fallbackText, o = {}) {
   const c = String(code || "").trim();
   for (const [re, words] of DECLINE_WORDS) if (re.test(c)) return words;
   const t = String(fallbackText || "").trim();
@@ -386,7 +387,30 @@ export function declineHuman(code, fallbackText) {
   if (/expired/i.test(t)) return "The card has expired.";
   if (/insufficient/i.test(t)) return "Insufficient funds.";
   if (/duplicate/i.test(t)) return "The processor saw this as a duplicate.";
+  // Mr. AT (25 Sep, the Kaufman charge): a v5 request the gateway refused carries no code and made no
+  // transaction - the bank never saw it. Say that, with the gateway's own words when it gave any.
+  if (o.refused) return "The card processor refused the charge itself - it never reached the bank." + (o.said ? ` It said: "${String(o.said).slice(0, 140)}".` : "");
   return "The card was not charged. Try again or use another card.";
+}
+
+/**
+ * THE ONE THING TO DO NEXT after a decline (Mr. AT, Joseph 25 Sep: "Show the processor's reason in
+ * plain words ... and the one thing to do next"). `kept` = the card is still held for a retry.
+ */
+export function declineNext(code, o = {}) {
+  const c = String(code || "").trim();
+  const again = o.kept ? " and tap Charge again - the card is held 5 more minutes, no need to send it again" : "";
+  if (/^225$/.test(c)) return o.kept ? `Type the right security code in the box on the tile${again}.` : "Send the card again with the right security code.";
+  if (/^22[04]$/.test(c)) return o.kept ? `Type the right expiry here (like 08/29)${again}.` : "Check the expiry and send the card again.";
+  if (/^20[23]$/.test(c)) return o.kept ? `Try a smaller amount${again}, or use another card.` : "Try a smaller amount, or use another card.";
+  if (/^(20[01]|24\d|26\d)$/.test(c)) return o.kept ? `Ask the customer to call the bank and approve the charge, then tap Charge again within 5 minutes - or use another card.` : "Ask the customer to call the bank and approve the charge, then send the card again - or use another card.";
+  if (/^(204|223|25\d|46[01])$/.test(c)) return "Use another card.";
+  if (/^22[12]$/.test(c)) return "Check the card number and send the card again.";
+  if (/^41[01]$/.test(c)) return "Nothing was charged - tell Joseph, the merchant account needs a fix.";
+  if (/^430$/.test(c)) return "Check in the processor whether the first charge went through before trying again.";
+  if (/^(300|4[0-4]\d)$/.test(c)) return o.kept ? "Nothing was charged. Try once more in a minute; if it says the same, tell Joseph." : "Nothing was charged. Send the card again in a minute; if it says the same, tell Joseph.";
+  if (o.refused) return "Nothing was charged. If the amount is large, it may be over the account's single-charge limit - try a smaller amount or split it" + (o.kept ? " (the card is held 5 more minutes)" : "") + ", or call Pinpoint.";
+  return o.kept ? "Tap Charge again within 5 minutes, or use another card." : "Send the card again, or use another card.";
 }
 
 function isInt(n) {
@@ -414,6 +438,10 @@ function accessLine(name, fields) {
   if (fields.txn) o.txn = fields.txn;
   // A yes/no, never the code. Nothing else about the card is ever logged.
   if (fields.cvv_sent != null) o.cvv_sent = Boolean(fields.cvv_sent);
+  // Mr. AT: the gateway's HTTP class on a decline (http_400 = the request itself was refused) and
+  // whether the card went back into its hold for a retry. Words from a closed alphabet, never a card.
+  if (fields.gw && /^http_\d{3}$/.test(fields.gw)) o.gw = fields.gw;
+  if (fields.kept != null) o.kept = Boolean(fields.kept);
   return `${name} ${JSON.stringify(o)}`;
 }
 
@@ -532,6 +560,9 @@ export async function handleChargeRequest(req, res, deps = {}) {
     if (held.error === "rep_mismatch") {
       return finish(403, { ok: false, error: "token_ref_wrong_rep", decline_reason_human: "That card was read by somebody else. Take the photo again." }, { outcome: "token_ref_wrong_rep", brand: brandId, amount_cents: amountCents });
     }
+    if (held.error === "needs_expiry") {
+      return finish(409, { ok: false, error: "token_ref_needs_expiry", decline_reason_human: "That card had no expiry yet, so nothing was charged. Send the card again with its expiry." }, { outcome: "token_ref_gone:needs_expiry", brand: brandId, amount_cents: amountCents });
+    }
     return finish(410, { ok: false, error: "token_ref_spent_or_expired", decline_reason_human: "That card reference has expired. Take the photo again." }, { outcome: `token_ref_gone:${held.error}`, brand: brandId, amount_cents: amountCents });
   }
   const entry = held.entry;
@@ -565,9 +596,18 @@ export async function handleChargeRequest(req, res, deps = {}) {
       privateKey: deps.privateKey,
     });
   } catch {
-    sale = { ok: false, error: "processor_error", responseCode: null, responseText: "" };
-  } finally {
-    // Approved, declined or thrown: the number is gone from this process here.
+    sale = { ok: false, error: "processor_error", responseCode: null, responseText: "", thrown: true };
+  }
+  // Approved, unknown or thrown: the number is gone from this process here. A CLEAR decline (Mr. AT,
+  // Joseph 25 Sep: "After a decline, keep the card hold for 5 minutes, so a corrected CVV or amount can
+  // retry WITHOUT re-sending the card") goes back behind the same reference, same rep, five minutes,
+  // at most MAX_HOLD_DECLINES times - and is zeroed by the next spend, the sweeper, or the cap.
+  const clearNo = sale && !sale.ok && !sale.outcomeUnknown && !sale.thrown && (sale.error === "declined" || sale.error === "processor_error" || sale.error === "keys_missing");
+  let kept = null;
+  if (clearNo) {
+    const back = reholdAfterDecline(tokenRef, entry, { now: clock() });
+    kept = back.ok ? back : null;
+  } else {
     zeroHold(entry);
   }
 
@@ -592,20 +632,29 @@ export async function handleChargeRequest(req, res, deps = {}) {
   if (!sale || !sale.ok) {
     const code = sale && sale.responseCode ? String(sale.responseCode) : null;
     const status = sale && sale.error === "keys_missing" ? 503 : 402;
+    const refused = Boolean(sale && sale.refusedRequest);
+    const said = sale && sale.gatewayText ? String(sale.gatewayText) : null;
+    const gw = sale && Number(sale.httpStatus) ? `http_${Number(sale.httpStatus)}` : null;
     return finish(
       status,
       {
         ok: false,
         error: (sale && sale.error) || "declined",
-        decline_reason_human: sale && sale.error === "keys_missing" ? "Card processing is not configured. Tell the office." : declineHuman(code, sale && sale.responseText),
+        decline_reason_human: sale && sale.error === "keys_missing" ? "Card processing is not configured. Tell the office." : declineHuman(code, sale && sale.responseText, { refused, said }),
+        decline_next: sale && sale.error === "keys_missing" ? "Nothing was charged - tell Joseph." : declineNext(code, { kept: Boolean(kept), refused }),
         decline_code: code,
-        decline_text: sale && sale.responseText ? String(sale.responseText).slice(0, 120) : null,
+        decline_text: sale && sale.responseText ? String(sale.responseText).slice(0, 120) : (said ? said.slice(0, 120) : null),
+        // A refusal of the REQUEST (no transaction exists at the gateway) vs the bank's answer.
+        refused_by_processor: refused,
         brand: brand.id,
         last4: entry.last4,
         amount_cents: amountCents,
         cvv_sent: Boolean(cvvUse),
+        // Still held for a retry (same reference, same rep), and until when.
+        hold_kept: Boolean(kept),
+        token_ref_expires_at: kept ? new Date(kept.expiresAt).toISOString() : null,
       },
-      { outcome: `declined:${code || (sale && sale.error) || "unknown"}`, brand: brand.id, amount_cents: amountCents, cvv_sent: Boolean(cvvUse) }
+      { outcome: `declined:${code || (sale && sale.error) || "unknown"}`, brand: brand.id, amount_cents: amountCents, cvv_sent: Boolean(cvvUse), gw, kept: Boolean(kept) }
     );
   }
   return finish(
