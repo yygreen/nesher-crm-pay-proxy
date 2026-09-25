@@ -12,7 +12,9 @@
 import { after, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { PGlite } from "@electric-sql/pglite";
+import fs from "node:fs";
 import {
+  leftoverLoopOn,
   reviewNoteText,
   recordNmiPaidInvoice,
   recordNmiException,
@@ -24,6 +26,7 @@ import { loopReview, REVIEW_WORDS } from "../payment-posts.js";
 import { runNmiRecovery } from "../nmi-recovery.js";
 import * as store from "../invoice-store.js";
 import { renderInvoiceHtml } from "../invoice-page.js";
+import { buildMoneyMap, periodFor, parseNmiTransactions } from "../money-map.js";
 
 class PGlitePool {
   constructor(db) { this.db = db; this.waiters = []; this.busy = false; }
@@ -387,3 +390,42 @@ describe("#145 a pay link stuck on 'confirming' is settled once the sweep record
   });
 });
 
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+describe("T3 (Gabbai re-verdict, Joseph's SHIP TODAY): MONEY_LEFTOVER_LOOP=off puts back the 07c394c behaviour, no deploy", () => {
+  const off = async (fn) => { process.env.MONEY_LEFTOVER_LOOP = "off"; try { return await fn(); } finally { delete process.env.MONEY_LEFTOVER_LOOP; } };
+  it("off: the P3 shape posts again exactly as live does (the switch really switches); on: held", async () => {
+    await link("depo2345", { invoiceNumber: "RES-TWOHLF", amountUsd: 500, mercuryUrl: "https://app.mercury.com/pay/m1", transactionId: "t-dep-1", paidAt: iso(T0) }, iso(T0 - 7200e3));
+    await link("bala2345", { invoiceNumber: "RES-TWOHLF", amountUsd: 1000, mercuryUrl: "https://app.mercury.com/pay/m1" }, iso(T0 + 600e3));
+    assert.equal((await recordNmiPaidInvoice({ pool, invoiceNumber: "RES-TWOHLF", amountUsd: 500, transactionId: "t-dep-1", paidAt: iso(T0), path: "guest" })).ok, true);
+    assert.equal(leftoverLoopOn(), true, "unset = on");
+    const r = await off(() => { assert.equal(leftoverLoopOn(), false); return sync([merc("m-inv-off", "RES-TWOHLF", 1000)]); });
+    assert.equal(r.recorded.length, 1, "off = 07c394c: paySync posts it");
+    const row = await one("SELECT paid_at FROM core_payment WHERE notes LIKE '%mercury:m-inv-off%'");
+    assert.equal(new Date(row.paid_at).toISOString(), "2026-09-20T10:00:00.000Z", "off = dated by updatedAt, as on 07c394c");
+    assert.equal(await ledger("mercury_m-inv-off"), undefined);
+    await setup();
+    await link("depo2345", { invoiceNumber: "RES-TWOHLF", amountUsd: 500, mercuryUrl: "https://app.mercury.com/pay/m1", transactionId: "t-dep-1", paidAt: iso(T0) }, iso(T0 - 7200e3));
+    await recordNmiPaidInvoice({ pool, invoiceNumber: "RES-TWOHLF", amountUsd: 500, transactionId: "t-dep-1", paidAt: iso(T0), path: "guest" });
+    assert.equal((await sync([merc("m-inv-on", "RES-TWOHLF", 1000)])).recorded.length, 0, "on = held");
+  });
+  it("off: the map dates by updatedAt and counts paySync marker rows as before", async () => {
+    const period = periodFor({ period: "day", date: "2026-08-10" }, Date.parse("2026-08-12T12:00:00Z"));
+    const crm = { nesherInPeriod: [{ id: 1, amount: 500, method: "bank", paid_at: "2026-08-10T16:15:28Z", reservation_id: 9, nmi_txn: null, mercury_inv: "inv-x" }],
+      reservations: [], nesherAll: [], jrmInPeriod: [], jrmAll: [], offers: [], requests: [], refundRows: [], mercuryPaid: [{ invoice_id: "inv-x", paid_at: "2026-08-10T16:15:28Z", source: "crm" }] };
+    const inv = [{ id: "inv-x", invoiceNumber: "RES-NEWRUL", status: "Paid", amount: 500, updatedAt: "2026-08-09T09:00:00Z" }];
+    const run = () => buildMoneyMap({ period, nowMs: Date.parse("2026-08-12T12:00:00Z"), nmi: parseNmiTransactions("<nm_response></nm_response>"), bank: [], invoices: inv, crm,
+      sources: { nmi: { ok: true }, mercury: { ok: true }, invoices: { ok: true }, crm: { ok: true } } });
+    const on = run();
+    assert.equal(on.brands.nesher.mercury_invoices.paid, 500);
+    assert.deepEqual(on.brands.nesher.recorded_other_rails, {});
+    const o = await off(run);
+    assert.equal(o.brands.nesher.mercury_invoices.paid, 0, "off = dated 9 Aug by updatedAt");
+    assert.deepEqual(o.brands.nesher.recorded_other_rails, { bank: 500 });
+    assert.ok(o.notes.some((n) => /paid date is the time Mercury last updated it/.test(n)));
+  });
+  it("the settle door is wired only when posting is live AND the switch is on, and the public health shows the switch", () => {
+    const src = fs.readFileSync(new URL("../server.js", import.meta.url), "utf8");
+    assert.match(src, /settled: POSTING_MODE === "live" && leftoverLoopOn\(\) \? \(ev\) => settleConfirmingLink\(ev\) : undefined,/);
+    assert.match(src, /leftoverLoop: leftoverLoopOn\(\) \? "on" : "off",/);
+  });
+});

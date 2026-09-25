@@ -25,6 +25,7 @@
 // that is always rolled back. It never reads or returns a card number, a customer name or an email.
 import { queryNmiRange, nmiDateMs, NMI_PROCESSOR_BRAND } from "./nmi-recovery.js";
 import { parseInvoiceNumber } from "./payments-sync.js";
+import { leftoverLoopOn } from "./payments-sync.js"; // the leftover lane's kill switch (one home: payments-sync)
 
 export const MONEY_MAP_BUILD = "2026-09-25-map-paid-day";
 export const MONEY_MAP_PATH = "/money-map";
@@ -712,7 +713,8 @@ export function buildMoneyMap({ period, nowMs, nmi, bank, invoices, crm, sources
     // is dated by the CRM row paySync wrote for it (or its ledger review row), so the Mercury section and the booking
     // lists of the same answer name the same day; an invoice with no such row keeps the day sent, and the notes say so.
     const paidDay = new Map();
-    for (const r of (crm && crm.mercuryPaid) || []) {
+    const dateBySync = leftoverLoopOn(); // T3 kill switch: off = dated by updatedAt, as on 07c394c
+    for (const r of (dateBySync && crm && crm.mercuryPaid) || []) {
       const id = String((r && r.invoice_id) || "");
       const ms = r && r.payment_date ? ilMidnightMs(String(r.payment_date).slice(0, 10)) : r && r.paid_at != null ? new Date(r.paid_at).getTime() : NaN;
       if (id && Number.isFinite(ms) && !(paidDay.has(id) && paidDay.get(id).source === "crm")) paidDay.set(id, { ms, source: r.source });
@@ -734,7 +736,8 @@ export function buildMoneyMap({ period, nowMs, nmi, bank, invoices, crm, sources
       } else I.fee_unmeasured_on += p.amt;
     }
     const bySent = paid.filter((p) => p.bySent).length;
-    notes.push(crm
+    if (!dateBySync) notes.push("A Mercury invoice's paid date is the time Mercury last updated it (the API gives no separate paid-at).");
+    else notes.push(crm
       ? "A Mercury invoice is dated by the payment the CRM recorded for it (our sync first saw it paid); Mercury itself gives no paid date."
         + (bySent ? ` ${bySent} paid invoice(s) with no CRM record are dated by when they were sent.` : "")
       : "A Mercury invoice is dated by when it was sent: the CRM could not be read, and Mercury itself gives no paid date.");
@@ -813,7 +816,7 @@ export function buildMoneyMap({ period, nowMs, nmi, bank, invoices, crm, sources
   if (crm) {
     for (const p of crm.nesherInPeriod) {
       // Gabbai leftover C8(b): paySync writes bank|other since f5625f2, so its rows are known by the mercury: marker
-      if (p.method === "card" || p.method === "mercury" || p.mercury_inv) continue;
+      if (p.method === "card" || p.method === "mercury" || (p.mercury_inv && leftoverLoopOn())) continue;
       add(out.brands.nesher.recorded_other_rails, p.method || "other", p.amount);
     }
     for (const p of crm.jrmInPeriod) {
@@ -825,7 +828,7 @@ export function buildMoneyMap({ period, nowMs, nmi, bank, invoices, crm, sources
         R[k] = r2((R[k] || 0) + p.amount);
         continue;
       }
-      if (p.method === "card" || p.method === "mercury" || p.mercury_inv) continue;
+      if (p.method === "card" || p.method === "mercury" || (p.mercury_inv && leftoverLoopOn())) continue;
       add(out.brands.jrm.recorded_other_rails, p.method || "other", p.amount);
     }
     for (const B of Object.values(out.brands)) {

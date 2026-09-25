@@ -125,6 +125,7 @@ import {
   recordNmiException,
   recordNmiReversal,
   recordSweepReversal,
+  leftoverLoopOn,
   listInvoicesViaSeat,
 } from "./payments-sync.js";
 import {
@@ -1605,6 +1606,8 @@ const server = http.createServer(async (req, res) => {
         : null,
       paymentPosting: lastPaymentPosting,
       postingMode: POSTING_MODE,
+      // the 25 Sep leftover lane's kill switch (Railway MONEY_LEFTOVER_LOOP=off): #76/P3 hold, #145 settle, Mercury paid day
+      leftoverLoop: leftoverLoopOn() ? "on" : "off",
       payLinks: payLinkStats,
       postingShadow: POSTING_MODE === "shadow" ? shadowStats : null,
       nmiRecovery: lastNmiRecovery,
@@ -2032,7 +2035,7 @@ async function runNmiRecoverySweep(days) {
       reverse: doors.reverseFromSweep,
       // Audit #145: a guest link stuck on "confirming" is settled once its sale is posted - live mode only, so
       // unsetting MONEY_POSTING_MODE stops it with the rest of the loop's own writes.
-      settled: POSTING_MODE === "live" ? (ev) => settleConfirmingLink(ev) : undefined,
+      settled: POSTING_MODE === "live" && leftoverLoopOn() ? (ev) => settleConfirmingLink(ev) : undefined,
       host: process.env.NMI_HOST || "https://pinpointpayments.transactiongateway.com",
       securityKey: process.env.NMI_PRIVATE_KEY || "",
       days,

@@ -28,6 +28,16 @@ export function parseInvoiceNumber(num) {
   return null;
 }
 
+/**
+ * THE KILL SWITCH of the 25 Sep leftover lane (Gabbai re-verdict T3): Railway variable MONEY_LEFTOVER_LOOP=off puts
+ * back the 07c394c behaviour - no Mercury hold for a person (#76 / P3), Mercury paid time = updatedAt again, no
+ * confirming-link settle (#145), the map dates Mercury invoices by updatedAt and counts marker rows as a rep's again.
+ * Unset or anything else = on. Read on every call, so it needs no code deploy; the public health shows it.
+ */
+export function leftoverLoopOn() {
+  return String(process.env.MONEY_LEFTOVER_LOOP || "").trim().toLowerCase() !== "off";
+}
+
 function marker(inv) {
   return `mercury:${inv.id}`;
 }
@@ -109,7 +119,7 @@ function paidAtOf(inv) {
   // Audit #150 (Gabbai leftover C3): Mercury's AR answer has no paid date and its updatedAt is the day the invoice
   // was SENT, so a Paid invoice is dated by when this sync first sees it paid (it reads Mercury every minute; after
   // a sync outage that is the recovery time). The card path always passes its own paidAt (nmiInput): unchanged.
-  const t = inv.paidAt || inv.paidDate || null;
+  const t = inv.paidAt || inv.paidDate || (leftoverLoopOn() ? null : inv.updatedAt) || null;
   const d = t ? new Date(t) : new Date();
   return isNaN(d.getTime()) ? new Date() : d;
 }
@@ -137,7 +147,7 @@ async function recordHotelPayment(pool, inv, target, out, channel = "mercury", {
   }
   // Audit #76 + P3 (Gabbai leftover C1/C2): a Paid Mercury invoice after a card payment on its number, or on a booking
   // that already carries the same amount, is never posted - kept for a person (or silent in the one provable case).
-  if (channel === "mercury" && await holdMercuryForPerson(pool, inv, target, target.requestId, out)) return;
+  if (channel === "mercury" && leftoverLoopOn() && await holdMercuryForPerson(pool, inv, target, target.requestId, out)) return;
   // Same amount already entered by staff? Don't double-count.
   const manual = await pool.query(
     `SELECT id FROM core_jrmhotelpayment
@@ -231,7 +241,7 @@ async function recordReservationPayment(pool, inv, target, out, channel = "mercu
   }
   // Audit #76 + P3 (Gabbai leftover C1/C2): a Paid Mercury invoice after a card payment on its number, or on a booking
   // that already carries the same amount, is never posted - kept for a person (or silent in the one provable case).
-  if (channel === "mercury" && await holdMercuryForPerson(pool, inv, target, reservationId, out)) return;
+  if (channel === "mercury" && leftoverLoopOn() && await holdMercuryForPerson(pool, inv, target, reservationId, out)) return;
   // The Mercury path's same-amount check COUNTS machine-marker rows (nmi:, mercury:) as already there:
   // that is what makes "mark the Mercury invoice PAID, never cancel" safe - the invoice the office marks
   // PAID after a card payment is not posted a second time (Gabbai 25 Sep B1; audit #76 stays open).
