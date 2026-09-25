@@ -1086,6 +1086,12 @@ export async function chargeWithToken(opts = {}) {
     message: "We could not confirm the payment yet. Please contact the desk before trying again.",
     httpStatus: 503,
   });
+  // Mr. AU (25 Sep, audit C2): a caller may give the sale its own time limit (the desk chat's card door
+  // does: its answer must come back well inside the desk's own wait). A timeout is an UNKNOWN outcome -
+  // the request may have left - never a "no". Callers that pass nothing keep the old behaviour exactly.
+  const saleMs = Number(opts.timeoutMs) > 0 ? Number(opts.timeoutMs) : 0;
+  const ctl = saleMs ? new AbortController() : null;
+  const timer = ctl ? setTimeout(() => ctl.abort(), saleMs) : null;
   try {
     res = await fetchImpl(`${NMI_HOST}/api/v5/payments/sale`, {
     method: "POST",
@@ -1095,10 +1101,13 @@ export async function chargeWithToken(opts = {}) {
       "Content-Type": "application/json",
     },
     body: JSON.stringify(body),
+    ...(ctl ? { signal: ctl.signal } : {}),
     });
     text = await res.text();
   } catch {
     return unknown();
+  } finally {
+    if (timer) clearTimeout(timer);
   }
   // Outcome classes (NMI v5: success is HTTP 200 + response "1", a decline is
   // response "2", a validation failure is HTTP 4xx with error_code/details):

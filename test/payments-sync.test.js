@@ -279,7 +279,7 @@ describe("recordNmiPaidInvoice", () => {
       ins[1].params.some((p) => String(p).includes("[Mercury Pay]")),
       false
     );
-    assert.match(String(ins[1].params[0]), /NMI card \$40\.00 USD txn txn_crm/);
+    assert.match(String(ins[1].params[0]), /Card payment \$40\.00 USD recorded in the CRM automatically \(NMI txn txn_crm\) - do not enter it again\./);
   });
 
   it("records a reservation NMI payment without [Mercury Pay]", async () => {
@@ -297,7 +297,7 @@ describe("recordNmiPaidInvoice", () => {
     assert.equal(notes.some((p) => p.includes("[Mercury Pay]")), false);
     assert.equal(notes.some((p) => p.includes("[Mercury sync]")), false);
     assert.ok(notes.some((p) => p.includes("nmi:txn_res")));
-    assert.ok(notes.some((p) => p.includes("NMI card $40.00")));
+    assert.ok(notes.some((p) => p.includes("Card payment $40.00 USD recorded in the CRM automatically (NMI txn txn_res) - do not enter it again.")));
     assert.ok(pool.calls.some((c) => c.sql.includes("INSERT INTO core_payment")));
     assert.ok(
       pool.calls.some((c) => c.sql.includes("amount_paid = COALESCE(amount_paid, 0) + $1"))

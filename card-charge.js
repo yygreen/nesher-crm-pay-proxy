@@ -73,6 +73,10 @@ export const REFUND_PATH = "/__nesher_pay/refund";
 export const CHARGE_BODY_MAX = 64 * 1024;
 /** Mirrors OPEN_PAY_MAX_USD: no single card charge above $25,000 from this door. */
 export const CHARGE_MAX_CENTS = 25000 * 100;
+/** Mr. AU (audit C2): the chat charge's own gateway limit. The desk waits 45 s; this door answers well inside it. */
+export const CHARGE_SALE_TIMEOUT_MS = 15000;
+/** Mr. AU (audit H3): the booking as the order id, per brand, in the collection loop's own shapes. */
+const INVOICE_REF_RE = { nesher: /^RES-[A-Z0-9][A-Z0-9_-]{2,20}$/, jrm: /^JRM-1\d{1,9}(?:-O\d{1,9})?$/ };
 export const REFUND_CAP_NAME = "REFUND_CAP_CENTS";
 
 const CARD_REF_RE = /^cr_[A-Za-z0-9_-]{16,64}$/;
@@ -390,7 +394,8 @@ export function declineHuman(code, fallbackText, o = {}) {
   // Mr. AT (25 Sep, the Kaufman charge): a v5 request the gateway refused carries no code and made no
   // transaction - the bank never saw it. Say that, with the gateway's own words when it gave any.
   if (o.refused) return "The card processor refused the charge itself - it never reached the bank." + (o.said ? ` It said: "${String(o.said).slice(0, 140)}".` : "");
-  return "The card was not charged. Try again or use another card.";
+  // Mr. AU: the next step is declineNext's alone - two different next steps in one tile contradicted each other.
+  return "The card was not charged.";
 }
 
 /**
@@ -539,7 +544,7 @@ export async function handleChargeRequest(req, res, deps = {}) {
   const currency = str(body.currency || "USD", 3).toUpperCase();
   const brandId = str(body.brand, 10).toLowerCase();
   const customerName = str(body.customer_name, 80);
-  const invoiceRef = str(body.invoice_ref, 50);
+  const invoiceRefRaw = str(body.invoice_ref, 50);
   const note = str(body.note, 255);
   // The security code, typed by the rep, optional. It is NOT in the hold and
   // never will be (13.4: it is never read from a photo). It is taken off the
@@ -558,11 +563,60 @@ export async function handleChargeRequest(req, res, deps = {}) {
   if (currency !== "USD") return bad("currency_usd_only");
   if (brandId !== "jrm" && brandId !== "nesher") return bad("brand_invalid");
   if (!customerName) return bad("customer_name_required");
+  // Mr. AU (25 Sep, audit H3): the booking goes to the processor as the order id, in the one shape the
+  // collection loop reads back (payments-sync parseInvoiceNumber): RES-<code> on Nesher, JRM-1<id>[-O<id>]
+  // on JRM. Anything else - a typo, the wrong brand's shape - is not sent; the random CARD ref stands.
+  const invoiceRef = INVOICE_REF_RE[brandId] && INVOICE_REF_RE[brandId].test(invoiceRefRaw.toUpperCase()) ? invoiceRefRaw.toUpperCase() : "";
+
+  // ONE TILE, AT MOST ONE SALE AT A TIME (Mr. AU, audit C2). The desk sends `arming` = its tile id. The
+  // first charge for a tile claims it BEFORE the hold is spent or the gateway is asked; while that sale
+  // is on the wire, and forever after an approval or an unknown answer, a repeat is answered from the
+  // claim and never reaches the gateway - not even with a new card read. Only a CLEAR no (a decline,
+  // a refused request, a spent hold) releases it, so "Charge again" after a real decline still works.
+  const chargeKey = ARMING_RE.test(str(body.arming, 80)) ? `charge:${str(body.arming, 80).split(":")[0]}` : null;
+  if (chargeKey) {
+    const prior = claimArming(chargeKey, clock());
+    if (prior) {
+      if (prior.state === "done") return finish(prior.status, { ...prior.body, repeated: true }, { outcome: "charge_repeat", brand: brandId, amount_cents: amountCents });
+      if (prior.state === "unknown") return finish(503, { ok: false, error: "outcome_unknown", repeated: true, message: "We could not confirm the first charge on this tile. Do not charge again - check the sale." }, { outcome: "charge_repeat:unknown", brand: brandId, amount_cents: amountCents });
+      return finish(409, { ok: false, error: "charge_in_flight", message: "That charge is being sent right now - its answer lands on the tile. Do not charge again." }, { outcome: "charge_repeat:in_flight", brand: brandId, amount_cents: amountCents });
+    }
+  }
+  // ONE CARD AND AMOUNT WHILE UNRESOLVED (Mr. AU, audit C1/C2 + "no duplicate guard on chat charges"). The
+  // desk sends the card's last four. While a charge of this card for this amount on this merchant is on the
+  // wire or UNKNOWN (5 minutes - the same five minutes after which the desk, having read the processor and found no sale, says Not charged), ANOTHER tile's charge of it is
+  // refused before the hold is spent: a rep who sends the card again while the first answer is unknown can
+  // no longer charge the customer twice. After an approval, a second charge of the same card and amount
+  // within 30 minutes needs the rep's explicit "charge it again" (body.again === true from the desk).
+  const tileId = chargeKey ? chargeKey.slice(7) : "";
+  const last4Said = /^\d{4}$/.test(str(body.last4, 4)) ? str(body.last4, 4) : "";
+  const cardKey = last4Said && chargeKey ? `card:${brandId}:${last4Said}:${amountCents}` : null;
+  if (cardKey) {
+    const nowC = clock();
+    const prior = armings.get(cardKey);
+    if (prior && prior.tile !== tileId) {
+      const unresolved = (prior.state === "in_flight" && nowC - prior.at < CARD_IN_FLIGHT_MS) || (prior.state === "unknown" && nowC - prior.at < CARD_UNRESOLVED_MS);
+      if (unresolved) {
+        armings.delete(chargeKey);
+        return finish(409, { ok: false, error: "card_unresolved", message: "An earlier charge of this card for this amount is still being checked with the processor. Do not charge it again - that tile turns into Charged or Not charged by itself." }, { outcome: "charge_refused:card_unresolved", brand: brandId, amount_cents: amountCents });
+      }
+      if (prior.state === "done" && nowC - prior.at < CARD_DUP_WINDOW_MS && body.again !== true) {
+        armings.delete(chargeKey);
+        return finish(409, { ok: false, error: "duplicate_recent", txn_id: prior.txn || null, minutes_ago: Math.floor((nowC - prior.at) / 60000), message: "This card was charged the same amount a few minutes ago. If a second charge is on purpose, charge it again." }, { outcome: "charge_refused:duplicate_recent", brand: brandId, amount_cents: amountCents });
+      }
+    }
+    armings.set(cardKey, { at: nowC, state: "in_flight", tile: tileId });
+  }
+  const releaseCharge = () => {
+    if (chargeKey) armings.delete(chargeKey);
+    if (cardKey) { const c = armings.get(cardKey); if (c && c.tile === tileId && c.state === "in_flight") armings.delete(cardKey); }
+  };
 
   // One presentation is the whole life of a reference. The rep on the ticket
   // must be the rep who took the photo.
   const held = redeemCardHold(tokenRef, { now: clock(), rep: ticket.repId });
   if (!held.ok) {
+    releaseCharge();
     if (held.error === "rep_mismatch") {
       return finish(403, { ok: false, error: "token_ref_wrong_rep", decline_reason_human: "That card was read by somebody else. Take the photo again." }, { outcome: "token_ref_wrong_rep", brand: brandId, amount_cents: amountCents });
     }
@@ -600,6 +654,9 @@ export async function handleChargeRequest(req, res, deps = {}) {
       paymentToken: "",
       fetchImpl: deps.fetchImpl,
       privateKey: deps.privateKey,
+      // Mr. AU (audit C2): the sale's own limit, well inside the desk's 45 s wait, so the desk always gets
+      // THIS door's answer (approved / declined / outcome_unknown) and never has to guess from a timeout.
+      timeoutMs: Number(deps.saleTimeoutMs) > 0 ? Number(deps.saleTimeoutMs) : CHARGE_SALE_TIMEOUT_MS,
     });
   } catch {
     sale = { ok: false, error: "processor_error", responseCode: null, responseText: "", thrown: true };
@@ -624,6 +681,14 @@ export async function handleChargeRequest(req, res, deps = {}) {
   }
 
   const brand = brandId === "jrm" ? BRANDS.jrm : BRANDS.nesher;
+  // A thrown sale is an unknown too (the request may have left): never a decline, never a release.
+  if (sale && sale.thrown) sale.outcomeUnknown = true;
+  if (chargeKey) {
+    if (sale && sale.outcomeUnknown) {
+      armings.set(chargeKey, { at: clock(), state: "unknown" });
+      if (cardKey) armings.set(cardKey, { at: clock(), state: "unknown", tile: tileId });
+    } else if (!sale || !sale.ok) releaseCharge();
+  }
   if (sale && sale.outcomeUnknown) {
     // Gabbai 23 Sep F5: the gateway may have taken the money. A rep told
     // "declined" would retake the photo and charge twice.
@@ -669,26 +734,30 @@ export async function handleChargeRequest(req, res, deps = {}) {
       { outcome: `declined:${code || (sale && sale.error) || "unknown"}`, brand: brand.id, amount_cents: amountCents, cvv_sent: Boolean(cvvUse), gw, kept: Boolean(kept), said_len: said ? said.length : 0 }
     );
   }
+  const approved = {
+    ok: true,
+    txn_id: sale.transactionId,
+    brand: brand.id,
+    last4: entry.last4,
+    card_brand: entry.brand,
+    amount_cents: amountCents,
+    currency: "USD",
+    processor_id: sale.processorId,
+    auth_code: sale.authCode || null,
+    avs: sale.avsResponse || null,
+    // The gateway's CVV match letter (M / N / P), never the code itself.
+    cvv: sale.cvvResponse || null,
+    // Did a security code go with this sale? The tile and the ledger show
+    // this: a sale without one is worse interchange and no CVV protection.
+    cvv_sent: Boolean(cvvUse),
+    order_id: sale.orderId,
+  };
+  // Mr. AU: an approved tile answers any repeat with this same approval - never a second sale.
+  if (chargeKey) armings.set(chargeKey, { at: clock(), state: "done", status: 200, body: approved });
+  if (cardKey) armings.set(cardKey, { at: clock(), state: "done", tile: tileId, txn: sale.transactionId || null });
   return finish(
     200,
-    {
-      ok: true,
-      txn_id: sale.transactionId,
-      brand: brand.id,
-      last4: entry.last4,
-      card_brand: entry.brand,
-      amount_cents: amountCents,
-      currency: "USD",
-      processor_id: sale.processorId,
-      auth_code: sale.authCode || null,
-      avs: sale.avsResponse || null,
-      // The gateway's CVV match letter (M / N / P), never the code itself.
-      cvv: sale.cvvResponse || null,
-      // Did a security code go with this sale? The tile and the ledger show
-      // this: a sale without one is worse interchange and no CVV protection.
-      cvv_sent: Boolean(cvvUse),
-      order_id: sale.orderId,
-    },
+    approved,
     { outcome: "approved", brand: brand.id, amount_cents: amountCents, txn: sale.transactionId, cvv_sent: Boolean(cvvUse) }
   );
 }
@@ -769,6 +838,10 @@ async function recordReversal(deps, fields) {
 // place; behind it stands the processor-based 15-minute guard, which survives a restart.
 const ARMING_RE = /^[A-Za-z0-9:_-]{6,80}$/;
 const ARMING_TTL_MS = 24 * 60 * 60 * 1000;
+// Mr. AU: the card-and-amount guard for chat charges (see handleChargeRequest).
+const CARD_IN_FLIGHT_MS = 2 * 60 * 1000;
+const CARD_UNRESOLVED_MS = 5 * 60 * 1000;
+const CARD_DUP_WINDOW_MS = 30 * 60 * 1000;
 const armings = new Map();
 export function _resetArmingsForTests() {
   armings.clear();

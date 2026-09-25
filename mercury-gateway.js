@@ -206,12 +206,31 @@ export function abaOk(routing) {
 export const ACH_TYPES = Object.freeze(["personalChecking", "personalSavings", "businessChecking", "businessSavings"]);
 const EMAIL_RE = /^[^\s@<>(),;:"]{1,64}@[A-Za-z0-9.-]{1,190}\.[A-Za-z]{2,24}$/;
 
-/** Gabbai AJ C2: any run of 5+ digits (spaces / dashes allowed inside) keeps only its last four. Pure. */
-export function scrubDigits(t) {
-  return String(t == null ? "" : t).replace(/\d[\d \-]{3,}\d/g, (m) => {
+/** Gabbai AJ C2: any run of 5+ digits (spaces / dashes allowed inside) keeps only its last four. Pure.
+ *  Audit #44 (25 Sep): a number pasted from Word, a French page or a Hebrew chat has en dashes, thin or
+ *  narrow spaces, bidi or zero-width marks between its groups, or full-width digits - each one broke the
+ *  run and the whole card reached Mercury's note. They are normalised first. A slash or underscore joins
+ *  a run of 9+ digits (a date like 12/27/2026 stays readable) and dots join 3+ groups of 12+ digits (an
+ *  amount like 1,240.00 stays readable). */
+const SCRUB_DROP = /[\u200b-\u200f\u2060\ufeff\u202a-\u202e\u2066-\u2069]/g;
+const SCRUB_SPACE = /[\u00a0\u2002-\u200a\u202f\u205f\u3000\t]/g;
+const SCRUB_DASH = /[\u2010-\u2015\u2212\ufe58\ufe63\uff0d]/g;
+const SCRUB_WIDE = /[\uff10-\uff19]/g;
+function scrubCut(min) {
+  return (m) => {
     const d = m.replace(/\D/g, "");
-    return d.length >= 5 ? "\u2022\u2022" + d.slice(-4) : m;
-  });
+    return d.length >= min ? "\u2022\u2022" + d.slice(-4) : m;
+  };
+}
+export function scrubDigits(t) {
+  return String(t == null ? "" : t)
+    .replace(SCRUB_DROP, "")
+    .replace(SCRUB_WIDE, (c) => String.fromCharCode(c.charCodeAt(0) - 0xFF10 + 48))
+    .replace(SCRUB_SPACE, " ")
+    .replace(SCRUB_DASH, "-")
+    .replace(/\d{3,6}(?: *\. *\d{3,6}){2,}/g, scrubCut(12))
+    .replace(/\d[\d \-\/_]{7,}\d/g, scrubCut(9))
+    .replace(/\d[\d \-]{3,}\d/g, scrubCut(5));
 }
 
 /** "yael.sher@gmail.com" -> "y***@gmail.com". For logs and the tile. Pure. */
