@@ -287,7 +287,7 @@ describe("server wiring (boot without credentials)", () => {
         for (let i = 0; i < 100 && !h; i++) { try { h = await get("/__nesher_pay/health"); } catch { await delay(50); } }
         assert.ok(h?.ok, log);
         const j = await h.json();
-        assert.equal(j.build, "2026-09-25-paddle-reader");
+        assert.equal(j.build, "2026-09-25-money-au");
         assert.equal(j.postingMode, mode === "live" ? "live" : "shadow");
         assert.deepEqual(j.payLinks, { confirming: null, at: null }, "no DB: the confirming count is unknown, never a fake 0");
         if (mode) assert.equal(j.postingShadow, null);
