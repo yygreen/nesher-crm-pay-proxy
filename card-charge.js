@@ -786,6 +786,29 @@ function claimArming(key, now) {
   return null;
 }
 
+// ONE SALE, ONE REVERSAL AT A TIME. `arming` above only catches the SAME tile re-sending; two
+// DIFFERENT tiles (two screens) touching the same sale at the same moment carry different armings and
+// would both pass it. Claimed here before the fresh sale read, released in the finally below whatever
+// happens - a second request for the same sale is turned away immediately, never left in the gap
+// between reading the sale and calling the gateway.
+const saleClaims = new Set();
+export function _resetSaleClaimsForTests() {
+  saleClaims.clear();
+}
+const SALE_BUSY_WORDS = "Another screen is sending money back on this sale right now - nothing was sent from this one. Look at the other tile.";
+
+// THE DAY CAP IS ONE NUMBER, CHECKED ONE REQUEST AT A TIME. Two different sales read the cap's day
+// total independently and could both pass it before either has sent; this module-level promise-chain
+// mutex serializes the day-cap check together with the gateway call itself, so a second concurrent
+// reversal waits its turn instead of racing the first to the gateway. Always released in .finally,
+// whatever the locked function does.
+let daycapChain = Promise.resolve();
+function withDaycapLock(fn) {
+  const run = daycapChain.then(fn, fn);
+  daycapChain = run.then(() => {}, () => {});
+  return run;
+}
+
 const UNKNOWN_WORDS = {
   refund: "We could not confirm this refund. Do not send it again - check the sale.",
   void: "We could not confirm this void. Do not send it again - check the sale.",
@@ -826,54 +849,72 @@ async function reversalDoor(kind, req, res, deps) {
     }
   }
   const release = () => { if (arming) armings.delete(arming); };
-  const facts = await saleBeforeReversal(txnId, deps);
-  const refused = reversalRefusal(kind, txnId, amountCents, facts, env);
-  if (refused) {
+
+  const saleClaimKey = `sale:${txnId}`;
+  if (saleClaims.has(saleClaimKey)) {
     release();
-    return finish(refused.status, refused.body, { outcome: refused.outcome, amount_cents: amountCents, txn: txnId });
+    return finish(409, { ok: false, error: "sale_busy", decline_reason_human: SALE_BUSY_WORDS, txn_id: txnId }, { outcome: `${kind}_refused:sale_busy`, amount_cents: amountCents, txn: txnId });
   }
-  const sale = facts.sale;
-  let out;
+  saleClaims.add(saleClaimKey);
   try {
-    out = kind === "refund"
-      ? await refundPayment({ transactionId: txnId, amountUsd: Number(moneyCents(amountCents)), fetchImpl: deps.fetchImpl, privateKey: deps.privateKey, timeoutMs: deps.gatewayTimeoutMs })
-      : await voidPayment({ transactionId: txnId, fetchImpl: deps.fetchImpl, privateKey: deps.privateKey, timeoutMs: deps.gatewayTimeoutMs });
-  } catch {
-    out = { ok: false, error: "outcome_unknown", outcomeUnknown: true };
-  }
-  if (out.outcomeUnknown) {
-    if (arming) armings.set(arming, { at: clock(), state: "unknown" });
+    const facts = await saleBeforeReversal(txnId, deps);
+    let refused = null;
+    let out;
+    try {
+      // The day-cap check and the gateway call, together, one reversal at a time process-wide: a
+      // second concurrent reversal (a different sale) waits its turn here rather than checking the
+      // cap against a number the first one is about to move past.
+      out = await withDaycapLock(async () => {
+        refused = reversalRefusal(kind, txnId, amountCents, facts, env);
+        if (refused) return null;
+        return kind === "refund"
+          ? await refundPayment({ transactionId: txnId, amountUsd: Number(moneyCents(amountCents)), fetchImpl: deps.fetchImpl, privateKey: deps.privateKey, timeoutMs: deps.gatewayTimeoutMs })
+          : await voidPayment({ transactionId: txnId, fetchImpl: deps.fetchImpl, privateKey: deps.privateKey, timeoutMs: deps.gatewayTimeoutMs });
+      });
+    } catch {
+      out = { ok: false, error: "outcome_unknown", outcomeUnknown: true };
+    }
+    if (refused) {
+      release();
+      return finish(refused.status, refused.body, { outcome: refused.outcome, amount_cents: amountCents, txn: txnId });
+    }
+    const sale = facts.sale;
+    if (out.outcomeUnknown) {
+      if (arming) armings.set(arming, { at: clock(), state: "unknown" });
+      _resetSaleCache();
+      // What had already gone back BEFORE this call (Gabbai 24 Sep round 2, condition 1): the desk's
+      // read-back counts a refund as landed only above this figure and only after the arming.
+      return finish(503, { ok: false, error: "outcome_unknown", decline_reason_human: UNKNOWN_WORDS[kind], txn_id: txnId, amount_cents: amountCents, refunded_cents_before: sale.refunded_cents }, { outcome: `${kind}_outcome_unknown`, amount_cents: amountCents, txn: txnId });
+    }
+    if (!out.ok) {
+      release();
+      return finish(
+        out.error === "keys_missing" ? 503 : 402,
+        {
+          ok: false,
+          error: out.error || `${kind}_failed`,
+          decline_reason_human: out.error === "keys_missing" ? "Card processing is not configured. Tell the office." : kind === "refund" ? "The processor refused the refund. Check the sale in the gateway portal." : "The processor refused the void. If the sale already settled, refund it instead.",
+          decline_code: out.responseCode || null,
+          decline_text: out.responseText ? String(out.responseText).slice(0, 120) : null,
+          txn_id: txnId,
+          amount_cents: amountCents,
+        },
+        { outcome: `${kind}_failed:${out.responseCode || out.error || "unknown"}`, amount_cents: amountCents, txn: txnId }
+      );
+    }
     _resetSaleCache();
-    // What had already gone back BEFORE this call (Gabbai 24 Sep round 2, condition 1): the desk's
-    // read-back counts a refund as landed only above this figure and only after the arming.
-    return finish(503, { ok: false, error: "outcome_unknown", decline_reason_human: UNKNOWN_WORDS[kind], txn_id: txnId, amount_cents: amountCents, refunded_cents_before: sale.refunded_cents }, { outcome: `${kind}_outcome_unknown`, amount_cents: amountCents, txn: txnId });
+    const moved = kind === "refund" ? amountCents : sale.amount_cents;
+    const crm = kind === "void" || out.transactionId
+      ? await recordReversal(deps, { kind, saleTxn: txnId, reversalTxn: out.transactionId || null, amountUsd: Number(moneyCents(moved)), brand: sale.merchant, orderId: sale.order_id, rep: ticket.repId, cardLast4: sale.last4, at: new Date(clock()).toISOString() })
+      : { state: "not_recorded", reason: "no_refund_txn_id" };
+    const answer = kind === "refund"
+      ? { ok: true, txn_id: txnId, refund_txn_id: out.transactionId || null, amount_cents: amountCents, refunded_cents: sale.refunded_cents + amountCents, sale_cents: sale.amount_cents, merchant: sale.merchant, crm }
+      : { ok: true, txn_id: txnId, void_txn_id: out.transactionId || null, amount_cents: sale.amount_cents, merchant: sale.merchant, crm };
+    if (arming) armings.set(arming, { at: clock(), state: "done", status: 200, body: answer });
+    return finish(200, answer, { outcome: kind === "refund" ? "refunded" : "voided", amount_cents: moved, txn: txnId });
+  } finally {
+    saleClaims.delete(saleClaimKey);
   }
-  if (!out.ok) {
-    release();
-    return finish(
-      out.error === "keys_missing" ? 503 : 402,
-      {
-        ok: false,
-        error: out.error || `${kind}_failed`,
-        decline_reason_human: out.error === "keys_missing" ? "Card processing is not configured. Tell the office." : kind === "refund" ? "The processor refused the refund. Check the sale in the gateway portal." : "The processor refused the void. If the sale already settled, refund it instead.",
-        decline_code: out.responseCode || null,
-        decline_text: out.responseText ? String(out.responseText).slice(0, 120) : null,
-        txn_id: txnId,
-        amount_cents: amountCents,
-      },
-      { outcome: `${kind}_failed:${out.responseCode || out.error || "unknown"}`, amount_cents: amountCents, txn: txnId }
-    );
-  }
-  _resetSaleCache();
-  const moved = kind === "refund" ? amountCents : sale.amount_cents;
-  const crm = kind === "void" || out.transactionId
-    ? await recordReversal(deps, { kind, saleTxn: txnId, reversalTxn: out.transactionId || null, amountUsd: Number(moneyCents(moved)), brand: sale.merchant, orderId: sale.order_id, rep: ticket.repId, cardLast4: sale.last4, at: new Date(clock()).toISOString() })
-    : { state: "not_recorded", reason: "no_refund_txn_id" };
-  const answer = kind === "refund"
-    ? { ok: true, txn_id: txnId, refund_txn_id: out.transactionId || null, amount_cents: amountCents, refunded_cents: sale.refunded_cents + amountCents, sale_cents: sale.amount_cents, merchant: sale.merchant, crm }
-    : { ok: true, txn_id: txnId, void_txn_id: out.transactionId || null, amount_cents: sale.amount_cents, merchant: sale.merchant, crm };
-  if (arming) armings.set(arming, { at: clock(), state: "done", status: 200, body: answer });
-  return finish(200, answer, { outcome: kind === "refund" ? "refunded" : "voided", amount_cents: moved, txn: txnId });
 }
 
 /** POST /__nesher_pay/void {txn_id, amount_cents, rep, arming}. Ticket kind "void", bound to txn_id. */
