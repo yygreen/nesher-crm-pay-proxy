@@ -54,3 +54,30 @@ describe("the card reader never freezes the proxy", () => {
     assert.ok(worst <= LOOP_CEILING_MS, `worst stall ${worst.toFixed(0)} ms at ${worstId}`);
   });
 });
+
+describe("a glyph worker that never answers cannot hold a read (Gabbai D1)", () => {
+  it("the read returns within its budget + 500 ms, and the next read works on a fresh worker", async () => {
+    const { fileURLToPath } = await import("node:url");
+    const { _setGlyphWorkerFileForTests, glyphWorkerStats } = await import("../ocr-glyph-worker.js");
+    const PAN = "4539578763621486";
+    const fake = (script) => ({ async recognize(buf, o) { return { text: script(o), confidence: 80 }; } });
+    const { tinyImage } = await import("./ocr-fixtures.js");
+    _setGlyphWorkerFileForTests(fileURLToPath(new URL("./glyph-worker-stub.mjs", import.meta.url)));
+    try {
+      const before = glyphWorkerStats.timeouts;
+      const t0 = Date.now();
+      const r = await recognizeCard(await tinyImage(), { engine: fake(() => ""), now: NOW, deadlineMs: 1000, totalMs: 2000 });
+      const took = Date.now() - t0;
+      assert.equal(r.ok, false);
+      assert.ok(took <= 2000 + 500, `returned in ${took} ms`);
+      assert.ok(glyphWorkerStats.timeouts > before, "the silent worker was cut off");
+    } finally {
+      _setGlyphWorkerFileForTests(null);
+    }
+    let n = 0;
+    const r2 = await recognizeCard(await tinyImage(), { engine: fake((o) => (o.charset === "text" ? "" : n++ < 2 ? PAN : "")), now: NOW });
+    assert.equal(r2.ok, true, "the next read works");
+    assert.equal(r2.pan, PAN);
+    r2.pan = null;
+  });
+});

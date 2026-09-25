@@ -908,7 +908,8 @@ async function locateLines(engine, img, scratch, budget, { textPass = false, not
   });
   // Rows of digit-sized shapes, found without tesseract (embossed and metal cards).
   const small = textPass ? null : await rawGray(base().toColourspace("b-w"), scratch);
-  const shapeLines = (!small ? [] : await glyphWorker().rows(small)).map((L) => ({ ...L, left: L.left / k, right: L.right / k, top: L.top / k, bottom: L.bottom / k, h: L.h / k }));
+  // A worker that does not answer within the read's time left is cut off; the read goes on without it.
+  const shapeLines = (!small ? [] : await glyphWorker().rows(small, { timeoutMs: Math.max(250, budget.left()) }).catch(() => [])).map((L) => ({ ...L, left: L.left / k, right: L.right / k, top: L.top / k, bottom: L.bottom / k, h: L.h / k }));
   // Dedupe the same word seen in several preparations: keep the one with more digits.
   words.sort((a, b) => b.d - a.d);
   const uniq = [];
@@ -1207,7 +1208,7 @@ async function recognizeCardOnce(input, opts) {
       const halves = [];
       for (const part of line.parts) {
         const pb = await cutLine(img, part, { flip }, scratch);
-        halves.push(pb ? (await glyphWorker().lines([{ ...pb, minGlyphs: 6 }], { digitPx: LINE_DIGIT_PX }))[0] : []);
+        halves.push(pb ? (await glyphWorker().lines([{ ...pb, minGlyphs: 6 }], { digitPx: LINE_DIGIT_PX, timeoutMs: Math.max(250, budget.left()) }).catch(() => [[]]))[0] : []);
       }
       for (const a of halves[flip ? 1 : 0] || []) {
         const b = (halves[flip ? 0 : 1] || []).find((x) => x.prep === a.prep && x.font === a.font);
@@ -1217,7 +1218,7 @@ async function recognizeCardOnce(input, opts) {
     } else {
       // A photo of a screen: soften the moire before the glyphs are cut.
       const soft = await rawGray(sharpG(band.data, { raw: { width: band.width, height: band.height, channels: 1 } }).blur(1.4).toColourspace("b-w"), scratch);
-      const [plain, local, softened] = await glyphWorker().lines([band, clahe, soft], { digitPx: LINE_DIGIT_PX });
+      const [plain, local, softened] = await glyphWorker().lines([band, clahe, soft], { digitPx: LINE_DIGIT_PX, timeoutMs: Math.max(250, budget.left()) }).catch(() => [[], [], []]);
       glyphReads.push(...plain);
       glyphReads.push(...local.map((g) => ({ ...g, prep: "c" + g.prep })));
       glyphReads.push(...softened.map((g) => ({ ...g, prep: "b" + g.prep })));

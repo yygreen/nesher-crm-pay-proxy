@@ -55,30 +55,45 @@ if (!isMainThread && parentPort) {
 let worker = null;
 let seq = 0;
 const pending = new Map();
-/** For the fence test: how many zeroed copies went out. */
-export const glyphWorkerStats = { sent: 0 };
+let workerFile = fileURLToPath(import.meta.url);
+/** For the fence test: how many zeroed copies went out, and how many workers were cut off. */
+export const glyphWorkerStats = { sent: 0, timeouts: 0, started: 0 };
 
-function failAll(err) {
-  for (const [, p] of pending) p.reject(err);
-  pending.clear();
+/** Tests only: run a different worker script (a stub that never answers). null = the real one. */
+export function _setGlyphWorkerFileForTests(file) {
+  const w = worker;
   worker = null;
+  if (w) w.terminate().catch(() => {});
+  workerFile = file || fileURLToPath(import.meta.url);
+}
+
+/** Reject everything owed by THIS worker and forget it - never a newer one (Gabbai D1). */
+function failAll(w, err) {
+  for (const [id, p] of pending) {
+    if (p.worker !== w) continue;
+    pending.delete(id);
+    p.reject(err);
+  }
+  if (worker === w) worker = null;
 }
 
 function ensure() {
   if (worker) return worker;
-  worker = new Worker(fileURLToPath(import.meta.url));
-  worker.unref();
-  worker.on("message", (m) => {
+  const w = new Worker(workerFile);
+  glyphWorkerStats.started += 1;
+  worker = w;
+  w.unref();
+  w.on("message", (m) => {
     const p = pending.get(m.id);
     if (!p) return;
     pending.delete(m.id);
-    if (!pending.size) worker && worker.unref();
+    if (![...pending.values()].some((x) => x.worker === w)) w.unref();
     if (m.ok) p.resolve(m.out);
     else p.reject(new Error(m.error || "glyph_worker_failed"));
   });
-  worker.on("error", (e) => failAll(e));
-  worker.on("exit", () => failAll(new Error("glyph_worker_exit")));
-  return worker;
+  w.on("error", (e) => failAll(w, e));
+  w.on("exit", () => failAll(w, new Error("glyph_worker_exit")));
+  return w;
 }
 
 /** A private copy of the pixels in a fresh ArrayBuffer, so it can be transferred whole. */
@@ -89,13 +104,29 @@ function copyOf(data) {
   return ab;
 }
 
-function call(msg, transfer) {
+/**
+ * One call, raced against the read's own time left (Gabbai D1, 25 Sep): a matcher that hangs on an
+ * odd picture must not hold that read - or every read queued behind it - forever. On timeout the
+ * worker is terminated (its copies die with it), everything it owed is rejected, and the next call
+ * builds a fresh one; the read carries on with what it already has.
+ */
+function call(msg, transfer, timeoutMs) {
   const w = ensure();
   const id = ++seq;
   msg.id = id;
   w.ref(); // while an answer is owed, the worker keeps the loop alive
   return new Promise((resolve, reject) => {
-    pending.set(id, { resolve, reject });
+    let timer = null;
+    const done = (fn) => (v) => { if (timer) clearTimeout(timer); fn(v); };
+    pending.set(id, { resolve: done(resolve), reject: done(reject), worker: w });
+    const ms = Math.max(250, Number(timeoutMs) || 5000);
+    timer = setTimeout(() => {
+      if (!pending.has(id)) return;
+      glyphWorkerStats.timeouts += 1;
+      failAll(w, new Error("glyph_worker_timeout"));
+      w.terminate().catch(() => {});
+    }, ms);
+    timer.unref();
     w.postMessage(msg, transfer);
   });
 }
@@ -103,13 +134,13 @@ function call(msg, transfer) {
 export function glyphWorker() {
   return {
     /** bands: [{data, width, height, minGlyphs}] -> [readings[]] in the same order. */
-    lines(bands, { digitPx }) {
+    lines(bands, { digitPx, timeoutMs } = {}) {
       const jobs = bands.map((b) => ({ buffer: copyOf(b.data), width: b.width, height: b.height, minGlyphs: b.minGlyphs }));
-      return call({ kind: "lines", digitPx, jobs }, jobs.map((j) => j.buffer));
+      return call({ kind: "lines", digitPx, jobs }, jobs.map((j) => j.buffer), timeoutMs);
     },
-    rows(gray) {
+    rows(gray, { timeoutMs } = {}) {
       const buffer = copyOf(gray.data);
-      return call({ kind: "rows", buffer, width: gray.width, height: gray.height }, [buffer]);
+      return call({ kind: "rows", buffer, width: gray.width, height: gray.height }, [buffer], timeoutMs);
     },
     async close() {
       if (worker) { const w = worker; worker = null; await w.terminate().catch(() => {}); }
