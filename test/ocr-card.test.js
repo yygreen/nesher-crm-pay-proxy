@@ -874,3 +874,23 @@ describe("PaddleOCR line reader (ocr-paddle.js)", () => {
     assert.ok(out.conf >= 0.6, "above the voting threshold PADDLE_MIN_CONF");
   });
 });
+
+describe("PaddleOCR is loaded in every worker, not inside a read (Gabbai P1)", () => {
+  it("a fresh worker reports loaded; after a forced cut-off the next worker loads it again", async () => {
+    const { glyphWorker, paddleStatus, _forceTimeoutForTests, glyphWorkerStats } = await import("../ocr-glyph-worker.js");
+    const first = await glyphWorker().warm();
+    assert.equal(typeof first.loadMs, "number");
+    let st = paddleStatus();
+    assert.equal(st.files, true);
+    assert.equal(st.loaded, true);
+    assert.equal(typeof st.loadMs, "number");
+    const started = glyphWorkerStats.started;
+    assert.equal(_forceTimeoutForTests(), true);
+    assert.equal(paddleStatus().loaded, false, "the cut-off worker's model does not count");
+    const again = await glyphWorker().warm();
+    assert.equal(typeof again.loadMs, "number");
+    st = paddleStatus();
+    assert.equal(st.loaded, true);
+    assert.equal(glyphWorkerStats.started, started + 1, "a new worker was built and warmed");
+  });
+});

@@ -44,6 +44,13 @@ async function load() {
   return loading;
 }
 
+/** Load the model now (Gabbai P1, 25 Sep): a fresh worker must not pay the load inside a read's budget. */
+export async function paddleWarm() {
+  const t0 = Date.now();
+  await load();
+  return Date.now() - t0;
+}
+
 export function paddleAvailable() {
   return fs.existsSync(PADDLE_MODEL) && fs.existsSync(PADDLE_DICT);
 }

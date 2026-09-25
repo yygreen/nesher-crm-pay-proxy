@@ -30,7 +30,7 @@ import {
 } from "./ocr-card.js";
 import { sharedEnginePool } from "./ocr-engine.js";
 import { loadTemplates as loadGlyphTemplates } from "./ocr-glyphs.js";
-import { paddleAvailable } from "./ocr-paddle.js";
+import { glyphWorker, paddleStatus } from "./ocr-glyph-worker.js";
 import {
   chargeFamilyPath,
   handleChargeRequest,
@@ -1608,7 +1608,8 @@ const server = http.createServer(async (req, res) => {
         // Card fonts the glyph matcher knows (14). 0 = ocr-glyphs.json missing from the image: the matcher is off.
         glyphFonts: loadGlyphTemplates().length,
         // PaddleOCR line model + dictionary present in the image (the primary line reader, 25 Sep).
-        paddle: paddleAvailable(),
+        // {files, loaded, loadMs}: loaded = the model is up in the CURRENT glyph worker (Gabbai P1).
+        paddle: paddleStatus(),
       },
     });
     return;
@@ -1920,6 +1921,10 @@ if (ocrEnabled()) {
     .warm()
     .then(() => console.log(`ocr engine ready workers=${ocrPool.size}`))
     .catch((e) => console.error("ocr engine warm failed:", e.message));
+  // PaddleOCR model loaded at boot, in the glyph worker thread (Gabbai P1, 25 Sep).
+  Promise.resolve(glyphWorker().warm())
+    .then((o) => console.log(`paddle ready loadMs=${o && o.loadMs}`))
+    .catch((e) => console.error("paddle warm failed:", String((e && e.message) || e).slice(0, 80)));
   startCardHoldSweeper();
 } else {
   console.log("ocr route disabled: OCR_TICKET_SECRET not set");

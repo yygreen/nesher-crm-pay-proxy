@@ -72,4 +72,9 @@ const lowOk = rows.filter((r) => r.verdict === "ok" && r.conf === "low").length;
 out(`TOTAL n=${total} exact=${exact} (${((100 * exact) / total).toFixed(1)}%) wrong=${wrong} lowConfidenceCorrect=${lowOk} expiry=${rows.filter((r) => r.expiry).length}/${total} name=${rows.filter((r) => r.name).length}/${total} p50=${pct(rows.map((r) => r.ms), 50)}ms p95=${p95}ms max=${Math.max(...rows.map((r) => r.ms))}ms workers=${workers}${heldOut ? " heldOut" : ""}${totalMs ? " totalMs=" + totalMs : ""}`);
 console.warn = quiet.warn;
 console.error = quiet.error;
-process.exitCode = wrong === 0 && exact / total >= 0.95 && p95 < 8000 ? 0 : 1;
+// Plan 13.6's 3 s for a clean card still stands (Gabbai P2): at 3 workers the clean category's p95 must be under 3 s.
+const cleanRows = rows.filter((r) => r.cat === "clean");
+const cleanP95 = pct(cleanRows.map((r) => r.ms), 95);
+const cleanOk = workers !== 3 || !cleanRows.length || cleanP95 < 3000;
+if (!cleanOk) out(`CLEAN p95 ${cleanP95} ms is over the 3 s target (plan 13.6)`);
+process.exitCode = wrong === 0 && exact / total >= 0.95 && p95 < 8000 && cleanOk ? 0 : 1;

@@ -18,7 +18,7 @@
 import { Worker, isMainThread, parentPort } from "node:worker_threads";
 import { fileURLToPath } from "node:url";
 import { readLineGlyphs, findRows } from "./ocr-glyphs.js";
-import { paddleReadLine } from "./ocr-paddle.js";
+import { paddleReadLine, paddleWarm, paddleAvailable } from "./ocr-paddle.js";
 
 function zero(list) {
   for (const a of list) if (a && typeof a.fill === "function") a.fill(0);
@@ -29,7 +29,10 @@ if (!isMainThread && parentPort) {
     const held = [];
     let reply;
     try {
-      if (msg.kind === "paddle") {
+      if (msg.kind === "warm") {
+        // Load the PaddleOCR model as soon as the worker exists (Gabbai P1).
+        reply = { id: msg.id, ok: true, out: { loadMs: await paddleWarm() } };
+      } else if (msg.kind === "paddle") {
         // PaddleOCR's line recogniser (ocr-paddle.js), one cut line at a time.
         const out = [];
         for (const job of msg.jobs) {
@@ -68,6 +71,24 @@ const pending = new Map();
 let workerFile = fileURLToPath(import.meta.url);
 /** For the fence test: how many zeroed copies went out, and how many workers were cut off. */
 export const glyphWorkerStats = { sent: 0, timeouts: 0, started: 0 };
+/** The Paddle model's state IN THE CURRENT WORKER (health ocr.paddle, Gabbai P1). */
+const paddleState = { worker: null, loadMs: null, error: null };
+const warmOf = new WeakMap();
+
+export function paddleStatus() {
+  const loaded = Boolean(worker && paddleState.worker === worker);
+  return { files: paddleAvailable(), loaded, loadMs: loaded ? paddleState.loadMs : null, error: loaded ? null : paddleState.error };
+}
+
+/** Tests only: the same cut-off a timeout makes (worker terminated, everything it owed rejected). */
+export function _forceTimeoutForTests() {
+  const w = worker;
+  if (!w) return false;
+  glyphWorkerStats.timeouts += 1;
+  failAll(w, new Error("glyph_worker_timeout"));
+  w.terminate().catch(() => {});
+  return true;
+}
 
 /** Tests only: run a different worker script (a stub that never answers). null = the real one. */
 export function _setGlyphWorkerFileForTests(file) {
@@ -85,6 +106,7 @@ function failAll(w, err) {
     p.reject(err);
   }
   if (worker === w) worker = null;
+  if (paddleState.worker === w) paddleState.worker = null;
 }
 
 function ensure() {
@@ -97,12 +119,28 @@ function ensure() {
     const p = pending.get(m.id);
     if (!p) return;
     pending.delete(m.id);
-    if (![...pending.values()].some((x) => x.worker === w)) w.unref();
+    if (![...pending.values()].some((x) => x.worker === w && !x.warm)) w.unref();
     if (m.ok) p.resolve(m.out);
     else p.reject(new Error(m.error || "glyph_worker_failed"));
   });
   w.on("error", (e) => failAll(w, e));
   w.on("exit", () => failAll(w, new Error("glyph_worker_exit")));
+  // Warm the Paddle model in every new worker, at once (Gabbai P1). Not ref'd: a warm-up never keeps
+  // the process alive; a worker cut off before it answers simply rejects it (handled below).
+  const id = ++seq;
+  const warm = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { if (pending.has(id)) { pending.delete(id); reject(new Error("paddle_warm_timeout")); } }, 60000);
+    timer.unref();
+    pending.set(id, {
+      warm: true,
+      worker: w,
+      resolve: (out) => { clearTimeout(timer); if (worker === w) { paddleState.worker = w; paddleState.loadMs = out && out.loadMs; paddleState.error = null; } resolve(out); },
+      reject: (e) => { clearTimeout(timer); paddleState.error = String((e && e.message) || e).slice(0, 60); reject(e); },
+    });
+  });
+  warm.catch(() => {});
+  warmOf.set(w, warm);
+  w.postMessage({ kind: "warm", id });
   return w;
 }
 
@@ -156,6 +194,10 @@ export function glyphWorker() {
     rows(gray, { timeoutMs } = {}) {
       const buffer = copyOf(gray.data);
       return call({ kind: "rows", buffer, width: gray.width, height: gray.height }, [buffer], timeoutMs);
+    },
+    /** Start (or reuse) the worker and wait until its Paddle model is loaded. Server boot calls this. */
+    warm() {
+      return warmOf.get(ensure());
     },
     async close() {
       if (worker) { const w = worker; worker = null; await w.terminate().catch(() => {}); }
