@@ -582,7 +582,35 @@ export async function handleChargeRequest(req, res, deps = {}) {
       return finish(409, { ok: false, error: "charge_in_flight", message: "That charge is being sent right now - its answer lands on the tile. Do not charge again." }, { outcome: "charge_repeat:in_flight", brand: brandId, amount_cents: amountCents });
     }
   }
-  const releaseCharge = () => { if (chargeKey) armings.delete(chargeKey); };
+  // ONE CARD AND AMOUNT WHILE UNRESOLVED (Mr. AU, audit C1/C2 + "no duplicate guard on chat charges"). The
+  // desk sends the card's last four. While a charge of this card for this amount on this merchant is on the
+  // wire or UNKNOWN (10 minutes - the desk reads an unknown back within 5), ANOTHER tile's charge of it is
+  // refused before the hold is spent: a rep who sends the card again while the first answer is unknown can
+  // no longer charge the customer twice. After an approval, a second charge of the same card and amount
+  // within 30 minutes needs the rep's explicit "charge it again" (body.again === true from the desk).
+  const tileId = chargeKey ? chargeKey.slice(7) : "";
+  const last4Said = /^\d{4}$/.test(str(body.last4, 4)) ? str(body.last4, 4) : "";
+  const cardKey = last4Said && chargeKey ? `card:${brandId}:${last4Said}:${amountCents}` : null;
+  if (cardKey) {
+    const nowC = clock();
+    const prior = armings.get(cardKey);
+    if (prior && prior.tile !== tileId) {
+      const unresolved = (prior.state === "in_flight" && nowC - prior.at < CARD_IN_FLIGHT_MS) || (prior.state === "unknown" && nowC - prior.at < CARD_UNRESOLVED_MS);
+      if (unresolved) {
+        armings.delete(chargeKey);
+        return finish(409, { ok: false, error: "card_unresolved", message: "An earlier charge of this card for this amount is still being checked with the processor. Do not charge it again - that tile turns into Charged or Not charged by itself." }, { outcome: "charge_refused:card_unresolved", brand: brandId, amount_cents: amountCents });
+      }
+      if (prior.state === "done" && nowC - prior.at < CARD_DUP_WINDOW_MS && body.again !== true) {
+        armings.delete(chargeKey);
+        return finish(409, { ok: false, error: "duplicate_recent", txn_id: prior.txn || null, minutes_ago: Math.floor((nowC - prior.at) / 60000), message: "This card was charged the same amount a few minutes ago. If a second charge is on purpose, charge it again." }, { outcome: "charge_refused:duplicate_recent", brand: brandId, amount_cents: amountCents });
+      }
+    }
+    armings.set(cardKey, { at: nowC, state: "in_flight", tile: tileId });
+  }
+  const releaseCharge = () => {
+    if (chargeKey) armings.delete(chargeKey);
+    if (cardKey) { const c = armings.get(cardKey); if (c && c.tile === tileId && c.state === "in_flight") armings.delete(cardKey); }
+  };
 
   // One presentation is the whole life of a reference. The rep on the ticket
   // must be the rep who took the photo.
@@ -656,8 +684,10 @@ export async function handleChargeRequest(req, res, deps = {}) {
   // A thrown sale is an unknown too (the request may have left): never a decline, never a release.
   if (sale && sale.thrown) sale.outcomeUnknown = true;
   if (chargeKey) {
-    if (sale && sale.outcomeUnknown) armings.set(chargeKey, { at: clock(), state: "unknown" });
-    else if (!sale || !sale.ok) releaseCharge();
+    if (sale && sale.outcomeUnknown) {
+      armings.set(chargeKey, { at: clock(), state: "unknown" });
+      if (cardKey) armings.set(cardKey, { at: clock(), state: "unknown", tile: tileId });
+    } else if (!sale || !sale.ok) releaseCharge();
   }
   if (sale && sale.outcomeUnknown) {
     // Gabbai 23 Sep F5: the gateway may have taken the money. A rep told
@@ -724,6 +754,7 @@ export async function handleChargeRequest(req, res, deps = {}) {
   };
   // Mr. AU: an approved tile answers any repeat with this same approval - never a second sale.
   if (chargeKey) armings.set(chargeKey, { at: clock(), state: "done", status: 200, body: approved });
+  if (cardKey) armings.set(cardKey, { at: clock(), state: "done", tile: tileId, txn: sale.transactionId || null });
   return finish(
     200,
     approved,
@@ -807,6 +838,10 @@ async function recordReversal(deps, fields) {
 // place; behind it stands the processor-based 15-minute guard, which survives a restart.
 const ARMING_RE = /^[A-Za-z0-9:_-]{6,80}$/;
 const ARMING_TTL_MS = 24 * 60 * 60 * 1000;
+// Mr. AU: the card-and-amount guard for chat charges (see handleChargeRequest).
+const CARD_IN_FLIGHT_MS = 2 * 60 * 1000;
+const CARD_UNRESOLVED_MS = 10 * 60 * 1000;
+const CARD_DUP_WINDOW_MS = 30 * 60 * 1000;
 const armings = new Map();
 export function _resetArmingsForTests() {
   armings.clear();

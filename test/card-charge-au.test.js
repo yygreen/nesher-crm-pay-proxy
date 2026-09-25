@@ -10,7 +10,7 @@ import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { CHARGE_PATH, handleChargeRequest, _resetArmingsForTests } from "../card-charge.js";
-import { mintTicket, registerCardHold, _resetCardRefsForTests } from "../ocr-card.js";
+import { mintTicket, registerCardHold, redeemCardHold, _resetCardRefsForTests } from "../ocr-card.js";
 import { parseInvoiceNumber } from "../payments-sync.js";
 
 const SECRET = "test-ocr-secret-0123456789abcdef";
@@ -107,6 +107,44 @@ describe("Mr. AU - one tile, at most one sale (audit C2)", () => {
       const b = await charge(door, { token_ref: ref, amount_cents: 20000, currency: "USD", brand: "nesher", rep: "joseph", customer_name: "Levi", arming: "mcdddd4444" });
       assert.equal(b.status, 200, JSON.stringify(b.body));
       assert.equal(gw.calls.length, 2);
+    } finally { await door.close(); }
+  });
+});
+
+describe("Mr. AU - one card and amount while unresolved, and the 30-minute duplicate guard", () => {
+  beforeEach(() => { _resetCardRefsForTests(); _resetArmingsForTests(); });
+
+  it("while tile A's charge is UNKNOWN, tile B (the card sent again) is refused before its hold is spent", async () => {
+    const gw = gateway(() => { throw new Error("socket hang up"); });
+    const door = await startDoor({ fetchImpl: gw.fetchImpl });
+    try {
+      const a = await charge(door, { token_ref: newRef(), amount_cents: 1566700, currency: "USD", brand: "nesher", rep: "joseph", customer_name: "Kaufman", arming: "mctileaaaa", last4: "1486" });
+      assert.equal(a.status, 503);
+      const refB = newRef();
+      const b = await charge(door, { token_ref: refB, amount_cents: 1566700, currency: "USD", brand: "nesher", rep: "joseph", customer_name: "Kaufman", arming: "mctilebbbb", last4: "1486" });
+      assert.equal(b.status, 409, JSON.stringify(b.body));
+      assert.equal(b.body.error, "card_unresolved");
+      assert.equal(gw.calls.length, 1, "no second sale");
+      assert.equal(redeemCardHold(refB, { rep: "joseph" }).ok, true, "tile B's card is still held");
+    } finally { await door.close(); }
+  });
+
+  it("after an approval, the same card and amount on another tile needs the rep's explicit again", async () => {
+    const gw = gateway((n) => approve("txn-" + n));
+    const door = await startDoor({ fetchImpl: gw.fetchImpl });
+    try {
+      const a = await charge(door, { token_ref: newRef(), amount_cents: 50000, currency: "USD", brand: "jrm", rep: "joseph", customer_name: "Cohen", arming: "mctilecccc", last4: "1486" });
+      assert.equal(a.status, 200);
+      const refB = newRef();
+      const b = await charge(door, { token_ref: refB, amount_cents: 50000, currency: "USD", brand: "jrm", rep: "joseph", customer_name: "Cohen", arming: "mctiledddd", last4: "1486" });
+      assert.equal(b.status, 409);
+      assert.equal(b.body.error, "duplicate_recent");
+      assert.equal(b.body.txn_id, "txn-1");
+      const c = await charge(door, { token_ref: refB, amount_cents: 50000, currency: "USD", brand: "jrm", rep: "joseph", customer_name: "Cohen", arming: "mctiledddd", last4: "1486", again: true });
+      assert.equal(c.status, 200, JSON.stringify(c.body));
+      const d = await charge(door, { token_ref: newRef(), amount_cents: 20000, currency: "USD", brand: "jrm", rep: "joseph", customer_name: "Cohen", arming: "mctileeeee", last4: "1486" });
+      assert.equal(d.status, 200, "a different amount is not a duplicate");
+      assert.equal(gw.calls.length, 3);
     } finally { await door.close(); }
   });
 });
