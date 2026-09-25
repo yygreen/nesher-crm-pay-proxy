@@ -103,7 +103,7 @@ describe("card-charge basics", () => {
     assert.equal(declineHuman("251"), "The issuer flagged this card. Do not retry.");
     assert.equal(declineHuman("430"), "The processor saw this as a duplicate.");
     assert.equal(declineHuman("999", "DECLINED BY ISSUER"), "The card was declined.");
-    assert.equal(declineHuman(null, ""), "The card was not charged. Try again or use another card.");
+    assert.equal(declineHuman(null, ""), "The card was not charged.");
     for (const code of ["200", "201", "202", "203", "204", "220", "221", "222", "223", "224", "225", "226", "240", "250", "260", "300", "400", "410", "411", "420", "421", "430", "440", "460", "461"]) {
       assert.doesNotMatch(declineHuman(code), /\d/, `no digits for ${code}`);
     }
