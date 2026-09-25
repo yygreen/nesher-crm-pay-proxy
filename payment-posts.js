@@ -46,6 +46,9 @@ async function ensureTable(pool) {
   await ready.get(pool);
 }
 
+/** For the sweep's reversal door (payments-sync recordSweepReversal): the ledger table exists before its reads. */
+export async function ensureLedger(pool) { await ensureTable(pool); }
+
 function result(error, needsReview = false) {
   return { ok: false, recorded: [], skipped: [], errors: [error], needsReview };
 }
@@ -119,7 +122,7 @@ export async function postConfirmedPayment({ pool, invoiceNumber, amountUsd, tra
       await client.query(`UPDATE nesher_money_payment_posts SET state = 'review', reason = $2,
         attempts = attempts + 1, updated_at = NOW() WHERE transaction_id = $1 AND state = 'pending'`, [txn, reason]);
       await client.query('COMMIT');
-      return { ...out, ok: false, durable: true, state: 'review', needsReview: true, errors: out.errors.length ? out.errors : [reason] };
+      return { ...out, ok: false, durable: true, state: 'review', needsReview: true, newlyReviewed: true, errors: out.errors.length ? out.errors : [reason] };
     }
     await client.query(`UPDATE nesher_money_payment_posts SET state = 'posted', reason = NULL,
       attempts = attempts + 1, updated_at = NOW(), posted_at = NOW() WHERE transaction_id = $1`, [txn]);
@@ -158,19 +161,66 @@ export async function retryPaymentPosts({ pool, post, limit = 50 }) {
       } catch { out.errors++; }
       continue;
     }
+    // A SALE VOIDED BEFORE ITS CRM ROW WAS WRITTEN (audit #26 L2, 25 Sep): the desk chat's void of this
+    // sale is already in the ledger as void_<txn>. Posting now would book money that never came in, so
+    // the sale goes to a person instead - the processor's own void is the latest word on it.
+    try {
+      const voided = await pool.query(`SELECT 1 AS hit FROM nesher_money_payment_posts WHERE transaction_id = $1 LIMIT 1`, [`void_${row.transaction_id}`]);
+      if (voided.rows && voided.rows.length) {
+        await pool.query(`UPDATE nesher_money_payment_posts SET state = 'review', reason = $2,
+          attempts = attempts + 1, updated_at = NOW() WHERE transaction_id = $1 AND state = 'pending'`, [row.transaction_id, 'sale_voided_before_posting']);
+        out.review++;
+        continue;
+      }
+    } catch { /* the read failed: fall through to the ordinary retry */ }
     try {
       const r = await post({ pool, transactionId: row.transaction_id, invoiceNumber: row.invoice_number,
         amountUsd: Number(row.amount_cents) / 100, paidAt: row.paid_at });
       if (r.ok) out.posted++;
       else if (r.needsReview) out.review++;
       else out.errors++;
-    } catch { out.errors++; }
+    } catch {
+      out.errors++;
+      // NEVER RETRIED FOREVER (audit #141): a row the CRM refuses MAX_POST_ATTEMPTS times (each attempt
+      // is a live connection that reached the row, so this is the row, not an outage) goes to a person.
+      try {
+        const moved = await pool.query(`UPDATE nesher_money_payment_posts SET state = 'review', reason = $2, updated_at = NOW()
+          WHERE transaction_id = $1 AND state = 'pending' AND attempts >= $3 RETURNING transaction_id`, [row.transaction_id, 'crm_write_keeps_failing', MAX_POST_ATTEMPTS]);
+        if (moved.rows && moved.rows.length) out.review++;
+      } catch { /* stays pending; the next pass tries again */ }
+    }
   }
   const totals = await pool.query(`SELECT state, COUNT(*)::integer AS count
     FROM nesher_money_payment_posts WHERE state <> 'posted' GROUP BY state`);
   out.pendingTotal = Number(totals.rows.find((row) => row.state === 'pending')?.count || 0);
-  out.reviewTotal = Number(totals.rows.find((row) => row.state === 'review')?.count || 0);
+  out.reviewTotal = Number(totals.rows.find((row) => row.state === 'review')?.count || 0) + await shadowReviewCount(pool);
   return out;
+}
+
+export const MAX_POST_ATTEMPTS = 10;
+
+// The CRM marker a sale's own payment row carries once it is in the CRM (the loop's rows, the office
+// rows, and the hand rows the 24 Sep link pass tagged). Anchored, as everywhere else in this file.
+const SALE_IN_CRM = `(EXISTS (SELECT 1 FROM core_payment WHERE notes ~ ('(^|[[:space:]])nmi:' || p.transaction_id || '($|[[:space:]])'))
+  OR EXISTS (SELECT 1 FROM core_jrmhotelpayment WHERE reference ~ ('(^|[[:space:]])nmi:' || p.transaction_id || '($|[[:space:]])')))`;
+
+/**
+ * SHADOW-ERA ROWS THAT STILL WAIT (audit #73, 25 Sep): a sale observed before the flip to live whose
+ * would-be action was review (an open-amount sale, a sale with no booking, a portal refund) was never
+ * moved on, so no count and no list showed it. It waits until its sale is in the CRM (a row carrying
+ * nmi:<txn>). Reads only. A CRM without the payment tables (tests) counts every such row.
+ */
+async function shadowReviewCount(pool) {
+  try {
+    const r = await pool.query(`SELECT COUNT(*)::integer AS n FROM nesher_money_payment_posts p
+      WHERE p.state = 'shadow' AND p.would_action = 'review' AND NOT ${SALE_IN_CRM}`);
+    return Number(r.rows?.[0]?.n || 0);
+  } catch {
+    try {
+      const r = await pool.query(`SELECT COUNT(*)::integer AS n FROM nesher_money_payment_posts WHERE state = 'shadow' AND would_action = 'review'`);
+      return Number(r.rows?.[0]?.n || 0);
+    } catch { return 0; }
+  }
 }
 
 /** Staff-only callers may inspect the reason a confirmed payment is still open. */
@@ -178,9 +228,129 @@ export async function listPaymentPostExceptions({ pool, limit = 100 }) {
   await ensureTable(pool);
   const out = await pool.query(`SELECT transaction_id, invoice_number, amount_cents, currency,
     brand, paid_at, state, reason, attempts, created_at, updated_at
-    FROM nesher_money_payment_posts WHERE state IN ('pending', 'review')
+    FROM nesher_money_payment_posts WHERE state IN ('pending', 'review') OR (state = 'shadow' AND would_action = 'review')
     ORDER BY created_at, transaction_id LIMIT $1`, [Math.min(200, Math.max(1, Math.floor(Number(limit) || 100)))]);
   return out.rows;
+}
+
+// ── what waits on a person (audit #27, 25 Sep) ─────────────────────────────
+// Plain words per reason: what happened + what to do. Never a card digit, never a customer name.
+// Gabbai 25 Sep D2: every line that tells a person to enter, take off or delete something says to CHECK
+// first - the loop cannot see what staff already did by hand. Pinned by a table scan in the tests.
+export const REVIEW_WORDS = Object.freeze({
+  no_crm_reference: "A card payment came in with no booking on it. Find its booking and enter it there, if it is not already there.",
+  booking_not_found: "A card payment names a booking the CRM cannot find. Find the right booking and enter it there, if it is not already there.",
+  request_not_found: "A card payment names a hotel request the CRM cannot find. Find the right request and enter it there, if it is not already there.",
+  manual_payment_requires_review: "A card payment matches a payment already typed on the booking. If it is the same money, nothing to enter; if it is not, enter it.",
+  sale_voided: "A card sale was voided at the processor, so no money came in. If the booking shows it as paid, take it off.",
+  sale_voided_before_posting: "A card sale was voided before it reached the CRM, so no money came in. Nothing to enter; if the booking shows it as paid, take it off.",
+  refund_voided: "A refund was started and then voided at the processor, so no money moved. Nothing to change.",
+  reversal_requires_review: "Money went back to a card outside the desk chat. If the booking still shows that money as paid, take it off.",
+  refund_outside_chat: "A refund was sent in the processor's portal for a sale the CRM did not record automatically. If the booking still shows the full amount, take the refund off it.",
+  reversal_retry_requires_review: "A refund or void could not be written to the CRM. If the booking does not show it yet, take it off by hand.",
+  sale_not_in_crm: "A refund or void is for a sale the CRM did not record automatically. If the booking shows that sale, adjust it by hand.",
+  sale_on_two_crm_rows: "A refund or void matches two payment rows. Check which one it belongs to, and if it is not already off, take it off that one only.",
+  crm_write_keeps_failing: "The CRM kept refusing this card payment. If the booking does not show it, enter it by hand.",
+  hand_row_after_auto_post: "A card payment the CRM recorded automatically also has a hand-typed payment of the same amount. If it is the same money, delete the hand-typed copy.",
+  flight_link_not_wired: "A flight pay link was paid. If the flight request does not show it, enter it there.",
+  brand_mismatch: "A card payment ran on the other company's merchant. Check which booking it belongs to, and enter it there if it is not already there.",
+  invoice_amount_mismatch: "A pay link was paid a different amount than it asked for. If the booking does not show what came in, enter it.",
+  invoice_transaction_conflict: "A pay link shows two card payments. Check the booking; if the second one is a duplicate charge, it needs a refund.",
+  legacy_transaction_conflict: "This card payment is already recorded on another booking. Do not enter it twice; check which booking is right.",
+  hotel_offer_mismatch: "A card payment names a hotel offer from another request. Check which request it belongs to, and enter it there if it is not already there.",
+  transaction_conflict: "The same card transaction came in with different facts. Check the booking before entering anything.",
+  review: "A card payment could not be recorded in the CRM by itself. Check the booking, and enter it if it is not already there.",
+  crm_write_pending: "A card payment is still being written to the CRM automatically. Do not enter it by hand while it shows here.",
+  before_live: "A card payment from before the automatic recording has no booking in the CRM. Check whether it was typed in by hand; if not, enter it.",
+});
+// Gabbai 25 Sep D1: loop-review `reason` is a code from a closed set, never ledger free text.
+export function reasonCode(reason) {
+  const r = String(reason || "");
+  if (/reservations match code/.test(r)) return "booking_not_found";
+  if (/not found/.test(r)) return "request_not_found";
+  if (Object.prototype.hasOwnProperty.call(REVIEW_WORDS, r)) return r;
+  return "review";
+}
+function wordsFor(code, state) {
+  if (state === "pending") return REVIEW_WORDS.crm_write_pending;
+  if (state === "shadow" && (code === "no_crm_reference" || code === "review")) return REVIEW_WORDS.before_live;
+  return REVIEW_WORDS[code] || REVIEW_WORDS.review;
+}
+function bookingOf(ref) {
+  const s = String(ref || "").trim().toUpperCase();
+  return /^(?:RES-[A-Z0-9_-]{1,40}|JRM-1[0-9]{1,12}(?:-O[0-9]{1,12})?|FLY-[A-Z0-9_-]{1,40})$/.test(s) && !/^RES-CARD-/.test(s) ? s : null;
+}
+
+/**
+ * THE LOOP-REVIEW LIST (read only; GET /__money_hop/loop-review behind the hop signature). Everything
+ * the collection loop could not close by itself, newest first:
+ *   - ledger rows in review (live) whose sale is not in the CRM,
+ *   - shadow-era rows whose would-be action was review and whose sale is not in the CRM (#73),
+ *   - pending rows older than 30 minutes (the CRM has not taken them yet),
+ *   - a loop-posted sale that was ALSO typed in by hand afterwards (#28) - computed live, so deleting
+ *     the hand copy clears it.
+ * `count` = all of them; `items` = at most 20. No card digits, no names, no transaction id.
+ */
+export async function loopReview({ pool, limit = 20, now = new Date() }) {
+  await ensureTable(pool);
+  const cap = Math.min(20, Math.max(1, Math.floor(Number(limit) || 20)));
+  const rows = [];
+  let marker = true;
+  let ledger;
+  try {
+    ledger = await pool.query(`SELECT p.transaction_id, p.invoice_number, p.amount_cents, p.currency, p.brand, p.state, p.reason, p.kind,
+        p.paid_at, p.created_at, p.updated_at FROM nesher_money_payment_posts p
+      WHERE ((p.state = 'review' OR (p.state = 'shadow' AND p.would_action = 'review')) AND (p.kind = 'refund' OR NOT ${SALE_IN_CRM}))
+         OR (p.state = 'pending' AND p.created_at < $1::timestamptz)
+      ORDER BY p.created_at DESC`, [new Date(now.getTime() - 30 * 60000).toISOString()]);
+  } catch {
+    marker = false;
+    ledger = await pool.query(`SELECT transaction_id, invoice_number, amount_cents, currency, brand, state, reason, kind, paid_at, created_at, updated_at
+      FROM nesher_money_payment_posts
+      WHERE state = 'review' OR (state = 'shadow' AND would_action = 'review') OR (state = 'pending' AND created_at < $1::timestamptz)
+      ORDER BY created_at DESC`, [new Date(now.getTime() - 30 * 60000).toISOString()]);
+  }
+  for (const r of ledger.rows || []) {
+    // at = when the money moved (the sale), not when the ledger first saw it
+    rows.push({ at: new Date(r.paid_at || r.created_at).toISOString(), brand: r.brand === "jrm" || r.brand === "nesher" ? r.brand : null,
+      amount_cents: Number(r.amount_cents), currency: "USD", booking: bookingOf(r.invoice_number),
+      reason: r.state === "pending" ? "crm_write_pending" : r.state === "shadow" ? `before_live_${reasonCode(r.reason)}` : reasonCode(r.reason),
+      words: wordsFor(reasonCode(r.reason), r.state) });
+  }
+  if (marker) {
+    try {
+      for (const d of await handRowsAfterAutoPost(pool)) rows.push(d);
+    } catch { /* a failed read never hides the ledger half */ }
+  }
+  rows.sort((a, b) => (a.at < b.at ? 1 : a.at > b.at ? -1 : 0));
+  return { ok: true, as_of: now.toISOString(), count: rows.length, items: rows.slice(0, cap) };
+}
+
+/** Audit #28: a sale the loop posted (state posted, last 30 days) whose booking ALSO carries a later
+ *  hand-typed row of the same amount with no marker. Reads only. */
+async function handRowsAfterAutoPost(pool) {
+  const posted = (await pool.query(`SELECT transaction_id, invoice_number, amount_cents, brand, posted_at
+    FROM nesher_money_payment_posts WHERE state = 'posted' AND kind = 'sale' AND posted_at > NOW() - INTERVAL '30 days'`)).rows || [];
+  const out = [];
+  for (const p of posted) {
+    const re = `(^|[[:space:]])nmi:${p.transaction_id}($|[[:space:]])`;
+    const res = (await pool.query(`SELECT id, reservation_id, amount FROM core_payment WHERE notes ~ $1 ORDER BY id LIMIT 1`, [re])).rows[0];
+    let hit = null;
+    if (res) {
+      hit = (await pool.query(`SELECT id, created_at FROM core_payment WHERE reservation_id = $1 AND id > $2 AND ABS(amount - $3) < 0.01
+        AND COALESCE(notes, '') !~ '(mercury|nmi|nmi-void|nmi-refund):[A-Za-z0-9_-]+' ORDER BY id LIMIT 1`, [res.reservation_id, res.id, res.amount])).rows[0];
+    } else {
+      const hot = (await pool.query(`SELECT id, request_id, amount FROM core_jrmhotelpayment WHERE reference ~ $1 ORDER BY id LIMIT 1`, [re])).rows[0];
+      if (hot) {
+        hit = (await pool.query(`SELECT id, created_at FROM core_jrmhotelpayment WHERE request_id = $1 AND id > $2 AND ABS(amount - $3) < 0.01
+          AND COALESCE(reference, '') !~ '(mercury|nmi|nmi-void|nmi-refund):[A-Za-z0-9_-]+' ORDER BY id LIMIT 1`, [hot.request_id, hot.id, hot.amount])).rows[0];
+      }
+    }
+    if (hit) out.push({ at: new Date(hit.created_at || p.posted_at).toISOString(), brand: p.brand === "jrm" || p.brand === "nesher" ? p.brand : null,
+      amount_cents: Number(p.amount_cents), currency: "USD", booking: bookingOf(p.invoice_number),
+      reason: "hand_row_after_auto_post", words: REVIEW_WORDS.hand_row_after_auto_post });
+  }
+  return out;
 }
 
 /**
@@ -196,13 +366,15 @@ export async function recordPaymentException({ pool, invoiceNumber, amountUsd, t
   await ensureTable(pool);
   const why = String(reason || 'review_required').slice(0, 80);
   const p = cleanPath(path);
-  await pool.query(`INSERT INTO nesher_money_payment_posts
+  const ins = await pool.query(`INSERT INTO nesher_money_payment_posts
     (transaction_id, invoice_number, amount_cents, brand, paid_at, state, reason, first_path, paths, card_last4, rep, kind)
     VALUES ($1, $2, $3, $4, $5, 'review', $6, $7, CASE WHEN $7::text IS NULL THEN '{}'::text[] ELSE ARRAY[$7::text] END, $8, $9, $10)
-    ON CONFLICT (transaction_id) DO UPDATE SET seen_count = nesher_money_payment_posts.seen_count + 1, updated_at = NOW()`,
+    ON CONFLICT (transaction_id) DO UPDATE SET seen_count = nesher_money_payment_posts.seen_count + 1, updated_at = NOW()
+    RETURNING (xmax = 0) AS inserted`,
     [v.txn, v.ref, v.cents, brand, v.when.toISOString(), why, p, cleanLast4(cardLast4), cleanRep(rep), cleanKind(kind)]);
   const row = (await pool.query(`SELECT state, reason FROM nesher_money_payment_posts WHERE transaction_id = $1`, [v.txn])).rows[0];
-  return { ok: false, durable: Boolean(row), state: row?.state || null, needsReview: true, errors: [row?.reason || why] };
+  // inserted = the first sight of this transaction (audit #142: health tells new exceptions from re-sightings)
+  return { ok: false, durable: Boolean(row), inserted: ins?.rows?.[0]?.inserted === true, state: row?.state || null, needsReview: true, errors: [row?.reason || why] };
 }
 
 // ── shadow ───────────────────────────────────────────────────────────────────

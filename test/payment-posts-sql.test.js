@@ -245,7 +245,10 @@ describe("confirmed NMI payment SQL integration", () => {
     assert.equal(hotelConflict.needsReview, true);
     assert.deepEqual(hotelConflict.errors, ["legacy_transaction_conflict"]);
     assert.equal((await pool.query("SELECT id FROM core_jrmhotelpayment WHERE request_id = 42")).rows.length, 1);
-    assert.equal((await pool.query("SELECT id FROM core_jrmhotelnote WHERE request_id = 42")).rows.length, 0);
+    // Audit #75 (25 Sep): the review leaves exactly ONE staff note saying it was NOT recorded (it used to leave none).
+    const hotelNotes = (await pool.query("SELECT note FROM core_jrmhotelnote WHERE request_id = 42")).rows;
+    assert.equal(hotelNotes.length, 1);
+    assert.match(hotelNotes[0].note, /is already recorded on another booking in the CRM, so it was NOT added here\. Do not enter it twice/);
     assert.equal((await row("SELECT state, reason FROM nesher_money_payment_posts WHERE transaction_id = $1", ["legacy_hotel"])).state, "review");
   });
 
@@ -258,7 +261,10 @@ describe("confirmed NMI payment SQL integration", () => {
     assert.equal(out.needsReview, true);
     assert.deepEqual(out.errors, ["hotel_offer_mismatch"]);
     assert.equal((await pool.query("SELECT id FROM core_jrmhotelpayment WHERE request_id = 42")).rows.length, 0);
-    assert.equal((await pool.query("SELECT id FROM core_jrmhotelnote WHERE request_id = 42")).rows.length, 0);
+    // Audit #75: one staff note, no payment row.
+    const offerNotes = (await pool.query("SELECT note FROM core_jrmhotelnote WHERE request_id = 42")).rows;
+    assert.equal(offerNotes.length, 1);
+    assert.match(offerNotes[0].note, /received and NOT recorded automatically: the hotel offer belongs to another request/);
     assert.deepEqual(
       await row("SELECT state, reason FROM nesher_money_payment_posts WHERE transaction_id = $1", ["nmi_bad_offer"]),
       { state: "review", reason: "hotel_offer_mismatch" },
