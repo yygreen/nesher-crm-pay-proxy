@@ -147,7 +147,11 @@ export function saleExtras(xml, nameNeedle = "") {
       const hay = ` ${[mdfText(head, "first_name"), mdfText(head, "last_name"), mdfText(head, "company")].join(" ").toLowerCase()} `;
       nameHit = needle.split(" ").every((w) => w.length >= 2 && hay.includes(w));
     }
-    out.set(id, { last4: m ? m[1] : null, nameHit });
+    // 25 Sep evening (Joseph: receipts print the approval code): the processor's authorization_code, only when it is
+    // a code - 2-12 letters/digits and not 7+ digits (never a card-shaped run). The phone reader applies the same guard.
+    const code = mdfText(head, "authorization_code");
+    const authCode = /^[A-Za-z0-9]{2,12}$/.test(code) && !/^\d{7,}$/.test(code) ? code : null;
+    out.set(id, { last4: m ? m[1] : null, nameHit, authCode });
   }
   return out;
 }
@@ -173,7 +177,7 @@ export function salesFromXml(xml, { nameNeedle = "", nowMs = Date.now() } = {}) 
   const extras = saleExtras(xml, nameNeedle);
   const back = new Map();
   const lastBack = new Map();
-  const noteBack = (id, at, cents) => { const p = lastBack.get(id); if (at != null && (!p || at > p.at)) lastBack.set(id, { at, cents }); };
+  const noteBack = (id, at, cents, txn = null) => { const p = lastBack.get(id); if (at != null && (!p || at > p.at)) lastBack.set(id, { at, cents, txn }); };
   let dayBackCents = 0;
   for (const t of txns) {
     const c = classifyTransaction(t);
@@ -187,7 +191,7 @@ export function salesFromXml(xml, { nameNeedle = "", nowMs = Date.now() } = {}) 
       if ((a.type === "refund" || a.type === "credit") && a.at != null && nowMs - a.at < DAY_MS) dayBackCents += Math.round(Math.abs(a.amount) * 100);
     }
     if (c.voided && c.kind === "sale" && c.voidAt != null && nowMs - c.voidAt < DAY_MS) dayBackCents += Math.round(c.amount * 100);
-    if (c.kind === "refund" && t.originalId && !refundVoided) { back.set(t.originalId, (back.get(t.originalId) || 0) + Math.round(c.amount * 100)); noteBack(t.originalId, c.at, Math.round(c.amount * 100)); }
+    if (c.kind === "refund" && t.originalId && !refundVoided) { back.set(t.originalId, (back.get(t.originalId) || 0) + Math.round(c.amount * 100)); noteBack(t.originalId, c.at, Math.round(c.amount * 100), t.id); }
     if (c.kind === "sale") {
       const ownActs = t.actions.filter((a) => a.success && (a.type === "refund" || a.type === "credit"));
       const own = ownActs.reduce((s, a) => s + Math.round(Math.abs(a.amount) * 100), 0);
@@ -210,7 +214,7 @@ export function salesFromXml(xml, { nameNeedle = "", nowMs = Date.now() } = {}) 
     else if (settled) why = "fully_refunded";
     else if (pending && refundedCents === 0) action = "void";
     else why = `condition_${t.condition || "unknown"}`;
-    const ex = extras.get(t.id) || { last4: null, nameHit: false };
+    const ex = extras.get(t.id) || { last4: null, nameHit: false, authCode: null };
     sales.push({
       txn_id: t.id,
       merchant: NMI_PROCESSOR_BRAND[t.processorId] || null,
@@ -221,6 +225,10 @@ export function salesFromXml(xml, { nameNeedle = "", nowMs = Date.now() } = {}) 
       refunded_cents: refundedCents,
       last_back_at: lastBack.get(t.id) ? new Date(lastBack.get(t.id).at).toISOString() : null,
       last_back_cents: lastBack.get(t.id) ? lastBack.get(t.id).cents : 0,
+      // the refund reference the phone prints on a refund confirmation: the id of the entry last_back_at names
+      // (null when that entry was a refund action on the sale itself, which has no transaction of its own)
+      last_back_txn: lastBack.get(t.id) && /^[A-Za-z0-9_-]{4,40}$/.test(String(lastBack.get(t.id).txn || "")) ? String(lastBack.get(t.id).txn) : null,
+      auth_code: ex.authCode || null,
       refundable_cents: action === "refund" ? amountCents - refundedCents : 0,
       voidable_cents: action === "void" ? amountCents : 0,
       settled,

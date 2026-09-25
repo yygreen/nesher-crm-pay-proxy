@@ -27,7 +27,7 @@ import { queryNmiRange, nmiDateMs, NMI_PROCESSOR_BRAND } from "./nmi-recovery.js
 import { parseInvoiceNumber } from "./payments-sync.js";
 import { leftoverLoopOn } from "./payments-sync.js"; // the leftover lane's kill switch (one home: payments-sync)
 
-export const MONEY_MAP_BUILD = "2026-09-25-map-paid-day";
+export const MONEY_MAP_BUILD = "2026-09-25-map-f4";
 export const MONEY_MAP_PATH = "/money-map";
 export const MONEY_MAP_TZ = "Asia/Jerusalem";
 // Ids and brands come from the ONE table (nmi-recovery.js NMI_PROCESSOR_BRAND); here only the
@@ -452,7 +452,19 @@ export async function loadCrm(pool, period, refs) {
       mercuryPaid.push(...(await q(`SELECT substring(transaction_id from 9) AS invoice_id, paid_at
                                      FROM nesher_money_payment_posts WHERE left(transaction_id, 8) = 'mercury_'`)).map((r) => ({ ...r, source: "ledger" })));
     }
-    return { nesherInPeriod, reservations, nesherAll, jrmInPeriod, jrmAll, offers, requests, refundRows, mercuryPaid };
+    // F4 (Gabbai s.8 (b)): the card payments (anchored nmi: marker) on the bookings of the paid Mercury invoices, so a
+    // Mercury invoice marked PAID after a card payment of the same amount is not counted as money a second time.
+    const mres = [...new Set(((refs && refs.mercury && refs.mercury.res) || []).map((c) => String(c).toUpperCase()))];
+    const mjrm = [...new Set(((refs && refs.mercury && refs.mercury.jrm) || []).map(String))];
+    const mercuryCardRows = [
+      ...(mres.length ? (await q(`SELECT 'RES-' || UPPER(regexp_replace(r.reservation_code, '[^A-Za-z0-9_-]', '', 'g')) AS ref, p.amount::float8 AS amount
+            FROM core_payment p JOIN core_reservation r ON r.id = p.reservation_id
+           WHERE UPPER(regexp_replace(r.reservation_code, '[^A-Za-z0-9_-]', '', 'g')) = ANY($1::text[])
+             AND COALESCE(p.notes, '') ~ '(^|[[:space:]])nmi:[A-Za-z0-9_-]+($|[[:space:]])'`, [mres])) : []),
+      ...(mjrm.length ? (await q(`SELECT 'JRM-1' || request_id::text AS ref, amount::float8 AS amount FROM core_jrmhotelpayment
+           WHERE request_id = ANY($1::bigint[]) AND COALESCE(reference, '') ~ '(^|[[:space:]])nmi:[A-Za-z0-9_-]+($|[[:space:]])'`, [mjrm])) : []),
+    ];
+    return { nesherInPeriod, reservations, nesherAll, jrmInPeriod, jrmAll, offers, requests, refundRows, mercuryPaid, mercuryCardRows };
   } finally {
     try { await client.query("ROLLBACK"); } catch { /* nothing was written */ }
     if (client !== pool && typeof client.release === "function") client.release();
@@ -724,13 +736,35 @@ export function buildMoneyMap({ period, nowMs, nmi, bank, invoices, crm, sources
       .map((inv) => ({ inv, ms: paidMs(inv), amt: Number(inv.amount) || 0, bySent: !paidDay.has(String(inv.id)),
         byLedger: paidDay.has(String(inv.id)) && paidDay.get(String(inv.id)).source === "ledger" }));
     const fits = (p, x) => x.createdMs >= p.ms - 86400000 && x.createdMs <= p.ms + 10 * 86400000 && x.amount <= p.amt + CENT && x.amount >= 0.9 * p.amt;
+    // F4 (switch on): money counted once. A paid invoice waiting for a person (its ledger review row) is not
+    // confirmed money; one with no CRM record whose booking has a card payment of the same amount is that card
+    // payment marked PAID in Mercury (the #74 note) - already in the card figures. Both are shown apart.
+    const cardRows = (dateBySync && crm && crm.mercuryCardRows) || [];
+    const refKey = (n) => { const r = refOf(n); return r ? (r.brand === "jrm" ? r.label : "RES-" + String(r.code).toUpperCase()) : null; };
+    const apart = (p) => {
+      if (!dateBySync) return null;
+      if (p.byLedger) return "held_for_person";
+      if (!p.bySent) return null;
+      const k = refKey(p.inv.invoiceNumber);
+      return k && cardRows.some((c) => c.ref === k && Math.abs(Number(c.amount) - p.amt) < 0.01) ? "marked_paid_after_card" : null;
+    };
+    const kept = { held_for_person: { n: 0, amt: 0 }, marked_paid_after_card: { n: 0, amt: 0 } };
+    for (const p of paid) p.apart = apart(p);
     for (const p of paid) {
       const brand = refOf(p.inv.invoiceNumber)?.brand === "jrm" ? "jrm" : "nesher";
       const I = out.brands[brand].mercury_invoices;
+      if (p.apart) {
+        const A = (I[p.apart] ||= { count: 0, amount: 0 });
+        A.count++;
+        A.amount = r2(A.amount + p.amt);
+        kept[p.apart].n++;
+        kept[p.apart].amt += p.amt;
+        continue;
+      }
       I.paid += p.amt;
       I.count++;
       const cands = credits.filter((x) => fits(p, x));
-      const rivals = cands.length === 1 ? paid.filter((q) => fits(q, cands[0])) : [];
+      const rivals = cands.length === 1 ? paid.filter((q) => !q.apart && fits(q, cands[0])) : [];
       if (cands.length === 1 && rivals.length === 1) {
         I.fee_inferred += p.amt - cands[0].amount;
         I.fee_inferred_items.push({ invoice: p.inv.invoiceNumber || null, invoice_amount: r2(p.amt), credit_amount: r2(cands[0].amount), label: `inferred: invoice ${r2(p.amt)} less bank credit ${r2(cands[0].amount)}` });
@@ -741,7 +775,8 @@ export function buildMoneyMap({ period, nowMs, nmi, bank, invoices, crm, sources
     const byLedger = paid.filter((p) => p.byLedger).length;
     if (dateBySync) notes.push(crm
       ? "A Mercury invoice is dated by the day on the payment the CRM recorded for it, or on its review row while it waits for a person; Mercury itself gives no paid date."
-        + (byLedger ? ` ${byLedger} paid invoice(s) wait for a person and are not in the CRM; dated by when our sync first saw them paid.` : "")
+        + (byLedger ? ` ${byLedger} paid invoice(s) ($${r2(kept.held_for_person.amt)}) wait for a person and are not counted until the CRM records them (held_for_person); dated by when our sync first saw them paid.` : "")
+        + (kept.marked_paid_after_card.n ? ` ${kept.marked_paid_after_card.n} invoice(s) ($${r2(kept.marked_paid_after_card.amt)}) were marked paid on a booking whose card payment of the same amount is already counted - not counted again (marked_paid_after_card).` : "")
         + (bySent ? ` ${bySent} paid invoice(s) with no CRM record are dated by when they were sent.` : "")
       : "A Mercury invoice is dated by when it was sent: the CRM could not be read, and Mercury itself gives no paid date.");
   } else notes.push("Mercury invoices could not be read (" + (sources.invoices?.error || "unknown") + ").");
@@ -1058,10 +1093,16 @@ export function createMoneyMap(opts = {}) {
       return { data: null, meta: { ok: false, error: "invoices_read_failed" } };
     }
   }
-  async function sourceCrm(period, nmi) {
+  async function sourceCrm(period, nmi, invoices) {
     const pool = getPool();
     if (!pool) return { data: null, meta: { ok: false, error: "not_configured" } };
-    const refs = { res: [], jrm: [] };
+    const refs = { res: [], jrm: [], mercury: { res: [], jrm: [] } };
+    for (const inv of invoices || []) {
+      if (String(inv && inv.status) !== "Paid") continue;
+      const ref = refOf(inv.invoiceNumber);
+      if (ref && ref.brand === "nesher") refs.mercury.res.push(ref.code);
+      if (ref && ref.brand === "jrm") refs.mercury.jrm.push(ref.requestId);
+    }
     for (const t of nmi || []) {
       const ref = refOf(t.orderId);
       if (ref && ref.brand === "nesher") refs.res.push(ref.code);
@@ -1083,7 +1124,7 @@ export function createMoneyMap(opts = {}) {
     const hit = cache.get(key);
     if (hit && nowMs - hit.at < cacheMs) { stats.cache_hits++; return { status: 200, body: { ...hit.body, cached: true } }; }
     const [nmi, bank, inv] = await Promise.all([sourceNmi(period, nowMs), sourceBank(period, nowMs), sourceInvoices()]);
-    const crm = await sourceCrm(period, nmi.data);
+    const crm = await sourceCrm(period, nmi.data, inv.data);
     const sources = { nmi: nmi.meta, mercury: bank.meta, invoices: inv.meta, crm: crm.meta };
     if (!nmi.data && !bank.data && !inv.data && !crm.data) return { status: 503, body: { ok: false, error: "no_source_available", sources } };
     const body = buildMoneyMap({ period, nowMs, nmi: nmi.data, bank: bank.data, invoices: inv.data, crm: crm.data, sources });

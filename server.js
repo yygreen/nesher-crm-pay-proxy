@@ -1585,7 +1585,7 @@ const server = http.createServer(async (req, res) => {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-09-25-leftover-loop",
+      build: "2026-09-25-money-sat",
       instance: INSTANCE_ID,
       snapEngage: {
         enabled: SNAPENGAGE_ENABLED,

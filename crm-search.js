@@ -17,7 +17,7 @@
 // Nesher (flights) and JRM (hotels) come back in two separate blocks and are never summed together.
 
 export const CRM_SEARCH_PATH = "/crm-search";
-export const CRM_SEARCH_BUILD = "2026-09-24-crm-search";
+export const CRM_SEARCH_BUILD = "2026-09-25-crm-balance";
 const LIMIT = 8;             // travellers, refunds, JRM requests
 const CUSTOMER_LIMIT = 8;
 const BOOKING_LIMIT = 40;
@@ -28,6 +28,32 @@ export function isReadOnlySql(sql) {
   if (String(sql).trim() === "SET LOCAL statement_timeout = '6s'") return true;
   return /^\s*(SELECT|WITH|BEGIN READ ONLY|ROLLBACK)\b/i.test(sql) && !/\b(INSERT|UPDATE|DELETE|ALTER|DROP|CREATE|TRUNCATE|GRANT|COPY|SET)\b/i.test(sql.replace(/'[^']*'/g, ""));
 }
+
+/**
+ * THE CRM'S OWN BALANCE (25 Sep evening; the phone's "Use $X" may offer an amount only from a complete source).
+ * Reservation.remaining_balance in the CRM (core/models.py, live 25 Sep) = net_customer_total - total_paid:
+ *   total_customer_price = (per_traveler: the trip rows' customer prices when they sum above 0, else the travellers')
+ *                          or (total mode: Reservation.customer_price) + the service rows' customer prices;
+ *   - refunds to the customer (core_refund.amount_to_customer);
+ *   - total_paid = legacy payments not copied into the ledger + ledger applications + active sponsorships
+ *                  (applied_amount, else amount).
+ * Proved equal to the CRM's own property on all 335 live reservations (25 Sep, read only); the naive
+ * price-minus-paid was wrong on 41 of them. One text, used here and by the drift proof.
+ */
+export const REMAINING_BALANCE_SQL = `SELECT r.id,
+  ( CASE WHEN r.pricing_mode = 'per_traveler' THEN
+      CASE WHEN COALESCE((SELECT SUM(j.customer_price) FROM core_journey j WHERE j.reservation_id = r.id AND j.line_type = 'trip'), 0) > 0
+           THEN (SELECT SUM(j.customer_price) FROM core_journey j WHERE j.reservation_id = r.id AND j.line_type = 'trip')
+           ELSE COALESCE((SELECT SUM(t.customer_price) FROM core_traveler t WHERE t.reservation_id = r.id), 0) END
+    ELSE COALESCE(r.customer_price, 0) END
+    + COALESCE((SELECT SUM(j.customer_price) FROM core_journey j WHERE j.reservation_id = r.id AND j.line_type = 'service'), 0)
+    - COALESCE((SELECT SUM(f.amount_to_customer) FROM core_refund f WHERE f.reservation_id = r.id), 0)
+    - COALESCE((SELECT SUM(p.amount) FROM core_payment p WHERE p.reservation_id = r.id
+        AND NOT EXISTS (SELECT 1 FROM core_customerpaymentapplication a WHERE a.legacy_payment_id = p.id)), 0)
+    - COALESCE((SELECT SUM(a.amount) FROM core_customerpaymentapplication a WHERE a.reservation_id = r.id), 0)
+    - COALESCE((SELECT SUM(COALESCE(s.applied_amount, s.amount)) FROM core_organizationsponsorship s WHERE s.reservation_id = r.id AND s.is_active), 0)
+  )::text AS remaining_balance
+  FROM core_reservation r WHERE r.id = ANY($1::bigint[])`;
 
 /** Any run of 13+ digits (a card is 13-19; a phone is at most 12 here) (spaces or dashes between them allowed) keeps only its last four. */
 export function maskDigits(v) {
@@ -160,7 +186,19 @@ export async function searchCrm(pool, query) {
             ORDER BY p.payment_date DESC LIMIT ${PAY_LIMIT + 1}`,
           [reqIds, from, to])
       : [];
-    return { customers, travelers, reservations, payments, customerPayments, refunds, hotelRequests, hotelPayments };
+    // The CRM's own balance per booking. Read LAST: if it fails (a renamed table), every other list is already
+    // read; the balance is then null (the phone asks, it never guesses) and the failure is counted.
+    let balances = new Map();
+    let balancesOk = true;
+    if (resIds.length) {
+      try {
+        for (const b of await q(REMAINING_BALANCE_SQL, [resIds])) balances.set(String(b.id), b.remaining_balance);
+      } catch {
+        balances = new Map();
+        balancesOk = false;
+      }
+    }
+    return { customers, travelers, reservations, payments, customerPayments, refunds, hotelRequests, hotelPayments, balances, balancesOk };
   } finally {
     try { await client.query("ROLLBACK"); } catch { /* nothing was written */ }
     if (client !== pool && typeof client.release === "function") client.release();
@@ -196,8 +234,10 @@ export function shape(query, rows) {
   for (const c of cust.items) group(c.id, c.full_name, { email: m(c.email), phone: m(c.phone), since: day(c.created_at), matched: "customer" });
   for (const r of res.items) {
     const g = group(r.customer_id, r.customer, { matched: "booking" });
+    const own = rows.balances && rows.balances.has(String(r.id)) ? num(rows.balances.get(String(r.id))) : null;
     g.bookings.push({ booking: m(r.reservation_code), created_on: day(r.created_at), price_usd: num(r.customer_price), paid_usd: num(r.amount_paid),
       balance_usd: r.customer_price != null && r.amount_paid != null ? num(Number(r.customer_price) - Number(r.amount_paid)) : null,
+      remaining_balance_usd: own,
       closed: r.is_closed === true, review: r.review_status || null, points: r.booked_with_points === true, agent: m(r.agent_name) || null });
   }
   for (const p of pay.items) group(p.customer_id, null, {}).payments.push({ booking: m(p.reservation_code), amount_usd: num(p.amount), method: p.method || null, paid_on: day(p.paid_at), processor_txn: p.nmi_txn || null });
@@ -226,6 +266,9 @@ export function shape(query, rows) {
   if (ambiguous) notes.push("AMBIGUOUS: more than one person matched - name them and ask which one; never add their money together.");
   if (anyCut) notes.push("TRUNCATED: a list hit its cap (see truncated) - a total over it is 'at least', never exact.");
   notes.push("payments_total_usd is one person's booking payments listed here; customer_level_payments may repeat money already in payments.");
+  notes.push(rows.balancesOk === false
+    ? "remaining_balance_usd could not be read - never offer an amount from balance_usd; ask for it."
+    : "remaining_balance_usd is the CRM's own balance (price + services - refunds to the customer - payments - ledger applications - active sponsorships), the same rule as the booking page. balance_usd is price minus amount paid only - never offer it as an amount.");
   return {
     ok: true,
     build: CRM_SEARCH_BUILD,
@@ -242,7 +285,7 @@ export function shape(query, rows) {
 export const MAX_INFLIGHT = 2;
 export function createCrmSearch(opts = {}) {
   const getPool = opts.getPool || (() => null);
-  const stats = { calls: 0, errors: 0, busy: 0, last_ms: null, last_at: null };
+  const stats = { calls: 0, errors: 0, busy: 0, balance_errors: 0, last_ms: null, last_at: null };
   let inflight = 0;
   async function answer(params) {
     const t0 = Date.now();
@@ -255,6 +298,7 @@ export function createCrmSearch(opts = {}) {
     inflight++;
     try {
       const rows = await searchCrm(pool, query);
+      if (rows.balancesOk === false) stats.balance_errors++;
       stats.last_ms = Date.now() - t0;
       stats.last_at = new Date().toISOString();
       return { status: 200, body: shape(query, rows) };

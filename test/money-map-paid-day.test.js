@@ -92,8 +92,11 @@ describe("#150 a Mercury invoice is dated by the payment the CRM recorded for it
     const m = buildMoneyMap({ period, nowMs: NOW, nmi: parseNmiTransactions("<nm_response></nm_response>"), bank: [],
       invoices: [{ id: "inv-held", invoiceNumber: "RES-A3L4RS", status: "Paid", amount: 300, updatedAt: "2026-08-01T10:00:00Z" }], crm,
       sources: { nmi: { ok: true }, mercury: { ok: true }, invoices: { ok: true }, crm: { ok: true } } });
-    assert.equal(m.brands.nesher.mercury_invoices.paid, 300);
-    assert.ok(m.notes.some((n) => /1 paid invoice\(s\) wait for a person and are not in the CRM; dated by when our sync first saw them paid/.test(n)), m.notes.join(" | "));
+    // F4 (25 Sep evening, a deliberate requirement change): an invoice waiting for a person is not confirmed money -
+    // shown apart as held_for_person, not counted in paid or the confirmed total
+    assert.equal(m.brands.nesher.mercury_invoices.paid, 0);
+    assert.deepEqual(m.brands.nesher.mercury_invoices.held_for_person, { count: 1, amount: 300 });
+    assert.ok(m.notes.some((n) => /1 paid invoice\(s\) \(\$300\) wait for a person and are not counted until the CRM records them \(held_for_person\); dated by when our sync first saw them paid/.test(n)), m.notes.join(" | "));
   });
 
   it("an invoice with no CRM record keeps the day it was sent, and the notes say so; an unreadable CRM says so too", () => {
