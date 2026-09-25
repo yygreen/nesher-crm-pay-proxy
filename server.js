@@ -92,6 +92,11 @@ import {
 import { injectPublicHomeUi } from "./public-ui.js";
 import { injectStatusExtra, handleStatusPost, STATUS_POST_RE } from "./status-extra.js";
 import { injectNeedsAxis } from "./needs-axis.js";
+import {
+  ORGANIZATION_PAYMENT_PATH,
+  handleOrganizationPayment,
+  injectOrganizationPayments,
+} from "./organization-payments.js";
 import { handleBoardPage, handleBoardDone } from "./board.js";
 import { createMoneyHop } from "./money-hop.js";
 import { createMercuryGateway } from "./mercury-gateway.js";
@@ -1016,6 +1021,9 @@ function proxyWithInject(req, res) {
                 }
                 // JRM Inbox bell/badge on every staff page (skips the login page by itself)
                 injected = injectIntakeUi(injected, pathOnly, { staffCheckHtml: text });
+                if (/^\/organizations\/\d+\/?$/.test(pathOnly) && looksLikeStaffPage(text)) {
+                  injected = await injectOrganizationPayments(injected, pathOnly, badgePool());
+                }
               } else if (
                 staffCore &&
                 /^\/reservations\/\d+\/payments\/add\/?$/.test(pathOnly)
@@ -1546,7 +1554,7 @@ const server = http.createServer(async (req, res) => {
     const wa = waConfig();
     sendJson(res, 200, {
       ok: true,
-      build: "2026-09-25-paddle-reader",
+      build: "2026-09-25-organization-payments",
       instance: INSTANCE_ID,
       snapEngage: {
         enabled: SNAPENGAGE_ENABLED,
@@ -1899,6 +1907,15 @@ const server = http.createServer(async (req, res) => {
       pool: badgePool(),
       upstream: UPSTREAM,
       publicHost: publicHostFor(req),
+    });
+    return;
+  }
+
+  const organizationPaymentMatch = url.pathname.match(ORGANIZATION_PAYMENT_PATH);
+  if (organizationPaymentMatch) {
+    await handleOrganizationPayment(req, res, organizationPaymentMatch, {
+      pool: badgePool(),
+      requireStaff,
     });
     return;
   }

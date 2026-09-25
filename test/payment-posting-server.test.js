@@ -28,7 +28,7 @@ it('boots the real proxy without credentials and gates payment exceptions to sta
     }
     assert.ok(health?.ok, `proxy did not become ready: ${output}`);
     const data = await health.json();
-    assert.equal(data.build, '2026-09-25-paddle-reader');
+    assert.equal(data.build, '2026-09-25-organization-payments');
     assert.equal(data.hasDb, false);
     assert.equal(data.hasMercury, false);
     assert.equal(data.hasNmi, false);
