@@ -397,6 +397,9 @@ export function declineHuman(code, fallbackText, o = {}) {
  * THE ONE THING TO DO NEXT after a decline (Mr. AT, Joseph 25 Sep: "Show the processor's reason in
  * plain words ... and the one thing to do next"). `kept` = the card is still held for a retry.
  */
+/** The gateway answers after which the SAME card may be tried again (Gabbai AT B2). Everything else is zeroed. */
+export const KEEP_CODES = /^(200|201|202|203|220|224|225|240|260|300|400|420|421|440|441)$/;
+
 export function declineNext(code, o = {}) {
   const c = String(code || "").trim();
   const again = o.kept ? " and tap Charge again - the card is held 5 more minutes, no need to send it again" : "";
@@ -409,7 +412,8 @@ export function declineNext(code, o = {}) {
   if (/^41[01]$/.test(c)) return "Nothing was charged - tell Joseph, the merchant account needs a fix.";
   if (/^430$/.test(c)) return "Check in the processor whether the first charge went through before trying again.";
   if (/^(300|4[0-4]\d)$/.test(c)) return o.kept ? "Nothing was charged. Try once more in a minute; if it says the same, tell Joseph." : "Nothing was charged. Send the card again in a minute; if it says the same, tell Joseph.";
-  if (o.refused) return "Nothing was charged. If the amount is large, it may be over the account's single-charge limit - try a smaller amount or split it" + (o.kept ? " (the card is held 5 more minutes)" : "") + ", or call Pinpoint.";
+  // Gabbai AT B3 (canon s.7): never advise splitting a sale to get under a limit.
+  if (o.refused) return "Nothing was charged. If it is about the amount, ask Joseph to call Pinpoint about the account's limit, or send the customer a bank-transfer link." + (o.kept ? " The card is held 5 more minutes." : "");
   return o.kept ? "Tap Charge again within 5 minutes, or use another card." : "Send the card again, or use another card.";
 }
 
@@ -442,6 +446,8 @@ function accessLine(name, fields) {
   // whether the card went back into its hold for a retry. Words from a closed alphabet, never a card.
   if (fields.gw && /^http_\d{3}$/.test(fields.gw)) o.gw = fields.gw;
   if (fields.kept != null) o.kept = Boolean(fields.kept);
+  // Gabbai AT C3: how long the gateway's own sentence was - the words go to the rep, never the log.
+  if (fields.said_len != null && Number.isInteger(fields.said_len)) o.said_len = fields.said_len;
   return `${name} ${JSON.stringify(o)}`;
 }
 
@@ -602,7 +608,13 @@ export async function handleChargeRequest(req, res, deps = {}) {
   // Joseph 25 Sep: "After a decline, keep the card hold for 5 minutes, so a corrected CVV or amount can
   // retry WITHOUT re-sending the card") goes back behind the same reference, same rep, five minutes,
   // at most MAX_HOLD_DECLINES times - and is zeroed by the next spend, the sweeper, or the cap.
-  const clearNo = sale && !sale.ok && !sale.outcomeUnknown && !sale.thrown && (sale.error === "declined" || sale.error === "processor_error" || sale.error === "keys_missing");
+  // Gabbai AT B2: kept ONLY on an allow-list of retryable answers. A hard decline (pick up / lost / stolen /
+  // fraud 250-253, not allowed 204, bad card 221-223, recurring stops 261-264, merchant 410/411, duplicate
+  // 430, unsupported 460/461) is zeroed: keeping it would be decline recycling. Never kept when the gateway
+  // said approved ("1") anywhere, even inside a 4xx.
+  const saleCode = sale && sale.responseCode ? String(sale.responseCode).trim() : "";
+  const clearNo = Boolean(sale && !sale.ok && !sale.outcomeUnknown && !sale.thrown && String(sale.gatewayResponse || "") !== "1" &&
+    (sale.error === "keys_missing" || (sale.refusedRequest && !saleCode) || KEEP_CODES.test(saleCode)));
   let kept = null;
   if (clearNo) {
     const back = reholdAfterDecline(tokenRef, entry, { now: clock() });
@@ -654,7 +666,7 @@ export async function handleChargeRequest(req, res, deps = {}) {
         hold_kept: Boolean(kept),
         token_ref_expires_at: kept ? new Date(kept.expiresAt).toISOString() : null,
       },
-      { outcome: `declined:${code || (sale && sale.error) || "unknown"}`, brand: brand.id, amount_cents: amountCents, cvv_sent: Boolean(cvvUse), gw, kept: Boolean(kept) }
+      { outcome: `declined:${code || (sale && sale.error) || "unknown"}`, brand: brand.id, amount_cents: amountCents, cvv_sent: Boolean(cvvUse), gw, kept: Boolean(kept), said_len: said ? said.length : 0 }
     );
   }
   return finish(

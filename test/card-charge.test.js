@@ -9,6 +9,7 @@ import {
   chargeFamilyPath,
   refundCapCents,
   declineHuman,
+  KEEP_CODES,
   handleChargeRequest,
   handleVoidRequest,
   handleRefundRequest,
@@ -861,7 +862,10 @@ describe("declines say why and what next, and keep the card for a retry", () => 
       assert.equal(p.body.refused_by_processor, true);
       assert.match(p.body.decline_reason_human, /never reached the bank/);
       assert.match(p.body.decline_reason_human, /Amount exceeds the maximum/);
-      assert.match(p.body.decline_next, /single-charge limit/);
+      assert.match(p.body.decline_next, /call Pinpoint about the account's limit/);
+      assert.doesNotMatch(p.body.decline_next, /split/i, "never advise splitting a sale (Gabbai AT B3)");
+      assert.match(s.logs.at(-1), /"said_len":\d+/);
+      assert.doesNotMatch(s.logs.at(-1), /maximum allowed/, 'the sentence itself is never logged');
       assert.equal(p.body.hold_kept, true);
       assert.ok(Date.parse(p.body.token_ref_expires_at) > Date.now());
       assert.match(s.logs.at(-1), /"gw":"http_400"/);
@@ -933,6 +937,39 @@ describe("declines say why and what next, and keep the card for a retry", () => 
     } finally {
       await s.close();
     }
+  });
+
+  it("Gabbai AT B2: a HARD decline keeps nothing - pick up, stolen, duplicate, not allowed; and never when the gateway said approved", async () => {
+    for (const code of ["250", "251", "252", "253", "430", "204", "223", "410", "461"]) {
+      const fetchImpl = async () => ({ ok: true, status: 200, text: async () => JSON.stringify({ response: "2", response_code: code }) });
+      const s = await startDoor(handleChargeRequest, { secret: SECRET, fetchImpl, privateKey: "k" });
+      try {
+        const ref = newRef();
+        const t = mintTicket({ kind: "charge", repId: "sruly", bind: ref, secret: SECRET });
+        const p = await post(s.url, CHARGE_PATH, t.token, { token_ref: ref, amount_cents: 2500, brand: "jrm", rep: "sruly", customer_name: "Guest" });
+        assert.equal(p.status, 402, `${code}: ${p.text}`);
+        assert.equal(p.body.hold_kept, false, `${code} must not keep the card`);
+        assert.equal(redeemCardHold(ref, { rep: "sruly" }).error, "unknown", `${code}: zeroed and gone`);
+        assert.doesNotMatch(p.body.decline_next, /Charge again|held 5 more minutes/, code);
+      } finally {
+        await s.close();
+      }
+    }
+    // a 4xx that nonetheless says response "1" is never treated as a retryable no
+    const odd = async () => ({ ok: false, status: 400, text: async () => JSON.stringify({ response: "1", message: "odd" }) });
+    const s2 = await startDoor(handleChargeRequest, { secret: SECRET, fetchImpl: odd, privateKey: "k" });
+    try {
+      const ref = newRef();
+      const t = mintTicket({ kind: "charge", repId: "sruly", bind: ref, secret: SECRET });
+      const p = await post(s2.url, CHARGE_PATH, t.token, { token_ref: ref, amount_cents: 2500, brand: "jrm", rep: "sruly", customer_name: "Guest" });
+      assert.notEqual(p.body.hold_kept, true);
+      assert.equal(redeemCardHold(ref, { rep: "sruly" }).error, "unknown");
+    } finally {
+      await s2.close();
+    }
+    // the allow-list itself
+    for (const c of ["200", "201", "202", "203", "220", "224", "225", "240", "260", "300", "400", "420", "421", "440", "441"]) assert.ok(KEEP_CODES.test(c), c);
+    for (const c of ["204", "221", "222", "223", "250", "253", "261", "264", "410", "411", "430", "460", "461", ""]) assert.equal(KEEP_CODES.test(c), false, c);
   });
 
   it("an unknown outcome (gateway 5xx) is never kept - it may have charged", async () => {

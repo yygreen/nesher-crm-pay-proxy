@@ -1141,6 +1141,7 @@ export async function chargeWithToken(opts = {}) {
       // only "try again or use another card". The gateway's own words, cleaned (no dumps, no long digit
       // runs), and whether it was a request refusal (no transaction exists) or a bank answer.
       gatewayText: gatewaySaid(json),
+      gatewayResponse: response,
       refusedRequest: refusedRequest && json.response_code == null && !["1", "2", "3"].includes(response),
     };
   }
