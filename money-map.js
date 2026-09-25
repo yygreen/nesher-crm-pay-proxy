@@ -25,8 +25,9 @@
 // that is always rolled back. It never reads or returns a card number, a customer name or an email.
 import { queryNmiRange, nmiDateMs, NMI_PROCESSOR_BRAND } from "./nmi-recovery.js";
 import { parseInvoiceNumber } from "./payments-sync.js";
+import { leftoverLoopOn } from "./payments-sync.js"; // the leftover lane's kill switch (one home: payments-sync)
 
-export const MONEY_MAP_BUILD = "2026-09-24-money-map";
+export const MONEY_MAP_BUILD = "2026-09-25-map-paid-day";
 export const MONEY_MAP_PATH = "/money-map";
 export const MONEY_MAP_TZ = "Asia/Jerusalem";
 // Ids and brands come from the ONE table (nmi-recovery.js NMI_PROCESSOR_BRAND); here only the
@@ -396,7 +397,8 @@ export async function loadCrm(pool, period, refs) {
     const endIso = new Date(period.endMs).toISOString();
     const nesherInPeriod = await q(
       `SELECT p.id, p.amount::float8 AS amount, p.method, p.paid_at, p.reservation_id,
-              substring(p.notes from 'nmi:([A-Za-z0-9_-]+)') AS nmi_txn
+              substring(p.notes from 'nmi:([A-Za-z0-9_-]+)') AS nmi_txn,
+              substring(p.notes from 'mercury:([A-Za-z0-9_-]+)') AS mercury_inv
          FROM core_payment p WHERE p.paid_at >= $1 AND p.paid_at < $2`, [startIso, endIso]);
     const codes = [...new Set(refs.res)];
     const byCode = codes.length
@@ -414,7 +416,8 @@ export async function loadCrm(pool, period, refs) {
       : [];
     const jrmInPeriod = await q(
       `SELECT id, amount::float8 AS amount, currency, method, payment_date::text AS payment_date, offer_id, request_id,
-              substring(reference from 'nmi:([A-Za-z0-9_-]+)') AS nmi_txn
+              substring(reference from 'nmi:([A-Za-z0-9_-]+)') AS nmi_txn,
+              substring(reference from 'mercury:([A-Za-z0-9_-]+)') AS mercury_inv
          FROM core_jrmhotelpayment WHERE payment_date >= $1::date AND payment_date < $2::date`,
       [period.start, addDaysYmd(period.end, 1)]);
     const reqIds = [...new Set([...jrmInPeriod.map((p) => String(p.request_id)), ...refs.jrm.map(String)])];
@@ -435,7 +438,21 @@ export async function loadCrm(pool, period, refs) {
     const refundRows = resIds.length
       ? await q(`SELECT reservation_id, count(*)::int AS n FROM core_refund WHERE reservation_id = ANY($1::bigint[]) GROUP BY reservation_id`, [resIds])
       : [];
-    return { nesherInPeriod, reservations, nesherAll, jrmInPeriod, jrmAll, offers, requests, refundRows };
+    // Audit #150 (Gabbai leftover C8): the day a Mercury invoice was paid is the day on the CRM row paySync wrote for
+    // it (mercury:<invoice id>; paid_at, or a hotel row's payment_date) or on its ledger review row - read here, never
+    // worked out again. paySync dates it by first sight (paidAtOf); rows written before that keep their old day.
+    const mercuryPaid = [
+      ...(await q(`SELECT substring(notes from 'mercury:([A-Za-z0-9_-]+)') AS invoice_id, min(paid_at) AS paid_at
+                     FROM core_payment WHERE notes ~ 'mercury:[A-Za-z0-9_-]+' GROUP BY 1`)).map((r) => ({ ...r, source: "crm" })),
+      ...(await q(`SELECT substring(reference from 'mercury:([A-Za-z0-9_-]+)') AS invoice_id, min(payment_date)::text AS payment_date
+                     FROM core_jrmhotelpayment WHERE reference ~ 'mercury:[A-Za-z0-9_-]+' GROUP BY 1`)).map((r) => ({ ...r, source: "crm" })),
+    ];
+    const ledger = await q(`SELECT to_regclass('public.nesher_money_payment_posts') IS NOT NULL AS ok`);
+    if (ledger[0] && ledger[0].ok) {
+      mercuryPaid.push(...(await q(`SELECT substring(transaction_id from 9) AS invoice_id, paid_at
+                                     FROM nesher_money_payment_posts WHERE left(transaction_id, 8) = 'mercury_'`)).map((r) => ({ ...r, source: "ledger" })));
+    }
+    return { nesherInPeriod, reservations, nesherAll, jrmInPeriod, jrmAll, offers, requests, refundRows, mercuryPaid };
   } finally {
     try { await client.query("ROLLBACK"); } catch { /* nothing was written */ }
     if (client !== pool && typeof client.release === "function") client.release();
@@ -692,8 +709,20 @@ export function buildMoneyMap({ period, nowMs, nmi, bank, invoices, crm, sources
     // is the credit's sole candidate (90-100% of the amount, from a day before to ten days after).
     // Anything else is left unmeasured. Even a clean pair is "inferred", not measured: a bank credit
     // carries no invoice number.
-    const paid = invoices.filter((inv) => String(inv.status) === "Paid" && inPeriod(Date.parse(inv.updatedAt || "")))
-      .map((inv) => ({ inv, ms: Date.parse(inv.updatedAt), amt: Number(inv.amount) || 0 }));
+    // Audit #150: Mercury's answer has no paid date and its updatedAt is the day the invoice was SENT. A paid invoice
+    // is dated by the CRM row paySync wrote for it (or its ledger review row), so the Mercury section and the booking
+    // lists of the same answer name the same day; an invoice with no such row keeps the day sent, and the notes say so.
+    const paidDay = new Map();
+    const dateBySync = leftoverLoopOn(); // T3 kill switch: off = dated by updatedAt, as on 07c394c
+    for (const r of (dateBySync && crm && crm.mercuryPaid) || []) {
+      const id = String((r && r.invoice_id) || "");
+      const ms = r && r.payment_date ? ilMidnightMs(String(r.payment_date).slice(0, 10)) : r && r.paid_at != null ? new Date(r.paid_at).getTime() : NaN;
+      if (id && Number.isFinite(ms) && !(paidDay.has(id) && paidDay.get(id).source === "crm")) paidDay.set(id, { ms, source: r.source });
+    }
+    const paidMs = (inv) => (paidDay.has(String(inv.id)) ? paidDay.get(String(inv.id)).ms : Date.parse(inv.updatedAt || ""));
+    const paid = invoices.filter((inv) => String(inv.status) === "Paid" && inPeriod(paidMs(inv)))
+      .map((inv) => ({ inv, ms: paidMs(inv), amt: Number(inv.amount) || 0, bySent: !paidDay.has(String(inv.id)),
+        byLedger: paidDay.has(String(inv.id)) && paidDay.get(String(inv.id)).source === "ledger" }));
     const fits = (p, x) => x.createdMs >= p.ms - 86400000 && x.createdMs <= p.ms + 10 * 86400000 && x.amount <= p.amt + CENT && x.amount >= 0.9 * p.amt;
     for (const p of paid) {
       const brand = refOf(p.inv.invoiceNumber)?.brand === "jrm" ? "jrm" : "nesher";
@@ -707,7 +736,14 @@ export function buildMoneyMap({ period, nowMs, nmi, bank, invoices, crm, sources
         I.fee_inferred_items.push({ invoice: p.inv.invoiceNumber || null, invoice_amount: r2(p.amt), credit_amount: r2(cands[0].amount), label: `inferred: invoice ${r2(p.amt)} less bank credit ${r2(cands[0].amount)}` });
       } else I.fee_unmeasured_on += p.amt;
     }
-    notes.push("A Mercury invoice's paid date is the time Mercury last updated it (the API gives no separate paid-at).");
+    const bySent = paid.filter((p) => p.bySent).length;
+    if (!dateBySync) notes.push("A Mercury invoice's paid date is the time Mercury last updated it (the API gives no separate paid-at).");
+    const byLedger = paid.filter((p) => p.byLedger).length;
+    if (dateBySync) notes.push(crm
+      ? "A Mercury invoice is dated by the day on the payment the CRM recorded for it, or on its review row while it waits for a person; Mercury itself gives no paid date."
+        + (byLedger ? ` ${byLedger} paid invoice(s) wait for a person and are not in the CRM; dated by when our sync first saw them paid.` : "")
+        + (bySent ? ` ${bySent} paid invoice(s) with no CRM record are dated by when they were sent.` : "")
+      : "A Mercury invoice is dated by when it was sent: the CRM could not be read, and Mercury itself gives no paid date.");
   } else notes.push("Mercury invoices could not be read (" + (sources.invoices?.error || "unknown") + ").");
 
   // ---- per brand finish ----
@@ -782,7 +818,8 @@ export function buildMoneyMap({ period, nowMs, nmi, bank, invoices, crm, sources
   // ---- CRM-recorded rails (a rep's record, not a bank confirmation - 16.3) ----
   if (crm) {
     for (const p of crm.nesherInPeriod) {
-      if (p.method === "card" || p.method === "mercury") continue;
+      // Gabbai leftover C8(b): paySync writes bank|other since f5625f2, so its rows are known by the mercury: marker
+      if (p.method === "card" || p.method === "mercury" || (p.mercury_inv && leftoverLoopOn())) continue;
       add(out.brands.nesher.recorded_other_rails, p.method || "other", p.amount);
     }
     for (const p of crm.jrmInPeriod) {
@@ -794,7 +831,7 @@ export function buildMoneyMap({ period, nowMs, nmi, bank, invoices, crm, sources
         R[k] = r2((R[k] || 0) + p.amount);
         continue;
       }
-      if (p.method === "card" || p.method === "mercury") continue;
+      if (p.method === "card" || p.method === "mercury" || (p.mercury_inv && leftoverLoopOn())) continue;
       add(out.brands.jrm.recorded_other_rails, p.method || "other", p.amount);
     }
     for (const B of Object.values(out.brands)) {

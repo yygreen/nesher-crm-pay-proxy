@@ -28,6 +28,16 @@ export function parseInvoiceNumber(num) {
   return null;
 }
 
+/**
+ * THE KILL SWITCH of the 25 Sep leftover lane (Gabbai re-verdict T3): Railway variable MONEY_LEFTOVER_LOOP=off puts
+ * back the 07c394c behaviour - no Mercury hold for a person (#76 / P3), Mercury paid time = updatedAt again, no
+ * confirming-link settle (#145), the map dates Mercury invoices by updatedAt and counts marker rows as a rep's again.
+ * Unset or anything else = on. Read on every call, so it needs no code deploy; the public health shows it.
+ */
+export function leftoverLoopOn() {
+  return String(process.env.MONEY_LEFTOVER_LOOP || "").trim().toLowerCase() !== "off";
+}
+
 function marker(inv) {
   return `mercury:${inv.id}`;
 }
@@ -106,7 +116,10 @@ function describeChannel(inv, channel = "mercury") {
 }
 
 function paidAtOf(inv) {
-  const t = inv.paidAt || inv.paidDate || inv.updatedAt || null;
+  // Audit #150 (Gabbai leftover C3): Mercury's AR answer has no paid date and its updatedAt is the day the invoice
+  // was SENT, so a Paid invoice is dated by when this sync first sees it paid (it reads Mercury every minute; after
+  // a sync outage that is the recovery time). The card path always passes its own paidAt (nmiInput): unchanged.
+  const t = inv.paidAt || inv.paidDate || (leftoverLoopOn() ? null : inv.updatedAt) || null;
   const d = t ? new Date(t) : new Date();
   return isNaN(d.getTime()) ? new Date() : d;
 }
@@ -132,6 +145,9 @@ async function recordHotelPayment(pool, inv, target, out, channel = "mercury", {
     out.skipped.push(`${inv.invoiceNumber}: already synced`);
     return;
   }
+  // Audit #76 + P3 (Gabbai leftover C1/C2): a Paid Mercury invoice after a card payment on its number, or on a booking
+  // that already carries the same amount, is never posted - kept for a person (or silent in the one provable case).
+  if (channel === "mercury" && leftoverLoopOn() && await holdMercuryForPerson(pool, inv, target, target.requestId, out)) return;
   // Same amount already entered by staff? Don't double-count.
   const manual = await pool.query(
     `SELECT id FROM core_jrmhotelpayment
@@ -223,6 +239,9 @@ async function recordReservationPayment(pool, inv, target, out, channel = "mercu
     } else out.skipped.push(`${inv.invoiceNumber}: already synced`);
     return;
   }
+  // Audit #76 + P3 (Gabbai leftover C1/C2): a Paid Mercury invoice after a card payment on its number, or on a booking
+  // that already carries the same amount, is never posted - kept for a person (or silent in the one provable case).
+  if (channel === "mercury" && leftoverLoopOn() && await holdMercuryForPerson(pool, inv, target, reservationId, out)) return;
   // The Mercury path's same-amount check COUNTS machine-marker rows (nmi:, mercury:) as already there:
   // that is what makes "mark the Mercury invoice PAID, never cancel" safe - the invoice the office marks
   // PAID after a card payment is not posted a second time (Gabbai 25 Sep B1; audit #76 stays open).
@@ -372,6 +391,9 @@ export const NOTE_REASON_WORDS = Object.freeze({
   invoice_amount_mismatch: "received and NOT recorded automatically: the amount differs from what the pay link asked for. If the booking does not show what came in, enter it.",
   legacy_transaction_conflict: "is already recorded on another booking in the CRM, so it was NOT added here. Do not enter it twice; check which booking is right.",
   hotel_offer_mismatch: "received and NOT recorded automatically: the hotel offer belongs to another request. Check which request it belongs to, and enter it there if it is not already there.",
+  // audit #76 + P3 (a Mercury invoice, not a card): holdMercuryForPerson, after "Mercury invoice <ref> shows $X USD paid."
+  mercury_same_amount_on_booking: "NOT recorded automatically: a payment of the same amount is already on this booking. If that is the same money, nothing to enter; if it is a second payment, enter it.",
+  mercury_paid_after_card_link: "NOT recorded automatically: this booking already has a card payment, so the invoice may only have been marked PAID for it. If money came in by bank, enter it; if not, nothing to enter.",
   other: "received and NOT recorded automatically: the CRM could not match it by itself. If the booking does not show it, enter it.",
 });
 export function reviewNoteText(amountUsd, txn, reason) {
@@ -380,7 +402,10 @@ export function reviewNoteText(amountUsd, txn, reason) {
 }
 /** The staff note for a live sale the loop could not record. Only when the booking is found. */
 async function writeReviewNote(pool, { target, inv }, reason) {
-  const note = reviewNoteText(inv.amount, inv.id, reason);
+  return writeBookingNote(pool, target, reviewNoteText(inv.amount, inv.id, reason));
+}
+/** THE booking-note door (Gabbai leftover C2): #75's card note and the #76 / P3 Mercury note. Only when the booking is found. */
+async function writeBookingNote(pool, target, note) {
   if (target.kind === "hotel") {
     const req = await pool.query(`SELECT id FROM core_jrmhotelrequest WHERE id = $1`, [target.requestId]);
     if (!req.rows.length) return false;
@@ -659,12 +684,89 @@ export async function syncPaidInvoices({ token, pool, fetchImpl, listInvoices })
   return out;
 }
 
-/** A paid Mercury invoice the sync will not write, kept once as a ledger review row (never a CRM write). */
+/** A paid Mercury invoice the sync will not write, kept once as a ledger review row (never a CRM write).
+ *  Its time is paidAtOf: Mercury gives no paid date, so first sight (audit #150). */
 async function keepMercuryForReview(pool, inv, brand, reason) {
   const id = String(inv.id || "").trim();
   if (!/^[A-Za-z0-9_-]{1,100}$/.test(id)) return null;
   return recordPaymentException({ pool, invoiceNumber: String(inv.invoiceNumber || "").trim(), amountUsd: Number(inv.amount),
     transactionId: `mercury_${id}`, paidAt: paidAtOf(inv).toISOString(), brand, reason, kind: "sale" });
+}
+
+/**
+ * AUDIT #76 + THE P3 GUARD (25 Sep leftover lane, Gabbai leftover verdict C1/C2). A Paid Mercury invoice is NEVER
+ * posted when
+ *   (a) a pay link on its invoice number was already paid by card (or holds a card claim): mercury.js keeps ONE open
+ *       Mercury invoice per number - a new link reuses it, and a new amount rewrites it in place (:236-266,
+ *       :329-361) - so after a card payment the office's "Mark the Mercury invoice PAID" (the #74 note) can turn
+ *       Paid an invoice that now asks another amount; posting it would record money that never came in (probe P3); or
+ *   (b) the booking already carries a payment of the same amount (#76: the second half of a half-card / half-bank
+ *       booking used to vanish SILENTLY).
+ * It is SILENT only in the one provable case, the #74 path: exactly one same-amount CRM row, it is the loop's card
+ * row nmi:T, and the link carrying T is the ONLY pay link on this invoice number (any amount). Anything else is kept
+ * for a person: one ledger review row mercury_<invoice id> (loop-review list) and one check-first note on the
+ * booking, on the first sight only. Returns true when the invoice was held (the caller returns without posting).
+ * A failed read throws: the sync reports an error for that invoice and posts nothing (fail closed).
+ */
+async function holdMercuryForPerson(pool, inv, target, bookingId, out) {
+  const amount = Number(inv.amount);
+  const links = await payLinksFor(pool, inv.invoiceNumber);
+  // Gabbai leftover r2 R1: the #74 "Mark the Mercury invoice PAID" note is written on EVERY card door (pay link, desk,
+  // office, sweep), so the guard keys on the booking: a card-paid / card-claimed link on the number, OR any card row
+  // (anchored nmi: marker) on the booking. This only moves post -> hold; the #74 silent rule below is unchanged.
+  const carded = links.some((p) => String(p.transactionId || "") !== "" || String(p.paidAt || "") !== "")
+    || await bookingHasCardRow(pool, target, bookingId);
+  const same = await sameAmountRows(pool, target, bookingId, amount);
+  if (!carded && !same.length) return false;
+  const silent = same.length === 1 && Boolean(same[0].nmi_txn) && links.length === 1
+    && String(links[0].transactionId || "") === String(same[0].nmi_txn);
+  const reason = same.length ? "mercury_same_amount_on_booking" : "mercury_paid_after_card_link";
+  const where = target.kind === "hotel" ? `request #${target.requestId}` : `reservation #${bookingId}`;
+  out.skipped.push(same.length
+    ? `${inv.invoiceNumber}: same-amount payment already on ${where} (manual?) — not duplicated`
+    : `${inv.invoiceNumber}: this booking already has a card payment — not posted`);
+  if (!silent) {
+    try {
+      const kept = await keepMercuryForReview(pool, inv, target.kind === "hotel" ? "jrm" : "nesher", reason);
+      if (kept && kept.inserted) await writeBookingNote(pool, target, mercuryReviewNoteText(inv.amount, inv.invoiceNumber, reason));
+    } catch {
+      /* the skip line still reports it; a ledger row that was not written is tried again next minute */
+    }
+  }
+  return true;
+}
+
+/** Pay links on one invoice number (any amount), payloads only. No pay-link table (tests) = none. Reads only. */
+async function payLinksFor(pool, invoiceNumber) {
+  const ref = String(invoiceNumber || "").trim();
+  if (!ref) return [];
+  const t = await pool.query(`SELECT to_regclass('public.nesher_pay_invoices') IS NOT NULL AS ok`);
+  if (!t.rows?.[0]?.ok) return [];
+  const r = await pool.query(`SELECT payload FROM nesher_pay_invoices WHERE lower(payload->>'invoiceNumber') = lower($1)`, [ref]);
+  return (r.rows || []).map((x) => (x && x.payload && typeof x.payload === "object" ? x.payload : {}));
+}
+
+/** Does the booking carry any card payment row the loop or the office wrote (anchored nmi:<txn> marker)? Reads only. */
+async function bookingHasCardRow(pool, target, bookingId) {
+  const r = target.kind === "hotel"
+    ? await pool.query(`SELECT 1 AS hit FROM core_jrmhotelpayment WHERE request_id = $1 AND COALESCE(reference, '') ~ '(^|[[:space:]])nmi:[A-Za-z0-9_-]+($|[[:space:]])' LIMIT 1`, [bookingId])
+    : await pool.query(`SELECT 1 AS hit FROM core_payment WHERE reservation_id = $1 AND COALESCE(notes, '') ~ '(^|[[:space:]])nmi:[A-Za-z0-9_-]+($|[[:space:]])' LIMIT 1`, [bookingId]);
+  return Boolean(r.rows && r.rows.length);
+}
+
+/** Same-amount CRM payment rows on the booking (any marker), with the card marker when there is one. Reads only. */
+async function sameAmountRows(pool, target, bookingId, amount) {
+  const r = target.kind === "hotel"
+    ? await pool.query(`SELECT substring(COALESCE(reference, '') from '(?:^|[[:space:]])nmi:([A-Za-z0-9_-]+)') AS nmi_txn
+        FROM core_jrmhotelpayment WHERE request_id = $1 AND ABS(amount - $2) < 0.01`, [bookingId, amount])
+    : await pool.query(`SELECT substring(COALESCE(notes, '') from '(?:^|[[:space:]])nmi:([A-Za-z0-9_-]+)') AS nmi_txn
+        FROM core_payment WHERE reservation_id = $1 AND ABS(amount - $2) < 0.01`, [bookingId, amount]);
+  return r.rows || [];
+}
+
+export function mercuryReviewNoteText(amountUsd, invoiceNumber, reason) {
+  const said = NOTE_REASON_WORDS[String(reason || "")] || NOTE_REASON_WORDS.mercury_same_amount_on_booking;
+  return `Mercury invoice ${String(invoiceNumber || "").trim()} shows $${Number(amountUsd).toFixed(2)} USD paid. ${said}`;
 }
 
 /**

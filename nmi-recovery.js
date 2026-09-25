@@ -143,7 +143,7 @@ export function recoveryDecision(e) {
  * One sweep. `observe(ev)` (shadow) or `post(ev)` / `except(ev)` (live) are
  * injected by the server. Returns counts only.
  */
-export async function runNmiRecovery({ host, securityKey, days = 3, now = new Date(), fetchImpl, mode = "shadow", observe, post, except, reverse }) {
+export async function runNmiRecovery({ host, securityKey, days = 3, now = new Date(), fetchImpl, mode = "shadow", observe, post, except, reverse, settled }) {
   const until = new Date(now.getTime());
   const since = new Date(now.getTime() - Math.max(1, Math.min(60, Number(days) || 3)) * 86400000);
   const xml = await queryNmiRange({ host, securityKey, since, until, fetchImpl });
@@ -151,7 +151,7 @@ export async function runNmiRecovery({ host, securityKey, days = 3, now = new Da
   // `fresh` (audit #142): what THIS pass did for the first time - a new CRM row, a new reversal, a new
   // review row - apart from the running totals that re-count every sale still in the window.
   const out = { at: new Date().toISOString(), mode, days, transactions: events.length, confirmed: 0, notMoney: 0, noBrand: 0, observed: 0, posted: 0, reversed: 0, exceptions: 0, errors: 0,
-    fresh: { posted: 0, reversed: 0, exceptions: 0 } };
+    fresh: { posted: 0, reversed: 0, exceptions: 0 }, linksSettled: 0 };
   for (const e of events) {
     // Only the processor's approval makes it money. Failed = no money moved.
     if (!e.success || !(e.amountUsd > 0) || !(MONEY_CONDITIONS.has(e.condition) || e.condition === "canceled")) { out.notMoney++; continue; }
@@ -197,6 +197,11 @@ export async function runNmiRecovery({ host, securityKey, days = 3, now = new Da
         if (decision.action === "post" && r?.ok) {
           out.posted++;
           if (r.recorded?.length) out.fresh.posted++;
+          // Audit #145: a guest pay link stuck on "confirming" for THIS sale is settled once the sale is in the
+          // CRM (invoice-store settleConfirmingLink, with the Gabbai's D4 guards). Live mode only (server.js).
+          if (e.kind === "sale" && typeof settled === "function") {
+            try { const s = await settled(ev); if (s?.ok) out.linksSettled++; } catch { /* the link stays as it was */ }
+          }
         } else if (r?.durable || r?.needsReview) {
           out.exceptions++;
           if (r?.inserted || r?.newlyReviewed) out.fresh.exceptions++;
