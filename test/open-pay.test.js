@@ -1544,7 +1544,7 @@ describe("wiring", () => {
     assert.match(docker, /\bopen-pay\.js\b/);
     const src = fs.readFileSync(new URL("../server.js", import.meta.url), "utf8");
     assert.match(src, /from "\.\/open-pay\.js"/);
-    assert.match(src, /build: "2026-09-25-white-card"/);
+    assert.match(src, /build: "2026-09-25-words-left"/);
     assert.match(src, /isOpenPayPath\(url\.pathname\)/);
     assert.match(src, /isOfficePayPath\(url\.pathname\)/);
     assert.match(src, /resolveOpenPayBrand\(req\.headers\)/);
