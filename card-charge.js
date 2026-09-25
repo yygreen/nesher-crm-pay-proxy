@@ -584,7 +584,7 @@ export async function handleChargeRequest(req, res, deps = {}) {
   }
   // ONE CARD AND AMOUNT WHILE UNRESOLVED (Mr. AU, audit C1/C2 + "no duplicate guard on chat charges"). The
   // desk sends the card's last four. While a charge of this card for this amount on this merchant is on the
-  // wire or UNKNOWN (10 minutes - the desk reads an unknown back within 5), ANOTHER tile's charge of it is
+  // wire or UNKNOWN (5 minutes - the same five minutes after which the desk, having read the processor and found no sale, says Not charged), ANOTHER tile's charge of it is
   // refused before the hold is spent: a rep who sends the card again while the first answer is unknown can
   // no longer charge the customer twice. After an approval, a second charge of the same card and amount
   // within 30 minutes needs the rep's explicit "charge it again" (body.again === true from the desk).
@@ -840,7 +840,7 @@ const ARMING_RE = /^[A-Za-z0-9:_-]{6,80}$/;
 const ARMING_TTL_MS = 24 * 60 * 60 * 1000;
 // Mr. AU: the card-and-amount guard for chat charges (see handleChargeRequest).
 const CARD_IN_FLIGHT_MS = 2 * 60 * 1000;
-const CARD_UNRESOLVED_MS = 10 * 60 * 1000;
+const CARD_UNRESOLVED_MS = 5 * 60 * 1000;
 const CARD_DUP_WINDOW_MS = 30 * 60 * 1000;
 const armings = new Map();
 export function _resetArmingsForTests() {
