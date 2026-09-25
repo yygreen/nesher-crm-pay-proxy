@@ -331,6 +331,25 @@ describe("sendPay: direct ACH from Nesher checking, every rule checked here", ()
     assert.equal(r.body.ok, true);
     assert.equal(s.sends.length, 1);
   });
+  it("Mr. AR (25 Sep): a retry of the SAME desk tile is itself, not a duplicate - a DIFFERENT tile still gets 409", async () => {
+    // base()'s idempotencyKey is "nesher-desk-mpak000001" and note is "mpak000001 by joseph" -
+    // exactly what deskNote() puts at the front of the Mercury note, after NOTE_MARK.
+    const sameTile = mercury({ txns: [{ id: "cccccccc-0000-4000-8000-000000000010", amount: -630, status: "pending", counterpartyId: BASE_R.cohen.id, note: "Refund RES-8P4R3T" + NOTE_MARK + "mpak000001 by joseph", createdAt: new Date(NOW - 600e3).toISOString(), estimatedDeliveryDate: "2026-09-28T00:00:00Z" }] });
+    let r = await gw(sameTile).sendPay(base(sameTile));
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    assert.equal(r.body.ok, true);
+    assert.equal(r.body.mode, "direct");
+    assert.equal(r.body.reused, true);
+    assert.equal(r.body.txn.id, "cccccccc-0000-4000-8000-000000000010");
+    assert.equal(sameTile.sends.length, 0, "the SAME tile's retry never reaches Mercury again");
+
+    const otherTile = mercury({ txns: [{ id: "cccccccc-0000-4000-8000-000000000011", amount: -630, status: "pending", counterpartyId: BASE_R.cohen.id, note: "Refund RES-8P4R3T" + NOTE_MARK + "mpzz999999 by hershy", createdAt: new Date(NOW - 600e3).toISOString() }] });
+    r = await gw(otherTile).sendPay(base(otherTile));
+    assert.equal(r.status, 409);
+    assert.equal(r.body.error, "duplicate_24h");
+    assert.equal(r.body.existing.amount, 630);
+    assert.equal(otherTile.sends.length, 0);
+  });
   it("Mercury holding an API send for approval is said as such (approval_forced), never 'sent'", async () => {
     const s = mercury({ sendMode: "approval" });
     const r = await gw(s).sendPay(base(s));

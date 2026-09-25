@@ -420,6 +420,21 @@ export function memoBase(echo) {
 }
 
 /**
+ * The desk tile id at the front of a note - deskNote's own words are "<tileId> by <rep>...", and the
+ * gateway puts that straight after NOTE_MARK when it sends (money-pay.js deskNote/sendDoor). Works on
+ * either shape: the raw desk-note text (o.note, before NOTE_MARK is added) or the full Mercury note
+ * Mercury hands back on a read (memo + NOTE_MARK + desk-note). "" when there is no tile id to read -
+ * an older or hand-made note, never our own retry. Pure.
+ */
+export function noteTileId(s) {
+  const raw = String(s || "");
+  const i = raw.indexOf(NOTE_MARK);
+  const desk = i >= 0 ? raw.slice(i + NOTE_MARK.length) : raw;
+  const m = desk.match(/^(\S+)\s+by\s+/);
+  return m ? m[1] : "";
+}
+
+/**
  * Does the memo Mercury echoes on a request belong to the rep's memo? Mercury's docs do not say
  * whether `memo` echoes externalMemo or the note, so both are accepted: equal to the memo, equal to
  * its external form, or the note that begins with the memo and the desk-chat marker.
@@ -1119,7 +1134,16 @@ export function createMercuryGateway(opts = {}) {
     if (o.allowDup !== true) {
       const dupT = out.find((t) => t.counterpartyId === payee.raw.id && Math.round(Number(t.amount) * 100) === -cents);
       const dupR = live.find((x) => x.recipientId === payee.raw.id && Math.round(Number(x.amount) * 100) === cents);
-      if (dupT || dupR) return { status: 409, body: { ok: false, error: "duplicate_24h", existing: dupT ? payTxnView(dupT) : payRequestView(dupR) } };
+      if (dupT || dupR) {
+        // A retry of the SAME desk tile (it lost the first answer and tried again) is ITSELF, not a
+        // duplicate: our own note carries the tile id right after NOTE_MARK, and Mercury hands it
+        // straight back on the read. A different tile at the same payee and amount is still refused.
+        const myTile = noteTileId(o.note);
+        if (dupT && myTile && noteTileId(dupT.note) === myTile) {
+          return { status: 200, body: { ok: true, mode: "direct", txn: payTxnView(dupT), payee: payee.view, reused: true } };
+        }
+        return { status: 409, body: { ok: false, error: "duplicate_24h", existing: dupT ? payTxnView(dupT) : payRequestView(dupR) } };
+      }
     }
     const chatSent = out.filter((t) => String(t.note || "").includes(NOTE_MARK)).reduce((s, t) => s + Math.round(-Number(t.amount) * 100), 0);
     const dayUsed = chatSent + live.reduce((s, x) => s + Math.round(Number(x.amount) * 100), 0);
