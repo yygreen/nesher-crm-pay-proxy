@@ -284,7 +284,7 @@ describe("wiring", () => {
     assert.match(src, /url\.pathname\.startsWith\("\/__money_hop\/"\)/);
     assert.match(src, /await moneyHop\.handle\(req, res\)/);
     assert.match(src, /moneyHop: moneyHop\.health\(\)/);
-    assert.match(src, /build: "2026-09-25-words-left"/);
+    assert.match(src, /build: "2026-09-25-leftover-loop"/);
     // the hop is mounted before the Mercury relay and everything behind it
     assert.ok(src.indexOf('url.pathname.startsWith("/__money_hop/")') < src.indexOf("/^\\/__mercury_relay\\/(.+)$/"));
     // no Mercury token or send path anywhere in the module
