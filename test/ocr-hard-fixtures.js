@@ -83,6 +83,9 @@ const PALETTES = {
   sky: { bg: "#8fc3ea", bg2: "#4f8fc4", fg: "#0d2a45", logo: "#0d2a45" },
   purple: { bg: "#4a2c6e", bg2: "#1e1030", fg: "#efe6ff", logo: "#ffb347" },
   orange: { bg: "#f08a24", bg2: "#b8520b", fg: "#1c1c1c", logo: "#1c1c1c" },
+  // White on white (25 Sep): the digits are the card's own colour; only the raised edge shows.
+  snow: { bg: "#f6f6f4", bg2: "#e2e2de", fg: "#ecece8", logo: "#c4c4c0" },
+  ivory: { bg: "#f4f0e6", bg2: "#e0d8c6", fg: "#ebe5d6", logo: "#c9bda0" },
 };
 
 /**
@@ -100,7 +103,9 @@ export function cardSvg(o) {
   const fg = o.fg || p.fg;
   const emb = (x, y, size, s, fam, w = "normal", fill = fg, spacing = ls) => {
     const t = (dx, dy, f, op) => `<text x="${x + dx}" y="${y + dy}" font-family="${fam}" font-size="${size}" font-weight="${w}" fill="${f}" fill-opacity="${op}" letter-spacing="${spacing}">${esc(s)}</text>`;
-    return o.embossed ? t(2, 3, "#000", 0.55) + t(-1, -1, "#fff", 0.55) + t(0, 0, fill, 1) : t(0, 0, fill, 1);
+    const shadow = o.embossOp ? o.embossOp.shadow : 0.55;
+    const light = o.embossOp ? o.embossOp.light : 0.55;
+    return o.embossed ? t(2, 3, "#000", shadow) + t(-1, -1, "#fff", light) + t(0, 0, fill, 1) : t(0, 0, fill, 1);
   };
   const metal = p.metal
     ? `<pattern id="brush" width="6" height="${H}" patternUnits="userSpaceOnUse"><rect width="3" height="${H}" fill="#fff" fill-opacity="0.07"/><rect x="3" width="1" height="${H}" fill="#000" fill-opacity="0.06"/></pattern><rect width="${W}" height="${H}" rx="40" fill="url(#brush)"/>`
@@ -289,6 +294,17 @@ function tiltQuad(cx, cy, cw, ch, k, axis = "y", roll = 0) {
 
 function effect(img, fx, rand) {
   const { data, width: w, height: h } = img;
+  if (fx.shade) {
+    // Uneven light: one lamp off to the side, falling off across the card (lo at distance r and beyond).
+    const { cx, cy, r, lo, hi } = fx.shade;
+    for (let y = 0; y < h; y += 1) {
+      for (let x = 0; x < w; x += 1) {
+        const k = hi - (hi - lo) * Math.min(1, Math.hypot(x - cx, y - cy) / r);
+        const o = (y * w + x) * 4;
+        for (let c = 0; c < 3; c += 1) data[o + c] = Math.round(data[o + c] * k);
+      }
+    }
+  }
   if (fx.dark) {
     for (let i = 0; i < data.length; i += 4) {
       for (let c = 0; c < 3; c += 1) data[i + c] = Math.max(0, Math.min(255, data[i + c] * fx.dark + (rand() - 0.5) * (fx.noise || 0) * 2));
@@ -443,6 +459,7 @@ export async function buildHardSet({ now = new Date(), seed = 20260924, only = n
   const PANS = heldOut ? HELD_OUT_PANS : TEST_PANS;
   if (heldOut) seed = 777001;
   const rand = seeded(seed);
+  const baseRand = rand;
   const items = [];
   let n = 0;
   let panI = 0;
@@ -458,6 +475,7 @@ export async function buildHardSet({ now = new Date(), seed = 20260924, only = n
   const add = async (cat, spec) => {
     if (only && !only.includes(cat)) return;
     n += 1;
+    const rand = spec.rand || baseRand;
     const pan = spec.pan || nextPan(spec.kind);
     const expiry = spec.expiry || exp();
     const name = spec.name || person();
@@ -575,6 +593,30 @@ export async function buildHardSet({ now = new Date(), seed = 20260924, only = n
       fx: { noise: 10, glare: i === 3 ? { x0: 300, y0: 100, x1: 1200, y1: 1000, width: 45, strength: 0.6 } : null },
       enc: { quality: 60 },
     });
+  }
+  // 25. white on white (Hershy's card, 25 Sep): embossed digits the same colour as the card - no ink,
+  //     only the raised edge's shadow and highlight - photographed in dim or uneven light. Appended
+  //     LAST so every earlier item keeps its exact bytes and numbers.
+  const wrand = seeded(seed + 925);
+  const WOW = [
+    { card: { palette: "snow", font: "ocra", embossOp: { shadow: 0.3, light: 0.5 } }, fx: { dark: 0.6, noise: 8 } },
+    { card: { palette: "snow", font: "mono", bold: true, embossOp: { shadow: 0.25, light: 0.4 } }, fx: { shade: { cx: 300, cy: 200, r: 1500, lo: 0.45, hi: 0.95 }, noise: 10 } },
+    { card: { palette: "ivory", font: "ocra", embossOp: { shadow: 0.3, light: 0.5 } }, fx: { dark: 0.55, noise: 12 } },
+    { card: { palette: "snow", font: "consolas", embossOp: { shadow: 0.22, light: 0.35 } }, fx: { dark: 0.65, noise: 8 }, tilt: { k: 0.85, axis: "y", roll: 3 } },
+    { card: { palette: "snow", font: "ocra", embossOp: { shadow: 0.3, light: 0.5 } }, fx: { dark: 0.5, noise: 12, glare: { x0: 250, y0: 150, x1: 1350, y1: 1000, width: 60, strength: 0.35 } } },
+    { card: { palette: "snow", font: "mono", embossOp: { shadow: 0.35, light: 0.5 } }, fx: { dark: 0.5, noise: 10 }, roll: 6 },
+    { card: { palette: "ivory", font: "ocra", embossOp: { shadow: 0.25, light: 0.45 } }, fx: { shade: { cx: 1500, cy: 1100, r: 1700, lo: 0.35, hi: 1.0 }, noise: 8 } },
+    { card: { palette: "snow", font: "mono", embossOp: { shadow: 0.3, light: 0.5 } }, fx: { dark: 0.42, noise: 14 }, enc: { blur: 1.0 } },
+    { card: { palette: "snow", font: "ocra", embossOp: { shadow: 0.28, light: 0.45 } }, fx: { dark: 0.55, noise: 10 }, enc: { quality: 45 } },
+    { kind: "amex", card: { palette: "snow", font: "ocra", embossOp: { shadow: 0.3, light: 0.5 } }, fx: { dark: 0.6, noise: 10 } },
+  ];
+  const WOW_KINDS = ["mc", "visa", "disc", "visa", "mc", "visa", "mc", "visa", "mc", "amex"];
+  for (let i = 0; i < WOW.length; i += 1) {
+    const w = WOW[i];
+    const pan = randomPan(wrand, w.kind || WOW_KINDS[i]);
+    const expiry = expiryAhead(now, 1 + Math.floor(wrand() * 6), 1 + Math.floor(wrand() * 12));
+    const name = NAMES[Math.floor(wrand() * NAMES.length)];
+    await add("white-on-white", { ...w, pan, expiry, name, rand: wrand, card: { embossed: true, ...w.card } });
   }
   return items;
 }

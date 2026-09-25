@@ -881,13 +881,26 @@ function digitsIn(s) {
  * boxes; boxes are merged into lines and ranked by how many digits they hold.
  * Only geometry leaves this function.
  */
-async function locateLines(engine, img, scratch, budget, { textPass = false, notAfter } = {}) {
+async function locateLines(engine, img, scratch, budget, { textPass = false, lowContrast = false, notAfter } = {}) {
   const sharp = await loadSharp();
   const k = LOCATE_SIDE / Math.max(img.width, img.height);
   const lw = Math.max(1, Math.round(img.width * k));
   const lh = Math.max(1, Math.round(img.height * k));
   const base = () => sharp(img.data, { raw: { width: img.width, height: img.height, channels: 1 } }).resize(lw, lh);
-  const preps = textPass ? [] : await Promise.all([
+  // The low-contrast view (25 Sep, white on white / dim light): the whole card local-contrast
+  // normalised, and under a strong CLAHE. Only asked for when the ordinary views found no number row.
+  let lcView = null;
+  if (lowContrast) {
+    const g = await rawGray(base().blur(0.8).toColourspace("b-w"), scratch);
+    const fl = new Float32Array(g.width * g.height);
+    scratch.push(fl);
+    for (let i = 0; i < fl.length; i += 1) fl[i] = g.data[i];
+    lcView = localContrast(fl, g.width, g.height, 14, scratch);
+  }
+  const preps = textPass ? [] : lowContrast ? await Promise.all([
+    sharp(lcView.data, { raw: { width: lcView.width, height: lcView.height, channels: 1 } }).png({ compressionLevel: 1 }).toBuffer(),
+    base().clahe({ width: claheTile(24, lw, lh), height: claheTile(24, lw, lh), maxSlope: 12 }).normalise().png({ compressionLevel: 1 }).toBuffer(),
+  ]) : await Promise.all([
     base().normalise().png({ compressionLevel: 1 }).toBuffer(),
     base().negate().normalise().png({ compressionLevel: 1 }).toBuffer(),
     base().clahe({ width: claheTile(64, lw, lh), height: claheTile(64, lw, lh), maxSlope: 4 }).png({ compressionLevel: 1 }).toBuffer(),
@@ -924,7 +937,7 @@ async function locateLines(engine, img, scratch, budget, { textPass = false, not
     }
   });
   // Rows of digit-sized shapes, found without tesseract (embossed and metal cards).
-  const small = textPass ? null : await rawGray(base().toColourspace("b-w"), scratch);
+  const small = textPass ? null : lowContrast ? lcView : await rawGray(base().toColourspace("b-w"), scratch);
   // A worker that does not answer within the read's time left is cut off; the read goes on without it.
   const shapeLines = (!small ? [] : await glyphWorker().rows(small, { timeoutMs: Math.max(250, budget.left()) }).catch(() => [])).map((L) => ({ ...L, left: L.left / k, right: L.right / k, top: L.top / k, bottom: L.bottom / k, h: L.h / k }));
   // Dedupe the same word seen in several preparations: keep the one with more digits.
@@ -1088,6 +1101,208 @@ async function linePreps(band, scratch, which) {
   return out;
 }
 
+// ── the low-contrast ladder (25 Sep 2026) ───────────────────────────────────
+//
+// Hershy's card (Joseph, 25 Sep: "the white on white and not well lit"): the digits are pressed
+// into a white card in the card's own colour, so all a photo holds of them is the thin shadow and
+// highlight of the raised edge - and in dim light even that is a few grey levels. On ten such test
+// cards (test/ocr-hard-fixtures.js, "white-on-white") the ordinary cut reads found 4.
+//
+// The ladder runs ONLY on a number-sized line the ordinary reads of that cut did not settle, at most
+// LC_MAX_LINES lines a card, so a card that reads today reads exactly as before. It prepares the same
+// cut nine ways - CLAHE at two strengths (the ordinary read already has a third), a gamma lift and a
+// gamma deepen, local contrast normalisation and a local adaptive threshold on it, the inverted strong
+// CLAHE, the embossed relief (the derivative across the raised edge) and the edge strength (Sobel,
+// filled) - some trimmed to the digit rows, as measured - and PaddleOCR reads each, the glyph matcher
+// the edge strength. A number counts only when it passes Luhn and a brand range (as every read here),
+// AT LEAST LC_MIN_AGREE different preparations agree on it digit for digit, no other number has a
+// third of its votes, and the ordinary reads' own view of the last group does not contradict it. A
+// number the ladder carried is always handed back "low", so the rep confirms the last four.
+
+/** Different low-contrast preparations that must agree before the ladder's number counts. */
+export const LC_MIN_AGREE = 3;
+/** ...when an ordinary read of the card already saw the same number once. */
+export const LC_MIN_AGREE_SEEN = 2;
+/** The ladder is skipped when less than this is left of the read's time (it costs about a second). */
+export const LC_MIN_BUDGET_MS = 1500;
+/** A cut whose 5th..95th percentile spread is under this is faint (white on white measured 18-49, printed cards 70+). */
+export const LC_FAINT_RANGE = 60;
+/** Time a card whose first cut is faint keeps back from the ordinary stages for the ladder. */
+export const LC_RESERVE_MS = 1700;
+/** At most this many cut lines of one card go up the ladder. */
+export const LC_MAX_LINES = 2;
+/** The preparations the glyph matcher also reads (it knows the embossing fonts). */
+export const LC_GLYPH_PREPS = ["edge", "c10", "gammaDown", "lcn", "relief"];
+/** [name, trimmed to the middle 60% of the cut's height] - the choice measured on the white-on-white set. */
+export const LC_PREPS = [
+  ["c3", true], ["c10", true], ["gammaUp", false], ["gammaDown", true], ["lcn", false],
+  ["lcnT", false], ["inv", true], ["relief", false], ["edge", false],
+];
+
+/** Box mean over a (2r+1)^2 window, from an integral image. */
+function boxMean(src, w, h, r, scratch) {
+  const W = w + 1;
+  const I = new Float64Array(W * (h + 1));
+  scratch.push(I);
+  for (let y = 1; y <= h; y += 1) {
+    let row = 0;
+    const s = (y - 1) * w;
+    for (let x = 1; x <= w; x += 1) {
+      row += src[s + x - 1];
+      I[y * W + x] = I[(y - 1) * W + x] + row;
+    }
+  }
+  const out = new Float32Array(w * h);
+  scratch.push(out);
+  for (let y = 0; y < h; y += 1) {
+    const y0 = Math.max(0, y - r);
+    const y1 = Math.min(h, y + r + 1);
+    for (let x = 0; x < w; x += 1) {
+      const x0 = Math.max(0, x - r);
+      const x1 = Math.min(w, x + r + 1);
+      out[y * w + x] = (I[y1 * W + x1] - I[y0 * W + x1] - I[y1 * W + x0] + I[y0 * W + x0]) / ((y1 - y0) * (x1 - x0));
+    }
+  }
+  return out;
+}
+
+/** A float plane into 8 bits: the 1st..99th percentile stretched to 0..255, then gamma, optionally inverted. */
+function planeTo8(f, w, h, scratch, { gamma = 1, invert = false, lo = 0.01, hi = 0.99 } = {}) {
+  const n = w * h;
+  const step = Math.max(1, Math.floor(n / 20000));
+  const sample = [];
+  for (let i = 0; i < n; i += step) sample.push(f[i]);
+  sample.sort((a, b) => a - b);
+  const a = sample[Math.floor(lo * (sample.length - 1))];
+  const b = sample[Math.floor(hi * (sample.length - 1))];
+  sample.length = 0;
+  const span = b - a > 1e-6 ? b - a : 1;
+  const out = Buffer.alloc(n);
+  scratch.push(out);
+  for (let i = 0; i < n; i += 1) {
+    let t = (f[i] - a) / span;
+    t = t < 0 ? 0 : t > 1 ? 1 : t;
+    if (gamma !== 1) t = Math.pow(t, gamma);
+    const v = Math.round(255 * t);
+    out[i] = invert ? 255 - v : v;
+  }
+  return { data: out, width: w, height: h };
+}
+
+/**
+ * Local contrast normalisation: each pixel against the mean and spread of its (2r+1)^2 neighbourhood,
+ * back to 8 bits. Uneven light and a faint raised edge both come out as the same strong contrast.
+ */
+function localContrast(f, w, h, r, scratch) {
+  const n = w * h;
+  const mean = boxMean(f, w, h, r, scratch);
+  const dev = new Float32Array(n);
+  scratch.push(dev);
+  for (let i = 0; i < n; i += 1) dev[i] = (f[i] - mean[i]) * (f[i] - mean[i]);
+  const varM = boxMean(dev, w, h, r, scratch);
+  const out = new Float32Array(n);
+  scratch.push(out);
+  for (let i = 0; i < n; i += 1) out[i] = (f[i] - mean[i]) / (Math.sqrt(varM[i]) + 4);
+  return planeTo8(out, w, h, scratch);
+}
+
+/** The 5th..95th percentile spread of a cut: a white-on-white or dim number line has little of it. */
+export function bandRange(band) {
+  const d = band.data;
+  const step = Math.max(1, Math.floor(d.length / 8000));
+  const v = [];
+  for (let i = 0; i < d.length; i += step) v.push(d[i]);
+  v.sort((x, y) => x - y);
+  const r = v.length ? v[Math.floor(0.95 * (v.length - 1))] - v[Math.floor(0.05 * (v.length - 1))] : 0;
+  v.length = 0;
+  return r;
+}
+
+/** The middle 60% of a cut's height: where the digits sit (cutLine pads 0.75 of a digit above and below). */
+function digitRows(img, scratch) {
+  const y0 = Math.round(0.2 * img.height);
+  const hh = Math.max(8, Math.round(0.6 * img.height));
+  if (y0 + hh > img.height) return img;
+  const out = Buffer.from(img.data.subarray(y0 * img.width, (y0 + hh) * img.width));
+  scratch.push(out);
+  return { data: out, width: img.width, height: hh };
+}
+
+/**
+ * The low-contrast preparations of one cut number line (raw gray in, raw gray out), in LC_PREPS order.
+ * Exported for the tests; every buffer it makes is pushed to `scratch` so the read's purge zeroes it.
+ */
+export async function lowContrastPreps(band, scratch = []) {
+  const sharp = await loadSharp();
+  const { width: w, height: h } = band;
+  const raw = { raw: { width: w, height: h, channels: 1 } };
+  const D = LINE_DIGIT_PX;
+  const clahe = (tile, slope) => rawGray(sharp(band.data, raw).clahe({ width: claheTile(tile, w, h), height: claheTile(tile, w, h), maxSlope: slope }).normalise().toColourspace("b-w"), scratch);
+  const [c3, c10] = await Promise.all([clahe(2 * D, 3), clahe(D, 10)]);
+  // A light blur first: the photo's grain is as strong as the digit's edge on a dim white card.
+  const soft = await rawGray(sharp(band.data, raw).blur(1).toColourspace("b-w"), scratch);
+  const s = soft.data;
+  const n = w * h;
+  const f = new Float32Array(n);
+  scratch.push(f);
+  for (let i = 0; i < n; i += 1) f[i] = s[i];
+  const gammaUp = planeTo8(f, w, h, scratch, { gamma: 0.5 });
+  const gammaDown = planeTo8(f, w, h, scratch, { gamma: 2 });
+  // Local contrast normalisation over about a digit.
+  const lcn = localContrast(f, w, h, Math.max(4, Math.round(D * 0.6)), scratch);
+  const lcnT = { data: adaptiveThreshold(lcn.data, w, h, Math.max(15, Math.round(D * 1.6)) | 1, 6), width: w, height: h };
+  scratch.push(lcnT.data);
+  const inv = { data: Buffer.alloc(n), width: w, height: h };
+  scratch.push(inv.data);
+  for (let i = 0; i < n; i += 1) inv.data[i] = 255 - c10.data[i];
+  // The raised edge: light from one side leaves a shadow on the other. The derivative along the
+  // diagonal turns that pair into a stroke (relief); the edge strength ignores where the lamp was.
+  const relF = new Float32Array(n);
+  const edgeF = new Float32Array(n);
+  scratch.push(relF, edgeF);
+  for (let y = 1; y < h - 1; y += 1) {
+    for (let x = 1; x < w - 1; x += 1) {
+      const i = y * w + x;
+      const gx = (s[i - w + 1] + 2 * s[i + 1] + s[i + w + 1]) - (s[i - w - 1] + 2 * s[i - 1] + s[i + w - 1]);
+      const gy = (s[i + w - 1] + 2 * s[i + w] + s[i + w + 1]) - (s[i - w - 1] + 2 * s[i - w] + s[i - w + 1]);
+      relF[i] = gx + gy;
+      edgeF[i] = Math.sqrt(gx * gx + gy * gy);
+    }
+  }
+  const relief = planeTo8(relF, w, h, scratch);
+  const edge0 = planeTo8(edgeF, w, h, scratch, { invert: true, lo: 0.02, hi: 0.995 });
+  const edge = await rawGray(sharp(edge0.data, raw).blur(1.2).normalise().toColourspace("b-w"), scratch);
+  const planes = { c3, c10, gammaUp, gammaDown, lcn, lcnT, inv, relief, edge };
+  return LC_PREPS.map(([name, trim]) => ({ name, img: trim ? digitRows(planes[name], scratch) : planes[name] }));
+}
+
+/**
+ * The ladder's vote for one line. `here` = the ladder's own Luhn-valid reads of this line, `seen` =
+ * every hit the ordinary reads already made, `lastGroups` = the last printed group of every ordinary
+ * line read. Returns the reads to count (all of one number), or [] - nothing counts.
+ */
+export function lowContrastVerdict(here, seen = [], lastGroups = []) {
+  const v = voteCandidates(here);
+  if (!v) return [];
+  const before = new Set(seen.filter((x) => x.pan === v.pan).map((x) => x.source)).size;
+  const rivals = new Map();
+  for (const x of [...seen, ...here]) {
+    if (x.pan === v.pan) continue;
+    if (!rivals.has(x.pan)) rivals.set(x.pan, new Set());
+    rivals.get(x.pan).add(x.source);
+  }
+  const rival = Math.max(0, ...[...rivals.values()].map((set) => set.size));
+  const need = before >= 1 ? LC_MIN_AGREE_SEEN : LC_MIN_AGREE;
+  if (v.sources < need || v.sources < 3 * rival) return [];
+  // Cross-check: two ordinary reads agreeing on a DIFFERENT last group, and none on this one - it does not count.
+  const tally = new Map();
+  for (const g of lastGroups) tally.set(g, (tally.get(g) || 0) + 1);
+  const mine = tally.get(v.pan.slice(-4)) || 0;
+  const other = Math.max(0, ...[...tally.entries()].filter(([k]) => k !== v.pan.slice(-4)).map(([, c]) => c));
+  if (!mine && other >= 2) return [];
+  return here.filter((x) => x.pan === v.pan);
+}
+
 const PROBLEM_SAY = {
   glare: "I couldn't read the card number - the photo has glare on it. Take it again flat, out of direct light, or type the number here.",
   dark: "I couldn't read the card number - the photo is too dark. Take it again in better light, or type the number here.",
@@ -1146,7 +1361,10 @@ async function recognizeCardOnce(input, opts) {
   const scratch = opts.trace && Array.isArray(opts.trace.buffers) ? opts.trace.buffers : [];
   if (Buffer.isBuffer(input)) scratch.push(input);
   const t0 = clock();
-  const budget = { left: () => totalMs - (clock() - t0) };
+  // The low-contrast last resort's time (25 Sep): held back from the ordinary stages only once the
+  // first cut of the card turned out faint; handed back when the last resort starts.
+  let reserve = 0;
+  const budget = { left: () => totalMs - reserve - (clock() - t0) };
   // Wall-clock cut-off the engine honours when a queued pass finally gets a worker (Date.now, as the pool uses).
   const notAfter = Date.now() + totalMs - 400;
   let passes = 0;
@@ -1216,10 +1434,64 @@ async function recognizeCardOnce(input, opts) {
     return bases.get(rot);
   };
   const seenLines = []; // {rot, line, img} for the partial read and the problem words
+  // The low-contrast ladder on one cut (see lowContrastPreps). Its reads never feed the partial "ends
+  // in", the expiry or the ordinary digit vote; they count only through lowContrastVerdict.
+  let lcRuns = 0;
+  let lastResort = false;
+  let faintSeen = false;
+  let faintFirst = false;
+  const readLowContrast = async (band, line, rot, flip) => {
+    lcRuns += 1;
+    const lk = `${rot}:${Math.round(line.top)}:${flip ? 1 : 0}`;
+    const preps = await lowContrastPreps(band, scratch);
+    if (opts.debugBands) {
+      const sharpD = await loadSharp();
+      for (const p of preps) opts.debugBands(`lc-${Math.round(line.top)}-${rot}-${flip ? 1 : 0}-${p.name}`, await sharpD(p.img.data, { raw: { width: p.img.width, height: p.img.height, channels: 1 } }).png().toBuffer());
+    }
+    const glyphPreps = preps.filter((p) => LC_GLYPH_PREPS.includes(p.name));
+    const wait = { timeoutMs: Math.max(250, budget.left() - 400) };
+    const [reads, glyphs] = await Promise.all([
+      glyphWorker().paddle(preps.map((p) => p.img), wait).catch(() => []),
+      glyphPreps.length ? glyphWorker().lines(glyphPreps.map((p) => p.img), { digitPx: LINE_DIGIT_PX, ...wait }).catch(() => []) : Promise.resolve([]),
+    ]);
+    const here = [];
+    const grouped = [];
+    (reads || []).forEach((r, i) => {
+      if (!r || !preps[i]) return;
+      passes += 1;
+      const text = digitsFromLookalikes(r.text);
+      const src = `lc:${preps[i].name}@${rot}${flip ? "f" : ""}`;
+      if (opts.debug) opts.debug({ stage: "lc", v: preps[i].name, shape: digitShape(text), conf: +r.conf.toFixed(3) });
+      if (r.conf < PADDLE_MIN_CONF) return;
+      for (const gr of groupedReads(text)) grouped.push({ ...gr, lineKey: lk });
+      for (const hit of extractPans(text)) here.push({ ...hit, source: src, lineKey: lk, h: line.h, lc: true });
+    });
+    for (const [gi, list] of (glyphs || []).entries()) for (const g of list || []) {
+      passes += 1;
+      if (opts.debug) opts.debug({ stage: "lc_glyph", font: g.font, shape: digitShape(g.text), minS: +g.minScore.toFixed(3), minM: +g.minMargin.toFixed(3) });
+      if (!(g.minScore >= GLYPH_MIN_SCORE && (g.minMargin >= GLYPH_MIN_MARGIN || (g.thin <= 1 && g.minMargin >= 0)))) continue;
+      for (const gr of groupedReads(g.text)) grouped.push({ ...gr, lineKey: lk });
+      for (const hit of extractPans(g.text)) here.push({ ...hit, source: `lc:glyph-${glyphPreps[gi] ? glyphPreps[gi].name : gi}@${rot}${flip ? "f" : ""}`, lineKey: lk, h: line.h, lc: true });
+    }
+    for (const hit of consensusPans(grouped)) here.push({ ...hit, source: `lcvote:${lk}`, lineKey: lk, h: line.h, lc: true });
+    const add = lowContrastVerdict(here, hits, lastGroups);
+    if (opts.debug) opts.debug({ stage: "lc_vote", reads: here.length, counted: add.length });
+    hits.push(...add);
+  };
   const readLine = async (img, line, rot, flip, which, modes) => {
     const band = await cutLine(img, line, { flip }, scratch);
     if (!band) return;
     const preps = await linePreps(band, scratch, which);
+    // A faint first cut (white on white, dim light: little spread between its dark and light): once the
+    // upright rescue is done, LC_RESERVE_MS of the read's time is held back for the low-contrast last resort. The ladder itself runs
+    // only in the last resort, after every ordinary stage and rotation failed - so a card that reads
+    // today keeps its path.
+    if (!faintSeen && !lastResort && (line.digits || 0) >= 4) {
+      faintSeen = true;
+      faintFirst = bandRange(band) < LC_FAINT_RANGE;
+      if (opts.debug) opts.debug({ stage: "band", top: Math.round(line.top), faint: faintFirst });
+    }
+    const ladderOk = () => lastResort && !line.parts && !flip && lcRuns < LC_MAX_LINES && !accepted(vote()) && (line.digits || 0) >= 4 && budget.left() > LC_MIN_BUDGET_MS;
     if (opts.debugBands) for (const p of preps) opts.debugBands(`${Math.round(line.top)}-${rot}-${flip ? 1 : 0}-${p.name}`, Buffer.from(p.buffer));
     // The glyph matcher on the same cut (ocr-glyphs.js): a second reader that knows card fonts.
     // Also on a local-contrast copy (glare lifts one part of the line), and for a number printed on
@@ -1294,7 +1566,8 @@ async function recognizeCardOnce(input, opts) {
     }
     // The glyph matcher is pure arithmetic and runs first; when two of its readings already agree on
     // a card number, the slow tesseract passes on this cut are not needed (a slow box keeps its budget).
-    if (!accepted(vote())) {
+    // In the low-contrast last resort they are skipped: the ladder below reads a faint cut, they do not.
+    if (!accepted(vote()) && !lastResort) {
       const jobs = [];
       for (const p of preps) for (const mode of modes) jobs.push({ p, mode });
       await Promise.all(jobs.map(async ({ p, mode }) => {
@@ -1314,15 +1587,17 @@ async function recognizeCardOnce(input, opts) {
     for (const hit of consensusPans(lineReads.filter((x) => x.lineKey === key))) {
       hits.push({ ...hit, source: `vote:${key}`, lineKey: key, h: line.h });
     }
+    // In the last resort only: a cut the low-contrast view found, and the reads above did not settle.
+    if (ladderOk()) await readLowContrast(band, line, rot, flip);
   };
-  const rescue = async (rot) => {
+  const rescue = async (rot, { lowContrast = false } = {}) => {
     if (budget.left() < 900) return;
     const img = await baseAt(rot);
     const inside = (L) => L.top > 2 && L.bottom < img.height - 2;
-    const locate = async (textPass) => {
-      const { lines, passes: lp } = await locateLines(engine, img, scratch, budget, { textPass, notAfter });
+    const locate = async (textPass, lowContrast = false) => {
+      const { lines, passes: lp } = await locateLines(engine, img, scratch, budget, { textPass, lowContrast, notAfter });
       passes += lp;
-      if (opts.debug) opts.debug({ stage: "locate", rot, text: textPass, lines: lines.slice(0, 5).map((l) => ({ top: Math.round(l.top), bot: Math.round(l.bottom), left: Math.round(l.left), right: Math.round(l.right), h: Math.round(l.h), d: l.digits, ang: Math.round(l.angle), st: !!l.stacked, sh: !!l.shapes })) });
+      if (opts.debug) opts.debug({ stage: "locate", rot, text: textPass, lc: lowContrast, lines: lines.slice(0, 5).map((l) => ({ top: Math.round(l.top), bot: Math.round(l.bottom), left: Math.round(l.left), right: Math.round(l.right), h: Math.round(l.h), d: l.digits, ang: Math.round(l.angle), st: !!l.stacked, sh: !!l.shapes })) });
       return lines;
     };
     const tried = (L) => seenLines.some((s) => s.rot === rot && Math.abs(s.line.top - L.top) < 0.5 * L.h && Math.abs(s.line.bottom - L.bottom) < 0.5 * L.h && Math.abs((s.line.angle || 0) - (L.angle || 0)) < 1);
@@ -1344,6 +1619,10 @@ async function recognizeCardOnce(input, opts) {
       }
     };
     const rankOf = (L) => Math.min(L.stacked ? 16 : L.digits, 19) * Math.pow(L.h, 1.5) * (inside(L) ? 1 : 0.2) * (L.core ? 1.05 : L.bottom - L.top > 1.3 * L.h ? 0.9 : 1);
+    if (lowContrast) {
+      await readAll(await locate(false, true));
+      return;
+    }
     let lines = await locate(false);
     let textDone = false;
     // No row inside the photo that already looks like most of a number: find rows the other way
@@ -1381,7 +1660,25 @@ async function recognizeCardOnce(input, opts) {
     } else {
       // The rescue is extra: if it throws (an odd picture size, a decoder edge), what was read stands.
       try { await rescue(rot); } catch (e) { if (opts.debug) opts.debug({ stage: "rescue_error", error: String(e && e.message).slice(0, 80) }); }
+      // The upright rescue found only a faint cut: the other rotations now leave the ladder its time.
+      if (faintFirst) reserve = LC_RESERVE_MS;
     }
+  }
+  // The last resort (25 Sep, a white-on-white or dim card): nothing read at any rotation - look once
+  // more for the number row on the low-contrast view of the card, and let any cut up the ladder.
+  reserve = 0;
+  if (!accepted(vote()) && budget.left() >= LC_MIN_BUDGET_MS) {
+    lastResort = true;
+    try {
+      // The number-sized cuts the ordinary stages already found, best first, straight up the ladder.
+      for (const seen of seenLines.filter((x) => !x.line.parts && (x.line.digits || 0) >= 4).slice(0, LC_MAX_LINES)) {
+        if (accepted(vote()) || lcRuns >= LC_MAX_LINES || budget.left() < LC_MIN_BUDGET_MS) break;
+        const band = await cutLine(seen.img, seen.line, { flip: false }, scratch);
+        if (band) await readLowContrast(band, seen.line, seen.rot, false);
+      }
+      // None of them: find the number row on the low-contrast view of the card.
+      if (!accepted(vote()) && budget.left() >= 2000) await rescue(fastRotation || 0, { lowContrast: true });
+    } catch (e) { if (opts.debug) opts.debug({ stage: "rescue_error", error: String(e && e.message).slice(0, 80) }); }
   }
 
   const final = vote();
@@ -1533,8 +1830,9 @@ async function recognizeCardOnce(input, opts) {
     expiry,
     name,
     // Accepted means two different reads agreed and nothing else came close. Three or more = high;
-    // exactly two = low, and the rep confirms the last four before a charge.
-    confidence: win.sources >= 3 ? "high" : "low",
+    // exactly two = low, and the rep confirms the last four before a charge. A number that fewer than
+    // two ORDINARY reads saw (the low-contrast ladder carried it) is always low.
+    confidence: new Set(winHits.filter((x) => !x.lc).map((x) => x.source)).size < 2 ? "low" : win.sources >= 3 ? "high" : "low",
     sources: win.sources,
     rotation,
   });
