@@ -518,6 +518,24 @@ describe("a past sale read from the processor (24 Sep)", () => {
     assert.equal(sales[0].txn_id, "txn-300", "newest first");
   });
 
+  it("a REFUND that was itself voided sent nothing back: not refunded_cents, not lastBack, not the day cap", () => {
+    const list = ledger();
+    // A $300 Nesher sale, and a refund of the whole amount that was itself voided minutes later
+    // (its own condition is canceled AND it carries a successful void action).
+    list.push({ id: "txn-700", order: "RES-VOIDRF", proc: "mav7067", cond: "complete", actions: [{ type: "sale", amount: "300.00", at: DAYS(1) }] });
+    list.push({ id: "txn-701", orig: "txn-700", proc: "mav7067", cond: "canceled", actions: [{ type: "refund", amount: "-300.00", at: NOW_MS - 3600000 }, { type: "void", amount: "-300.00", at: NOW_MS - 1800000 }] });
+    const { sales, dayBackCents } = salesFromXml(nmiXml(list), { nowMs: NOW_MS });
+    const by = Object.fromEntries(sales.map((s) => [s.txn_id, s]));
+    assert.equal(by["txn-700"].refunded_cents, 0, "the voided refund must not count as money already back");
+    assert.equal(by["txn-700"].refundable_cents, 30000);
+    assert.equal(by["txn-700"].action, "refund");
+    assert.equal(by["txn-700"].last_back_cents, 0);
+    assert.equal(by["txn-700"].last_back_at, null);
+    assert.equal(dayBackCents, 0, "a voided refund never eats the day cap or the 15-minute guard");
+    // Positive control: a normal, non-voided complete refund still counts (txn-100/txn-101 in ledger()).
+    assert.equal(by["txn-100"].refunded_cents, 10000);
+  });
+
   it("matchSales: txn, booking with or without RES-, last four, name + day; an identifier is required", () => {
     const { sales } = salesFromXml(nmiXml(ledger()), { nowMs: NOW_MS, nameNeedle: "cohen" });
     assert.deepEqual(matchSales(sales, { txn: "txn-100" }).matches.map((s) => s.txn_id), ["txn-100"]);

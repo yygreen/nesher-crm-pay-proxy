@@ -173,12 +173,17 @@ export function salesFromXml(xml, { nameNeedle = "", nowMs = Date.now() } = {}) 
   let dayBackCents = 0;
   for (const t of txns) {
     const c = classifyTransaction(t);
+    // A refund transaction that was itself voided (its own condition is "canceled", it carries a
+    // successful void action, or classifyTransaction marks it voided) sent nothing back: it must not
+    // count as money already returned - not toward refunded_cents, not lastBack/last_back_at, not the
+    // day cap.
+    const refundVoided = c.kind === "refund" && (c.voided || t.condition === "canceled");
     for (const a of t.actions) {
-      if (!a.success) continue;
+      if (!a.success || refundVoided) continue;
       if ((a.type === "refund" || a.type === "credit") && a.at != null && nowMs - a.at < DAY_MS) dayBackCents += Math.round(Math.abs(a.amount) * 100);
     }
     if (c.voided && c.kind === "sale" && c.voidAt != null && nowMs - c.voidAt < DAY_MS) dayBackCents += Math.round(c.amount * 100);
-    if (c.kind === "refund" && t.originalId) { back.set(t.originalId, (back.get(t.originalId) || 0) + Math.round(c.amount * 100)); noteBack(t.originalId, c.at, Math.round(c.amount * 100)); }
+    if (c.kind === "refund" && t.originalId && !refundVoided) { back.set(t.originalId, (back.get(t.originalId) || 0) + Math.round(c.amount * 100)); noteBack(t.originalId, c.at, Math.round(c.amount * 100)); }
     if (c.kind === "sale") {
       const ownActs = t.actions.filter((a) => a.success && (a.type === "refund" || a.type === "credit"));
       const own = ownActs.reduce((s, a) => s + Math.round(Math.abs(a.amount) * 100), 0);
